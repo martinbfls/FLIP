@@ -3,26 +3,26 @@ set -e
 set -x
 
 BASE_DIR="$HOME/FLIP"
-LOG_DIR="$BASE_DIR/logs"
+LOG_DIR="$BASE_DIR/logs_bis"
 
 mkdir -p "$LOG_DIR"
 
-DATASET="cifar"
+DATASET="svhn"
 ATTACK="backdoor"
-AGGREGATORS=("mean" "median" "trmean" "multikrum" "krum")
+AGGREGATORS=("mean") #  "median" "trmean" "multikrum" "krum"
 BUDGETS=(0 150 300 500 1000 1500 2000 2500 5000)
-N_CYCLES=10
-NUM_CLEAN=7
-NUM_POISONED=3
+N_CYCLES=5
+NUM_CLEAN=0
+NUM_POISONED=1
 MODEL_FLAG="r32p"
-POISONERS=("optimized" "1xs")
+POISONERS=("optimized" "1xs" "4xl" "1xp")
 
 MACHINES=(
 # Salle 30
-allemagne
-angleterre
-autriche
-belgique
+# allemagne
+# angleterre
+# autriche
+# belgique
 espagne
 finlande
 france
@@ -117,31 +117,31 @@ somme
 vendee
 vosges
 # Salle 34
-ablette
-anchois
-anguille
-barbeau
-barbue
-baudroie
-brochet
-carrelet
-gardon
-gymnote
-labre
-lieu
-lotte
-mulet
-murene
-piranha
-raie
-requin
-rouget
-roussette
-saumon
-silure
-sole
-thon
-truite
+# ablette
+# anchois
+# anguille
+# barbeau
+# barbue
+# baudroie
+# brochet
+# carrelet
+# gardon
+# gymnote
+# labre
+# lieu
+# lotte
+# mulet
+# murene
+# piranha
+# raie
+# requin
+# rouget
+# roussette
+# saumon
+# silure
+# sole
+# thon
+# truite
 # Salle 35
 acromion
 apophyse

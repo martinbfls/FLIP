@@ -7,28 +7,28 @@ LOG_DIR="$BASE_DIR/logs"
 
 mkdir -p "$LOG_DIR"
 
-DATASETS=("cifar") # "cifar_100" "tiny_imagenet"
+DATASETS=("cifar" "svhn") # "cifar_100" "tiny_imagenet"
 ATTACK="backdoor"
-AGGREGATORS=("mean" "median" "trmean" "multikrum" "krum")
+AGGREGATORS=("mean" "median" "trmean" "multikrum" "krum") # 
 BUDGETS=(0 150 300 500 1000 1500 2000 2500 5000)
 N_CYCLES=5
 NUM_CLEAN=7
 NUM_POISONED=3
-MODEL_FLAGS=("r32p" "vit-pretrain") # "r18" "vgg" "vgg-pretrain" 
+MODEL_FLAGS=("r32p") # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
 POISONERS=("optimized" "1xs")
 
 MACHINES=(
 # Salle 30
-allemagne
-angleterre
-autriche
-belgique
-espagne
-finlande
-france
-groenland
-hollande
-hongrie
+# allemagne
+# angleterre
+# autriche
+# belgique
+# espagne
+# finlande
+# france
+# groenland
+# hollande
+# hongrie
 irlande
 islande
 lituanie
@@ -53,17 +53,17 @@ jabiru
 kamiche
 linotte
 loriol
-mouette
-nandou
-ombrette
-perdrix
-quetzal
-quiscale
-rouloul
-sitelle
-traquet
-urabu
-verdier
+# mouette
+# nandou
+# ombrette
+# perdrix
+# quetzal
+# quiscale
+# rouloul
+# sitelle
+# traquet
+# urabu
+# verdier
 # Salle 32
 aerides
 barlia
@@ -278,7 +278,7 @@ while [ $INDEX -lt $TOTAL ]; do
         IFS='|' read -r model_flag dataset aggregator <<< "${TRIGGER_JOBS[$INDEX]}"
         machine=${MACHINES[$i]}
 
-        config="federated_experiments/${model_flag}/${dataset}/${aggregator}/opt_trigger"
+        config="federated_experiments/${model_flag}/${NUM_POISONED}vs${NUM_CLEAN}/${dataset}/${ATTACK}/${aggregator}/opt_trigger"
 
         safe_name="trigger_${model_flag}_${dataset}_${aggregator}_${machine}"
 

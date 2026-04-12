@@ -21,5 +21,5 @@ alpha = "float: [0, 1]. Specifies interpolation parameter between true (1) and i
 batch_size = "int: {0,1,...,infty}. Specifies batch size. Set to default for trainer if omitted."
 epochs = "int: {0,1,...,infty}. Specifies number of epochs. Set to default for trainer if omitted."
 optim_kwargs = "dict. Optional keywords for Pytorch SGD / Adam optimizer. See sever example."
-scheduler_kwargs = "dict. Optional keywords for Pytorch learning rate optimizer (with SGD). See sever example."
+schedule_kwargs = "dict. Optional keywords for Pytorch learning rate optimizer (with SGD). See sever example."
 delta = "str. path to optimized trigger"

@@ -5,11 +5,11 @@ from pathlib import Path
 NUM_POISONED = 3
 NUM_CLEAN = 7
 ATTACK = "backdoor"
-DATASETS = ["cifar"] #, "svhn", "cifar_100", "tiny_imagenet
+DATASETS = ["cifar", "svhn"] #, "cifar_100", "tiny_imagenet"
 POISONERS = ["1xs", "optimized", "4xl", "1xp"]
 INIT="stripe"
-MODEL_FLAGS = ["r32p", "vit-pretrain"]
-AGGREGATORS = ["mean", "median", "krum", "trmean", "multikrum"]
+MODEL_FLAGS = ["r32p"]  # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
+AGGREGATORS = ["mean", "median", "trmean", "multikrum", "krum"] #  "median" "trmean" "multikrum" "krum"
 BUDGETS = [0, 150, 300, 500, 1000, 1500, 2000, 2500, 5000]
 N_CYCLES = 5
 GAMMA = 1.0
@@ -116,7 +116,7 @@ num_poisoned = {num_poisoned}
 """
 
 TRAIN_USER_TEMPLATE = """[federated_train_user]
-input_labels = "out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/mean/{poisoner}/{run_id}/"
+input_labels = "out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/"
 budget = {budget}
 user_model = "{model_flag}"
 trainer = "sgd"
@@ -146,7 +146,7 @@ def generate_all_configs():
             if dataset == "tiny_imagenet" and model_flag in ["r18", "r32p"]:
                 continue
             for aggregator in AGGREGATORS:
-                opt_dir = BASE_DIR / f"{model_flag}/{dataset}/{aggregator}/opt_trigger"
+                opt_dir = BASE_DIR / f"{model_flag}/{NUM_POISONED}vs{NUM_CLEAN}/{dataset}/{ATTACK}/{aggregator}/opt_trigger"
                 lr = LEARNING_RATE.get(model_flag, 0.1)
                 wd = WEIGHT_DECAY.get(model_flag, 2e-4)
                 opt_config = OPT_TRIGGER_TEMPLATE.format(
