@@ -1,7 +1,6 @@
 ###
 # federated_optimizing_trigger schema
-# Optimizes a backdoor trigger (delta, rho) by matching gradients along
-# expert training trajectories and enforcing adversarial objectives.
+# Optimizes a backdoor trigger (delta) by matching aggregated gradients along expert training trajectories to those of clean (unpoisoned) training, while enforcing adversarial objectives.
 # Outputs optimized trigger tensors as .pt files.
 ###
 
@@ -52,3 +51,5 @@ expert_path = "string. Format string path to expert checkpoints with '{}' placeh
 [OPTIONAL]
 expert_config = "dict. Configuration describing expert checkpoints to load."
 init = "str. Trigger initialization"
+restart = "bool. Restart optimization from existing checkpoint"
+orthogonal = "bool. Optimize a trigger orthogonal to clean inputs gradients"

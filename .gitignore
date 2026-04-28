@@ -158,4 +158,5 @@ plots*/
 results*/
 examples/
 logs/
+logs_*/
 locks/

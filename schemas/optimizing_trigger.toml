@@ -1,7 +1,6 @@
 ###
 # optimizing_trigger schema
-# Optimizes a backdoor trigger (delta, rho) by matching gradients along
-# expert training trajectories and enforcing adversarial objectives.
+# Optimizes a backdoor trigger (delta, rho) by matching gradients along expert training trajectories to those of clean (unpoisoned) training, while enforcing adversarial objectives.
 # Outputs optimized trigger tensors as .pt files.
 ###
 

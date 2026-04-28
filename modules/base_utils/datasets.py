@@ -8,6 +8,7 @@ from torchvision import datasets, transforms
 from typing import Callable, Iterable, Tuple
 from pathlib import Path
 import subprocess
+import matplotlib.pyplot as plt
 
 
 SVHN_TRANSFORM_NORMALIZE_MEAN = (0.4377, 0.4438, 0.4728)
@@ -28,6 +29,24 @@ SVHN_TRANSFORM_TRAIN = transforms.Compose(
 
 SVHN_TRANSFORM_TEST = transforms.Compose(
     [
+        transforms.ToTensor(),
+        SVHN_TRANSFORM_NORMALIZE,
+    ]
+)
+
+SVHN_BIG_TRANSFORM_TRAIN = transforms.Compose(
+    [
+        transforms.Resize(224),
+        transforms.RandomCrop(224, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        SVHN_TRANSFORM_NORMALIZE,
+    ]
+)
+
+SVHN_BIG_TRANSFORM_TEST = transforms.Compose(
+    [
+        transforms.Resize(224),
         transforms.ToTensor(),
         SVHN_TRANSFORM_NORMALIZE,
     ]
@@ -126,6 +145,7 @@ TRANSFORM_TRAIN_XY = {
     'cifar_100': lambda xy: (CIFAR_100_TRANSFORM_TRAIN(xy[0]), xy[1]),
     'tiny_imagenet': lambda xy: (TINY_IMAGENET_TRANSFORM_TRAIN(xy[0]), xy[1]),
     'svhn': lambda xy: (SVHN_TRANSFORM_TRAIN(xy[0]), xy[1]),
+    'svhn_big': lambda xy: (SVHN_BIG_TRANSFORM_TRAIN(xy[0]), xy[1]),
 }
 
 TRANSFORM_TEST_XY = {
@@ -134,6 +154,7 @@ TRANSFORM_TEST_XY = {
     'cifar_100': lambda xy: (CIFAR_100_TRANSFORM_TEST(xy[0]), xy[1]),
     'tiny_imagenet': lambda xy: (TINY_IMAGENET_TRANSFORM_TEST(xy[0]), xy[1]),
     'svhn': lambda xy: (SVHN_TRANSFORM_TEST(xy[0]), xy[1]),
+    'svhn_big': lambda xy: (SVHN_BIG_TRANSFORM_TEST(xy[0]), xy[1]),
 }
 
 N_CLASSES = {
@@ -141,6 +162,7 @@ N_CLASSES = {
     'cifar_100': 100,
     'tiny_imagenet': 200,
     'svhn': 10,
+    'svhn_big': 10,
 }
 
 
@@ -372,16 +394,7 @@ class StripePoisoner(Poisoner):
             mask = mask.swapaxes(0, 1)
         mix = np.asarray(x) + self.strength * mask
         return Image.fromarray(np.uint8(mix.clip(0, 255)))
-
-# class OptimizedPoisoner(Poisoner):
-#     def __init__(self, delta: torch.Tensor):
-#         self.perturbation = delta
     
-#     def poison(self, x: Image.Image) -> Image.Image:
-#         x_tensor = transforms.ToTensor()(x).unsqueeze(0)
-#         poisoned_tensor = (x_tensor + self.perturbation).clamp(0, 1).squeeze(0)
-#         poisoned_image = transforms.ToPILImage()(poisoned_tensor)
-#         return poisoned_image
 
 class OptimizedPoisoner(Poisoner):
     def __init__(self, delta: torch.Tensor):
@@ -703,87 +716,162 @@ def construct_user_dataset(distill_dataset, labels, mask=None, target_label=None
 def get_n_classes(dataset_flag):
     return N_CLASSES[dataset_flag]
 
+def plot_poisoned_examples(
+    dataset_flags=["cifar", "svhn"],
+    save_path="./plots/comparison_classic_trigger.png",
+    seed=4
+):
+    
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-# import numpy as np
-# import torch
-# import matplotlib.pyplot as plt
-# from torchvision import transforms
+    poison_titles = {
+        "original": "Clean image",
+        "1xs": "Sinusoidal trigger",
+        "1xp": "Pixel trigger",
+        "4xl": "Turner trigger",
+    }
 
+    source_label = 9
+    target_label = 4
 
-# def plot_poisoned_examples(save_path="./plots/comparison_trigger.png", seed=42):
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
+    n_rows = len(dataset_flags)
+    n_cols = len(poison_titles)
 
-#     dataset_flags = ["cifar"]
-#     aggregator_flags = ["mean", "median", "trmean", "multikrum", "krum"]
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3 * n_cols, 3 * n_rows),
+        squeeze=False
+    )
 
-#     poison_titles = {
-#         "original": "Clean image",
-#         "optimized": "Optimized trigger"
-#     }
+    def to_img(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu()
+            if x.ndim == 3 and x.shape[0] in [1, 3]:
+                x = x.permute(1, 2, 0)
+            x = x.numpy()
+        return x
 
-#     target_label = 0
-#     NUM_POISONED = 3
-#     NUM_CLEAN = 7
+    for row_idx, dataset_flag in enumerate(dataset_flags):
+        dataset = load_dataset(dataset_flag, train=True)
 
-#     delta_path = "./optimized_trigger/fed_opt_trig_stripe_r32p_{}_{}_{}vs{}.pt"
+        indices = [i for i, (_, y) in enumerate(dataset) if y == source_label]
+        idx = np.random.choice(indices)
 
-#     n_rows = len(dataset_flags)
-#     n_cols = 1 + len(aggregator_flags)   # clean + each aggregator
+        img, _ = dataset[idx]
 
-#     fig, axes = plt.subplots(
-#         n_rows,
-#         n_cols,
-#         figsize=(3 * n_cols, 3 * n_rows),
-#         squeeze=False
-#     )
+        clean_img = img
+        if isinstance(clean_img, torch.Tensor):
+            clean_img = transforms.ToPILImage()(clean_img)
 
-#     fig.suptitle("Poisoning comparison", fontsize=16, y=1.02)
+        ax = axes[row_idx, 0]
+        ax.imshow(clean_img)
+        ax.set_title(poison_titles["original"], fontsize=11)
+        ax.axis("off")
 
-#     for row_idx, dataset_flag in enumerate(dataset_flags):
-#         dataset = load_dataset(dataset_flag, train=True)
-#         img, label = dataset[np.random.randint(len(dataset))]
+        for col_idx, poisoner_flag in enumerate(list(poison_titles.keys())[1:], start=1):
 
-#         # --- clean image ---
-#         clean_img = img
-#         if isinstance(clean_img, torch.Tensor):
-#             clean_img = transforms.ToPILImage()(clean_img)
+            poisoner = pick_poisoner(
+                poisoner_flag,
+                dataset_flag,
+                target_label,
+            )
 
-#         ax = axes[row_idx, 0]
-#         ax.imshow(clean_img)
-#         ax.set_title(poison_titles["original"], fontsize=11)
-#         ax.axis("off")
+            poisoned_img, _ = poisoner.poison((img, source_label))
 
-#         # --- optimized trigger with different aggregators ---
-#         for col_idx, aggregator in enumerate(aggregator_flags, start=1):
-#             delta_path_ = delta_path.format(
-#                 dataset_flag,
-#                 aggregator,
-#                 NUM_POISONED,
-#                 NUM_CLEAN
-#             )
+            if isinstance(poisoned_img, torch.Tensor):
+                poisoned_img = transforms.ToPILImage()(poisoned_img)
 
-#             poisoner = pick_poisoner(
-#                 "optimized",
-#                 dataset_flag,
-#                 target_label,
-#                 delta=delta_path_
-#             )
+            ax = axes[row_idx, col_idx]
+            ax.imshow(to_img(poisoned_img))
+            ax.set_title(poison_titles[poisoner_flag], fontsize=11)
+            ax.axis("off")
 
-#             poisoned_img, _ = poisoner.poison((img, label))
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f"Saved comparison figure to {save_path}")
+    plt.show()
 
-#             if isinstance(poisoned_img, torch.Tensor):
-#                 poisoned_img = transforms.ToPILImage()(poisoned_img)
+def plot_optimized_poisoned_examples(model_flag="r32p", dataset_flags=["cifar"], aggregator_flags=["mean", "median", "trmean", "multikrum", "krum"], save_path="./plots/comparison_trigger_{}_{}.png", seed=4):
+    
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-#             ax = axes[row_idx, col_idx]
-#             ax.imshow(poisoned_img)
-#             ax.set_title(f"{aggregator}", fontsize=11)
-#             ax.axis("off")
+    poison_titles = {
+        "original": "Clean image",
+        "mean": "Optimized trigger (Mean)",
+        "median": "Optimized trigger (CW Median)",
+        "trmean": "Optimized trigger (Trimmed-Mean)",
+        "multikrum": "Optimized trigger (Multikrum)",
+        "krum": "Optimized trigger (Krum)",
+    }
 
-#     plt.tight_layout()
-#     plt.savefig(save_path, dpi=300, bbox_inches="tight")
-#     print(f"Saved comparison figure to {save_path}")
-#     plt.show()
+    source_label = 9
+    target_label = 4
+    NUM_POISONED = 3
+    NUM_CLEAN = 7
 
+    delta_path = "./optimized_trigger/fed_opt_trig_stripe_{}_{}_{}_{}vs{}.pt"
 
-# plot_poisoned_examples()
+    n_rows = len(dataset_flags)
+    n_cols = 1 + len(aggregator_flags)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3 * n_cols, 3 * n_rows),
+        squeeze=False
+    )
+
+    for row_idx, dataset_flag in enumerate(dataset_flags):
+        dataset = load_dataset(dataset_flag, train=True)
+        indices = [i for i, (_, y) in enumerate(dataset) if y == source_label]
+        idx = np.random.choice(indices)
+
+        img, _ = dataset[idx]
+
+        clean_img = img
+        if isinstance(clean_img, torch.Tensor):
+            clean_img = transforms.ToPILImage()(clean_img)
+
+        ax = axes[row_idx, 0]
+        ax.imshow(clean_img)
+        ax.set_title(poison_titles["original"], fontsize=11)
+        ax.axis("off")
+
+        for col_idx, aggregator in enumerate(aggregator_flags, start=1):
+            delta_path_ = delta_path.format(
+                model_flag,
+                dataset_flag,
+                aggregator,
+                NUM_POISONED,
+                NUM_CLEAN
+            )
+
+            poisoner = pick_poisoner(
+                "optimized",
+                dataset_flag,
+                target_label,
+                delta=delta_path_
+            )
+
+            poisoned_img, _ = poisoner.poison((img, source_label))
+
+            if isinstance(poisoned_img, torch.Tensor):
+                poisoned_img = transforms.ToPILImage()(poisoned_img)
+
+            ax = axes[row_idx, col_idx]
+            ax.imshow(poisoned_img)
+            ax.set_title(poison_titles[aggregator], fontsize=11)
+            ax.axis("off")
+
+    plt.tight_layout()
+    save_path = save_path.format(model_flag, "_".join(dataset_flags))
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    print(f"Saved comparison figure to {save_path}")
+    plt.show()
+
+if __name__ == "__main__":
+    plot_poisoned_examples()
+    plot_optimized_poisoned_examples()

@@ -1,43 +1,13 @@
-from modules.base_utils.datasets import get_n_classes, pick_poisoner
+from modules.base_utils.datasets import get_n_classes
 from modules.base_utils.util import get_train_info, mini_train, load_model,either_dataloader_dataset_to_both, extract_toml, slurmify_path, make_pbar, needs_big_ims
-from modules.optimizing_trigger.utils import sample_checkpoints, cosine_grad_loss, compute_batch_gradients, trigger_penalty, get_mu, extract_experts, get_clean_dataset, get_poison_dataset, move_to_device, init_delta, raw_to_preprocess, raw_to_trigger_preprocess, get_raw_clean_dataset, match_loss
+from modules.federated_optimizing_trigger.utils import sample_checkpoints, cosine_grad_loss, compute_batch_gradients, trigger_penalty, get_mu, extract_experts, get_clean_dataset, get_poison_dataset, move_to_device, init_delta, raw_to_preprocess, raw_to_trigger_preprocess, get_raw_clean_dataset, match_loss
 from modules.train_expert.utils import checkpoint_callback
-from modules.base_utils.aggregator.trmean import aggr_trmean
-from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
+from modules.federated_generate_labels.utils import agg as federated_aggregate
 import torch
 from pathlib import Path
 import os
 import matplotlib.pyplot as plt
-import numpy as np
 import copy
-import torchvision.transforms as transforms
-from pathlib import Path
-import copy
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-
-def federated_aggregate(params, grad_buf, method, f=1):
-    agg_grads = []
-    for i, p in enumerate(params):
-        grads = torch.stack(grad_buf[i], dim=0)
-
-        if method == "mean":
-            g = grads.mean(dim=0)
-        elif method == "median":
-            g = grads.median(dim=0).values
-        elif method == "trmean":
-            g = aggr_trmean(grads, f=f)
-        elif method == "multikrum":
-            g = aggr_multikrum(grads, f=f)
-        elif method == "krum":
-            g = aggr_multikrum(grads, f=f, m=1)
-        else:
-            raise ValueError(method)
-
-        agg_grads.append(g)
-
-    return agg_grads
 
 def build_worker_loaders(dataset, num_workers, batch_size):
     loaders = []
@@ -73,6 +43,7 @@ def optimize_trigger_step_federated(
     dataset_flag="cifar",
     init="stripe",
     model_flag="r32p",
+    orthogonal=False,
 ):
     sampled_k = sample_checkpoints(
         len(expert_models),
@@ -161,7 +132,7 @@ def optimize_trigger_step_federated(
                     for i, g in enumerate(grads):
                         grad_buf_mix[i].append(g)
 
-                    flat = torch.cat([g.view(-1) for g in grads])
+                    flat = torch.cat([g.reshape(-1) for g in grads])
                     poison_worker_grads.append(flat)
 
                     adv_loss_sum += loss_fn(logits_adv, y_poison)
@@ -174,7 +145,7 @@ def optimize_trigger_step_federated(
                 f=num_poisoned
             )
 
-            flat_mix = torch.cat([g.view(-1) for g in agg_mix])
+            flat_mix = torch.cat([g.reshape(-1) for g in agg_mix])
 
             if len(poison_worker_grads) > 0:
                 mu_poison = torch.stack(poison_worker_grads).mean(0)
@@ -193,7 +164,7 @@ def optimize_trigger_step_federated(
         agg_mix_mean = agg_mix_sum / n_exp
         mu_poison_mean = mu_poison_sum / n_exp
 
-        L_match = cosine_grad_loss(agg_mix_mean, mu_poison_mean)
+        L_match = cosine_grad_loss(agg_mix_mean, mu_poison_mean, orthogonal=orthogonal)
 
         if adv_count > 0:
             L_adv = adv_loss_sum / adv_count
@@ -221,18 +192,6 @@ def optimize_trigger_step_federated(
             "L_pen": f"{L_pen.item():.4f}",
             "||delta||": f"{delta.norm().item():.4f}",
         })
-
-    # delta_img = delta.detach().cpu().numpy().transpose(1, 2, 0)
-    # delta_img = (delta_img - delta_img.min()) / (delta_img.max() - delta_img.min() + 1e-8)
-    # plt.imshow(delta_img)
-    # plt.title("Optimized Trigger (Delta)")
-    # plt.axis("off")
-    # plt.savefig(f"out/optimizing_trigger_stripe/fed_opt_trig_{dataset_flag}_{agg_method}_{num_poisoned}_{num_honests}.png")
-
-    # torch.save(
-    # delta.cpu(),
-    # f"out/optimizing_trigger/fed_opt_trig_{dataset_flag}_{agg_method}_{num_poisoned}_{num_honests}.pt",
-    # )
     
     delta_img = delta.detach().cpu().numpy().transpose(1, 2, 0)
     delta_img = (delta_img - delta_img.min()) / (delta_img.max() - delta_img.min() + 1e-8)
@@ -246,7 +205,7 @@ def optimize_trigger_step_federated(
     os.makedirs("optimized_trigger", exist_ok=True)
     torch.save(
         delta_save,
-        f"optimized_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
+        f"optimized_trigger/fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
     )
 
     return delta
@@ -282,15 +241,20 @@ def optimize_trigger(
     num_honests=5,
     num_poisoned=5,
     model_flag="r32p",
+    output_dir_trigger="optimized_trigger",
+    restart=False,
+    orthogonal=False,
 ):
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    delta = init_delta(
-        mu.shape,
-        horizontal=True,
-        strength=6.0,
-        freq=16,
+    if restart and Path(output_dir_trigger).joinpath(f"fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt").exists():
+        delta = torch.load(Path(output_dir_trigger).joinpath(f"fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt"), map_location=device)
+    else:
+        delta = init_delta(
+            mu.shape,
+            horizontal=True,
+            strength=6.0,
+            freq=16,
         device=device,
         init=init
     )
@@ -387,22 +351,18 @@ def optimize_trigger(
                         device=device,
                         dataset_flag=dataset_flag,
                         model_flag=model_flag,
+                        orthogonal=orthogonal
                     )
 
         del expert_models
         torch.cuda.empty_cache()
-
-        # torch.save(
-        #     delta.detach().cpu(),
-        #     Path(output_dir) / f"out/optimizing_trigger/optimized_trigger_step_{step+1}.pt",
-        # )
 
     return delta.detach()
 
 
 def run(experiment_name, module_name, **kwargs):
     """
-    Optimizes and saves a trigger (delta, rho).
+    Optimizes and saves a trigger (delta).
     """
 
     slurm_id = kwargs.get("slurm_id", None)
@@ -420,16 +380,16 @@ def run(experiment_name, module_name, **kwargs):
     lambda_match = args.get("lambda_match", 0.0)
     lambda_adv = args.get("lambda_adv", 0.0)
     lambda_penalty = args.get("lambda_penalty", 0.0)
-    lambda_rho = args.get("lambda_rho", 0.0)
     lambda_delta = args.get("lambda_delta", 0.0)
 
     epsilon = args.get("epsilon", 0.1)
     lr_delta = args.get("lr_delta", 1e-2)
     n_steps = args.get("n_steps", 100)
+    orthogonal = args.get("orthogonal", False)
 
     alpha_ckpt = args.get("alpha_ckpt", None)
     num_chckpt = args.get("num_chckpt", 15)
-    
+    restart = args.get("restart", False)
     expert_config = args.get("expert_config", {})
     expert_path = args.get("expert_path", None)
 
@@ -485,6 +445,8 @@ def run(experiment_name, module_name, **kwargs):
         optim_kwargs=optim_kwargs,
         scheduler_kwargs=scheduler_kwargs,
         model_flag=model_flag,
+        restart=restart,
+        orthogonal=orthogonal
     )
 
     print("Optimized trigger obtained.")
@@ -500,7 +462,7 @@ def run(experiment_name, module_name, **kwargs):
     os.makedirs("optimized_trigger", exist_ok=True)
     torch.save(
         optimized_delta.detach().cpu(),
-        f"optimized_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
+        f"optimized_trigger/fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
     )
 
 if __name__ == "__main__":

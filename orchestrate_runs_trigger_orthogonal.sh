@@ -3,27 +3,27 @@ set -e
 set -x
 
 BASE_DIR="$HOME/FLIP"
-LOG_DIR="$BASE_DIR/logs"
+LOG_DIR="$BASE_DIR/logs_orthogonal_trigger"
 
 mkdir -p "$LOG_DIR"
 
-DATASETS=("cifar" "svhn") # "cifar_100" "tiny_imagenet"
+DATASETS=("cifar") # "cifar_100" "tiny_imagenet"
 ATTACK="backdoor"
 AGGREGATORS=("mean" "median" "trmean" "multikrum" "krum") # 
 BUDGETS=(0 150 300 500 1000 1500 2000 2500 5000)
 N_CYCLES=5
 NUM_CLEAN=7
 NUM_POISONED=3
-MODEL_FLAGS=("convnext_micro") # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
+MODEL_FLAGS=("r32p") # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
 POISONERS=("optimized" "1xs")
 
 MACHINES=(
 # Salle 30
-allemagne
-angleterre
-autriche
-belgique
-espagne
+# allemagne
+# angleterre
+# autriche
+# belgique
+# espagne
 # # finlande
 # # france
 # # groenland
@@ -117,25 +117,25 @@ espagne
 # vendee
 # vosges
 # # Salle 34
-ablette
-anchois
-anguille
-# barbeau
-barbue
-baudroie
-# brochet
-# carrelet
-# gardon
-# # gymnote
-# labre
-# lieu
-# # lotte
-# # mulet
-# # murene
-# # piranha
-# # raie
-# # requin
-# rouget
+# ablette
+# anchois
+# anguille
+# # barbeau
+# barbue
+# baudroie
+brochet
+carrelet
+gardon
+# gymnote
+labre
+lieu
+# lotte
+# mulet
+# murene
+# piranha
+# raie
+# requin
+rouget
 # roussette
 # saumon
 # silure

@@ -1,5 +1,5 @@
 """
-Optimizes logit labels given expert trajectories using trajectory matching.
+Optimizes logit labels given expert trajectories using federated trajectory matching.
 """
 
 from pathlib import Path
@@ -13,116 +13,9 @@ from modules.base_utils.datasets import get_matching_datasets, pick_poisoner, ge
 from modules.base_utils.util import extract_toml, get_module_device, get_mtt_attack_info, \
                                     load_model, either_dataloader_dataset_to_both, make_pbar, \
                                     needs_big_ims, slurmify_path, clf_loss, softmax, total_mse_distance
-from modules.federated_generate_labels.utils import coalesce_attack_config, extract_experts, \
-                                                    extract_labels, sgd_step
+from modules.federated_generate_labels.utils import coalesce_attack_config, extract_experts, extract_labels, sgd_step, agg
 from modules.base_utils.aggregator.trmean import aggr_trmean
 from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
-
-def cosine_similarity_list(grads_a, grads_b, eps=1e-8):
-    dot, na, nb = 0.0, 0.0, 0.0
-    for ga, gb in zip(grads_a, grads_b):
-        dot += torch.sum(ga * gb)
-        na += torch.sum(ga ** 2)
-        nb += torch.sum(gb ** 2)
-    return dot / (torch.sqrt(na) * torch.sqrt(nb) + eps)
-
-def agg(params, grad_buf, method, f=1):
-    agg_grads = []
-    for i, p in enumerate(params):
-        grads = torch.stack(grad_buf[i], dim=0)
-
-        if method == "mean":
-            g = grads.mean(dim=0)
-        elif method == "median":
-            g = grads.median(dim=0).values
-            # orig_shape = grads.shape[1:]
-            # grads_flat = grads.view(grads.shape[0], -1)
-
-            # g_flat = damed(grads_flat)
-
-            # g = g_flat.view(orig_shape)
-
-        elif method == "trmean":
-            g = aggr_trmean(grads, f=f)
-        elif method == "multikrum":
-            g = aggr_multikrum(grads, f=f)
-        elif method == "krum":
-            g = aggr_multikrum(grads, f=f, m=1)
-        else:
-            raise ValueError(method)
-        p.grad = g
-        agg_grads.append(g)
-    return agg_grads
-
-def get_s(num_clients, num_poisoned):
-    s = num_clients / 2 + 1
-    return max(1, math.floor(s) - num_poisoned)
-
-def get_z_max(s, num_clients, device=None, dtype=None, eps=1e-6):
-    q = (num_clients - s) / num_clients
-    q = min(max(q, eps), 1 - eps)
-    z = norm.ppf(q)
-    return torch.tensor(z, device=device, dtype=dtype)
-
-def get_median_hinge_loss(
-    grads_buf,
-    num_honests,
-    num_poisoned,
-    eps=1e-8
-):
-    device = grads_buf[0][0].device
-
-    flat_grads = torch.cat(
-        [torch.stack(g_list, dim=0).view(len(g_list), -1)
-         for g_list in grads_buf],
-        dim=1
-    )
-
-    honest = flat_grads[:num_honests]          # [H, D]
-    poisoned = flat_grads[-num_poisoned:]      # [P, D]
-
-    lower = honest.min(dim=0).values
-    upper = honest.max(dim=0).values
-
-    # hinge coordinate
-    loss = (
-        torch.relu(poisoned - upper) +
-        torch.relu(lower - poisoned)
-    )
-
-    return loss.mean()
-
-
-def get_stealthy_loss_vectorized(
-    grads_buf,
-    num_honests,
-    num_poisoned,
-    z_max,
-    eps=1e-5
-):
-    device = grads_buf[0][0].device
-    n_params = sum(g_list[0].numel() for g_list in grads_buf)
-
-    flat_grads = torch.cat(
-        [torch.stack(g_list, dim=0).view(len(g_list), -1) for g_list in grads_buf],
-        dim=1
-    )
-
-    honest_grads = flat_grads[:num_honests, :]
-    poisoned_grads = flat_grads[-num_poisoned:, :]
-
-    mu = honest_grads.mean(dim=0)
-    sigma = honest_grads.std(dim=0, unbiased=True)
-    sigma = torch.clamp(sigma, min=eps)
-
-    denom = torch.maximum(z_max * sigma, torch.tensor(eps, device=device))
-
-    diff = (poisoned_grads - mu) / denom
-
-    stealthy_loss = (diff.pow(2).sum() / n_params) / num_poisoned
-
-    return stealthy_loss
-
 
 def run(experiment_name, module_name, **kwargs):
     """
@@ -176,9 +69,6 @@ def run(experiment_name, module_name, **kwargs):
     labels = extract_labels(mtt_dataset.distill, config['one_hot_temp'], n_classes)
     labels_init = torch.stack(extract_labels(mtt_dataset.distill, 1, n_classes))
     labels_syn = torch.stack(labels).requires_grad_(True)
-
-    s = get_s(num_honests + num_poisoned, num_poisoned)
-    z_max = get_z_max(s, num_honests + num_poisoned)
 
     # Load expert trajectories
     print("Loading expert trajectories...")
@@ -237,10 +127,9 @@ def run(experiment_name, module_name, **kwargs):
                 expert_grad_buf = [[] for _ in expert_params]
                 student_grad_buf = [[] for _ in student_params]
 
-                # Compute gradients
                 for cid, batch in enumerate(batches):
 
-                    # ---------- HONEST CLIENTS ----------
+                    # HONEST CLIENTS
                     if cid < num_honests:
                         x, y = batch[0].to(device), batch[1].to(device)
 
@@ -253,7 +142,7 @@ def run(experiment_name, module_name, **kwargs):
                                 expert_grad_buf[i].append(p.grad.detach().clone())
                                 student_grad_buf[i].append(p.grad.detach().clone())
 
-                    # ---------- POISONED CLIENTS ----------
+                    # POISONED CLIENTS
                     else:
                         x_t, y_t, x_d, _, idx = batch
                         x_t, y_t = x_t.to(device), y_t.to(device)
@@ -279,12 +168,12 @@ def run(experiment_name, module_name, **kwargs):
                             student_grad_buf[i].append(g)
 
                 # Aggregate expert gradients
-                agg_expert_grads = agg(
-                    expert_params,
-                    expert_grad_buf,
-                    agg_method, 
-                    f=num_poisoned
-                )
+                # agg_expert_grads = agg(
+                #     expert_params,
+                #     expert_grad_buf,
+                #     agg_method, 
+                #     f=num_poisoned
+                # )
 
                 optimizer_expert.step()
                 expert_model.eval()
@@ -327,27 +216,6 @@ def run(experiment_name, module_name, **kwargs):
                     if attack == "untargeted":
                         grand_loss = -grand_loss
                 
-                elif attack == "grad_ascent":
-                    cos = cosine_similarity_list(
-                        agg_student_grads,
-                        agg_expert_grads
-                    )
-                    grand_loss = cos + reg_term
-
-                elif attack == "orth_grad":
-                    cos = cosine_similarity_list(
-                        agg_student_grads,
-                        agg_expert_grads
-                    )
-                    grand_loss = cos ** 2 + reg_term
-
-                if attack == "stealthy_backdoor":
-                    stealthy_loss = get_median_hinge_loss(
-                        student_grad_buf,
-                        num_honests,
-                        num_poisoned
-                    )
-                    grand_loss += (1-gamma)*stealthy_loss
                 
                 # Optimize labels
                 optimizer_labels.zero_grad()
@@ -359,7 +227,6 @@ def run(experiment_name, module_name, **kwargs):
                 pbar.set_postfix(
                     g_loss=f"{np.mean(losses[-20:]):.4g}",
                     backdoor_loss=f"{(param_loss/param_dist).item():.4g}" if attack in ["backdoor", "untargeted", "stealthy_backdoor"] else "N/A",
-                    stealthy_loss=f"{stealthy_loss.item():.4g}" if attack == "stealthy_backdoor" else "N/A",
                     reg=f"{reg_term.item():.4g}"
                 )
 

@@ -17,6 +17,7 @@ from modules.base_utils import util
 
 
 experiment_name = sys.argv[1]
+print(f"Running experiment: {experiment_name}")
 args = util.extract_toml(experiment_name)
 resolves_to = {}
 

@@ -1,5 +1,5 @@
 ### 
-# train_user schema
+# federated_train_user schema
 # Trains and records metrics on a downstream model trained on input labels.
 # Outputs the poison accuracy, clean accuracy, and training labels .npy files and a final model .pth.
 ###
@@ -21,7 +21,7 @@ alpha = "float: [0, 1]. Specifies interpolation parameter between true (1) and i
 batch_size = "int: {0,1,...,infty}. Specifies batch size. Set to default for trainer if omitted."
 epochs = "int: {0,1,...,infty}. Specifies number of epochs. Set to default for trainer if omitted."
 optim_kwargs = "dict. Optional keywords for Pytorch SGD / Adam optimizer. See sever example."
-scheduler_kwargs = "dict. Optional keywords for Pytorch learning rate optimizer (with SGD). See sever example."
+schedule_kwargs = "dict. Optional keywords for Pytorch learning rate optimizer (with SGD). See sever example."
 num_honests = "int: {0,1,...,infty}. Num of honests workers"
 num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers"
 budget = "int: {0,1,...,infty}. Flip budget"

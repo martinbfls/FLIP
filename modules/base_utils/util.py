@@ -34,7 +34,6 @@ DEFAULT_SGD_SCHED_KWARGS = {
     'gamma': 0.1
 }
 
-
 DEFAULT_ADAM_BATCH_SIZE = 256
 DEFAULT_ADAM_EPOCHS = 200
 DEFAULT_ADAM_KWARGS = {
@@ -47,7 +46,7 @@ DEFAULT_ADAM_SCHED_KWARGS = {
     'gamma': 0.1
 }
 
-BIG_IMS_MODELS = ['vgg', 'vgg-pretrain', 'vit-pretrain']
+BIG_IMS_MODELS = ['convnext-tiny', 'vgg', 'vgg-pretrain', 'vit-pretrain']
 
 
 def generate_full_path(path):
@@ -114,6 +113,22 @@ def load_model(model_flag, num_classes=10):
             if 'head' not in name:
                 param.requires_grad=False
         return model.cuda()
+    
+    elif model_flag == "convnext_tiny":
+        from torchvision.models import convnext_tiny
+
+        model = convnext_tiny(weights='IMAGENET1K_V1')
+        model.classifier[2] = torch.nn.Linear(model.classifier[2].in_features, num_classes)
+
+        return model.cuda()
+    
+    elif model_flag == "convnext_micro":
+        from modules.base_utils.model.convnext_micro import ConvNeXtMicro
+
+        model = ConvNeXtMicro(num_classes=num_classes)
+
+        return model.cuda()
+    
     else:
         raise NotImplementedError
 
@@ -301,7 +316,6 @@ def mini_train_multi(
     total_samples = sum(client_sizes)
     total_examples = epochs * total_samples
 
-    # Test sets
     if test_data:
         if not isinstance(test_data, Iterable):
             test_data = [test_data]
@@ -314,7 +328,6 @@ def mini_train_multi(
             train_epoch_correct = 0
 
             for batches in zip(*dataloaders):
-                # buffers de gradients
                 grad_buffer = [
                     [] for _ in model.parameters()
                 ]

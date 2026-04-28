@@ -1,24 +1,25 @@
-#!/usr/bin/env python3
 import os
 from pathlib import Path
 
 NUM_POISONED = 3
 NUM_CLEAN = 7
 ATTACK = "backdoor"
-DATASETS = ["cifar", "svhn"] #, "cifar_100", "tiny_imagenet"
-POISONERS = ["1xs", "optimized", "4xl", "1xp"]
+DATASETS = ["cifar", "svhn"] 
+POISONERS = ["1xs","optimized"]
 INIT="stripe"
-MODEL_FLAGS = ["r32p"]  # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
-AGGREGATORS = ["mean", "median", "trmean", "multikrum", "krum"] #  "median" "trmean" "multikrum" "krum"
+MODEL_FLAGS = ["convnext_micro"]
+AGGREGATORS = ["mean", "median", "trmean", "multikrum", "krum"]
 BUDGETS = [0, 150, 300, 500, 1000, 1500, 2000, 2500, 5000]
-N_CYCLES = 5
+N_CYCLES = 10
 GAMMA = 1.0
+RESTART = False
+ORTHOGONAL = False
 
 BASE_DIR = Path("experiments/federated_experiments").resolve()
 
-LEARNING_RATE = {'r18': 0.1, 'r32p': 0.1, 'vgg': 0.01, 'vgg-pretrain': 0.01, 'vit-pretrain': 0.05}
-WEIGHT_DECAY = {'r18': 2e-4, 'r32p': 2e-4, 'vgg': 2e-4, 'vgg-pretrain': 2e-4, 'vit-pretrain': 5e-4}
-MILESTONE = {'r18': [75, 125], 'r32p': [75, 125], 'vgg': [125], 'vgg-pretrain': [125], 'vit-pretrain': [125]}
+LEARNING_RATE = {'convnext_micro': 0.1, 'r18': 0.1, 'r32p': 0.1, 'vgg': 0.01, 'vgg-pretrain': 0.01, 'vit-pretrain': 0.05}
+WEIGHT_DECAY = {'convnext_micro': 2e-4, 'r18': 2e-4, 'r32p': 2e-4, 'vgg': 2e-4, 'vgg-pretrain': 2e-4, 'vit-pretrain': 5e-4}
+MILESTONE = {'convnext_micro': [75, 125], 'r18': [75, 125], 'r32p': [75, 125], 'vgg': [125], 'vgg-pretrain': [125], 'vit-pretrain': [125]}
 
 OPT_TRIGGER_TEMPLATE = """[federated_optimizing_trigger]
 model = "{model_flag}"
@@ -35,7 +36,7 @@ epsilon = 1.0
 lr_delta = 1e-2
 n_steps = 50
 alpha_ckpt = 0.01
-num_chckpt = 5
+num_chckpt = 3
 
 init = "{init}"
 
@@ -48,6 +49,9 @@ output_dir = "optimized_trigger"
 num_poisoned = {num_poisoned}
 num_honests = {num_clean}
 agg_method = "{aggregator}"
+
+restart = {restart}
+orthogonal = {orthogonal}
 
 [federated_optimizing_trigger.expert_config]
 experts = 1
@@ -159,6 +163,8 @@ def generate_all_configs():
                     lr=lr,
                     wd=wd,
                     milestones=MILESTONE.get(model_flag, [75, 125]),
+                    restart=str(RESTART).lower(),
+                    orthogonal=str(ORTHOGONAL).lower(),
                 )
                 write_config(opt_dir / "config.toml", opt_config)
                 for poisoner in POISONERS:
@@ -178,7 +184,7 @@ def generate_all_configs():
                             init=INIT,
                             lr=lr,
                             wd=wd,
-                            milestones=MILESTONE.get(model_flag, [75, 125])
+                            milestones=MILESTONE.get(model_flag, [75, 125]),
                         )
                         write_config(gen_label_dir / "config.toml", gen_label_config)
                         for budget in BUDGETS:
@@ -196,7 +202,7 @@ def generate_all_configs():
                                 init=INIT,
                                 lr=lr,
                                 wd=wd,
-                                milestones=MILESTONE.get(model_flag, [75, 125])
+                                milestones=MILESTONE.get(model_flag, [75, 125]),
                             )
                             write_config(train_user_dir / "config.toml", train_user_config)
 

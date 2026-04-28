@@ -1,5 +1,5 @@
 """
-Trains a downstream (user) model on reconstructed datasets with input labels.
+Trains a downstream (user) model on reconstructed datasets with input labels in the federated learning setting.
 """
 
 from pathlib import Path
@@ -107,9 +107,6 @@ def run(experiment_name, module_name, **kwargs):
         optim_kwargs,
         scheduler_kwargs,
     )
-
-    # if agg_method == "median":
-    #     batch_size = batch_size // 3
 
     model_retrain, clean_metrics, poison_metrics = mini_train_multi(
         model=model_retrain,
