@@ -7,33 +7,33 @@ LOG_DIR="$BASE_DIR/logs_ter"
 
 mkdir -p "$LOG_DIR"
 
-DATASETS=("svhn") # "cifar_100" "tiny_imagenet"
+DATASETS=("cifar") # "cifar_100" "tiny_imagenet"
 ATTACK="backdoor"
-AGGREGATORS=("median") #  "median" "trmean" "multikrum" "krum"
+AGGREGATORS=("median" "trmean" "multikrum" "krum") #  
 BUDGETS=(0 150 300 500 1000 1500 2000 2500 5000)
 N_CYCLES=10
 NUM_CLEAN=7
 NUM_POISONED=3
-MODEL_FLAG="convnext_micro"
-POISONERS=("1xs") #  "1xp" "4xl"
+MODEL_FLAG="r32p"
+POISONERS=("optimized") #  "1xp" "4xl"
 
 MACHINES=(
-# # Salle 30
-# # allemagne
-# # angleterre
-# # autriche
-# # belgique
-# # espagne
-# finlande
-# france
-# groenland
-# hollande
-# hongrie
-# irlande
-# islande
-# lituanie
-# malte
-# monaco
+# Salle 30
+allemagne
+angleterre
+autriche
+# belgique
+espagne
+finlande
+france
+groenland
+hollande
+hongrie
+irlande
+islande
+lituanie
+malte
+monaco
 # pologne
 # portugal
 # roumanie
@@ -65,84 +65,84 @@ MACHINES=(
 # urabu
 # verdier
 # Salle 32
-# aerides
-# barlia
-# calanthe
-# diuris
-# encyclia
-# epipactis
+aerides
+barlia
+calanthe
+diuris
+encyclia
+epipactis
 # gennaria
-# habenaria
-# isotria
-# ipsea
-# liparis
+habenaria
+isotria
+ipsea
+liparis
 # lycaste
-# malaxis
-# neotinea
-# oncidium
-# ophrys
-# orchis
-# pleione
-# pogonia
-# serapias
-# telipogon
-# vanda
-# vanilla
-# xylobium
-# zeuxine
-# # Salle 33
-# ain
-# allier
-# ardennes
-# carmor
-# charente
-# cher
-# creuse
-# dordogne
-# doubs
-# essonne
-# finistere
+malaxis
+neotinea
+oncidium
+ophrys
+orchis
+pleione
+pogonia
+serapias
+telipogon
+vanda
+vanilla
+xylobium
+zeuxine
+# Salle 33
+ain
+allier
+ardennes
+carmor
+charente
+cher
+creuse
+dordogne
+doubs
+essonne
+finistere
 # gironde
-# indre
-# jura
-# landes
-# loire
-# manche
-# marne
-# mayenne
-# morbihan
-# moselle
-# saone
-# somme
-# vendee
-# vosges
+indre
+jura
+landes
+loire
+manche
+marne
+mayenne
+morbihan
+moselle
+saone
+somme
+vendee
+vosges
 # Salle 34
-ablette
-anchois
-anguille
-barbeau
-barbue
-baudroie
-brochet
-carrelet
-gardon
-gymnote
-labre
-lieu
-lotte
-mulet
-murene
-piranha
-raie
-requin
-rouget
-roussette
-saumon
-silure
-sole
-thon
-truite
-# # Salle 35
+# ablette
+# anchois
+# anguille
+# barbeau
+# barbue
+# baudroie
+# brochet
+# carrelet
+# gardon
+# gymnote
+# labre
+# lieu
+# lotte
+# mulet
+# murene
+# piranha
+# raie
+# requin
+# rouget
+# roussette
+# saumon
+# silure
+# sole
+# thon
+# truite
+# Salle 35
 # acromion
 # apophyse
 # astragale
@@ -150,50 +150,50 @@ truite
 # axis
 # coccyx
 # cote
-# cubitus
-# cuboide
-# femur
-# frontal
-# humerus
-# malleole
-# metacarpe
-# parietal
-# perone
-# phalange
+cubitus
+cuboide
+femur
+frontal
+humerus
+malleole
+metacarpe
+parietal
+perone
+phalange
 # radius
-# rotule
-# sacrum
-# sternum
-# tarse
-# temporal
-# tibia
-# #xiphoide
-# # Salle 36
-# #bentley
-# bugatti
-# cadillac
-# chrysler
-# corvette
-# ferrari
-# fiat
-# ford
-# jaguar
-# lada
-# maserati
-# mazda
-# nissan
-# niva
-# peugeot
-# pontiac
-# porsche
-# renault
-# rolls
-# rover
-# royce
-# simca
-# skoda
-# venturi
-# volvo
+rotule
+sacrum
+sternum
+tarse
+temporal
+tibia
+#xiphoide
+# Salle 36
+#bentley
+bugatti
+cadillac
+chrysler
+corvette
+ferrari
+fiat
+ford
+jaguar
+lada
+maserati
+mazda
+nissan
+niva
+peugeot
+pontiac
+porsche
+renault
+rolls
+rover
+royce
+simca
+skoda
+venturi
+volvo
 )
 
 N_MACHINES=${#MACHINES[@]}

@@ -196,7 +196,7 @@ def run(experiment_name, module_name, **kwargs):
                     dim=1
                 ).mean()
 
-                if attack in ["backdoor", "untargeted", "stealthy_backdoor"]:
+                if attack in ["backdoor", "untargeted"]:
                     for init, student, expert, grad, state in zip(
                         expert_start,
                         student_params,
@@ -213,8 +213,6 @@ def run(experiment_name, module_name, **kwargs):
 
                     grand_loss = (param_loss / param_dist) + reg_term
                     grand_loss = gamma * grand_loss
-                    if attack == "untargeted":
-                        grand_loss = -grand_loss
                 
                 
                 # Optimize labels
@@ -226,7 +224,7 @@ def run(experiment_name, module_name, **kwargs):
                 pbar.update(batch_size)
                 pbar.set_postfix(
                     g_loss=f"{np.mean(losses[-20:]):.4g}",
-                    backdoor_loss=f"{(param_loss/param_dist).item():.4g}" if attack in ["backdoor", "untargeted", "stealthy_backdoor"] else "N/A",
+                    backdoor_loss=f"{(param_loss/param_dist).item():.4g}" if attack in ["backdoor"] else "N/A",
                     reg=f"{reg_term.item():.4g}"
                 )
 
