@@ -19,6 +19,7 @@ optim_kwargs = "dict: optimization arguments"
 schedule_kwargs = "dict: optimization arguments"
 
 output_dir = "string. Path to output directory (slurm compatible)."
+output_dir_trigger = "string. Path to output directory (slurm compatible)."
 
 device = "string: {cpu, cuda}. Device used for optimization. Defaults to cuda if available."
 
