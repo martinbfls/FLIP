@@ -9,12 +9,12 @@ mkdir -p "$LOG_DIR"
 
 DATASETS=("cifar" "svhn") # "cifar_100" "tiny_imagenet"
 ATTACK="backdoor"
-AGGREGATORS=("mean" "median" "trmean" "multikrum" "krum") # 
+AGGREGATORS=("mean") #  "median" "trmean" "multikrum" "krum"
 BUDGETS=(0 150 300 500 1000 1500 2000 2500 5000)
 N_CYCLES=5
-NUM_CLEAN=7
-NUM_POISONED=3
-MODEL_FLAGS=("convnext_micro") # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
+NUM_CLEAN=0
+NUM_POISONED=1
+MODEL_FLAGS=("r32p" "convnext_micro") # "r18" "vgg" "vgg-pretrain"  "vit-pretrain"
 POISONERS=("optimized" "1xs")
 
 MACHINES=(

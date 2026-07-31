@@ -708,6 +708,119 @@ def get_matching_datasets(
     else:
         return poisoned_train_dataset, distill_dataset, test_dataset, poison_test_dataset, poisoned_mtt_dataset
 
+def shard_dataset_indices(n_samples, num_workers, seed=0, iid=True, labels=None, n_classes=None):
+    rng = np.random.RandomState(seed)
+
+    if iid:
+        idx = np.arange(n_samples)
+        rng.shuffle(idx)
+        return np.array_split(idx, num_workers)
+
+    # (option non-IID simple: shard par labels)
+    assert labels is not None and n_classes is not None
+
+    shards = [[] for _ in range(num_workers)]
+    class_indices = [np.where(labels == c)[0] for c in range(n_classes)]
+
+    for c in range(n_classes):
+        rng.shuffle(class_indices[c])
+        splits = np.array_split(class_indices[c], num_workers)
+        for i in range(num_workers):
+            shards[i].extend(splits[i])
+
+    return [np.array(s) for s in shards]
+
+
+def build_federated_datasets(
+    dataset_flag,
+    poisoner,
+    label,
+    num_workers,
+    num_poisoned,
+    seed=1,
+    train_pct=1.0,
+    big=False,
+    clean=False,
+    iid=True
+):
+    # -------------------- load datasets --------------------
+    train_transform = TRANSFORM_TRAIN_XY[dataset_flag + ('_big' if big else '')]
+    test_transform = TRANSFORM_TEST_XY[dataset_flag + ('_big' if big else '')]
+
+    train_data = load_dataset(dataset_flag, train=True)
+    test_data = load_dataset(dataset_flag, train=False)
+
+    n_classes = get_n_classes(dataset_flag)
+    train_labels = np.array([y for _, y in train_data])
+
+    # optional truncation
+    n_train = int(len(train_data) * train_pct)
+    train_data = Subset(train_data, np.arange(n_train))
+    train_labels = train_labels[:n_train]
+
+    # -------------------- shard dataset --------------------
+    shards = shard_dataset_indices(
+        n_samples=len(train_data),
+        num_workers=num_workers,
+        seed=seed,
+        iid=iid,
+        labels=train_labels,
+        n_classes=n_classes
+    )
+
+    rng = np.random.RandomState(seed)
+    poisoned_workers = set(rng.choice(num_workers, num_poisoned, replace=False))
+
+    worker_datasets = []
+
+    # -------------------- poisoning logic --------------------
+    for i, shard in enumerate(shards):
+
+        base_dataset = Subset(train_data, shard)
+
+        if i in poisoned_workers:
+            # choose poison indices ONLY inside shard
+            shard_labels = train_labels[shard]
+
+            if label == -1:
+                poison_mask = shard_labels != poisoner.target_label
+            else:
+                poison_mask = shard_labels == label
+
+            poison_inds = shard[np.where(poison_mask)[0]]
+
+            poison_dataset = MappedDataset(
+                Subset(train_data, poison_inds),
+                poisoner,
+                seed=seed + i
+            )
+
+            dataset = ConcatDataset([base_dataset, poison_dataset])
+
+        else:
+            dataset = base_dataset
+
+        dataset = MappedDataset(dataset, train_transform)
+        worker_datasets.append(dataset)
+
+    # -------------------- shared datasets --------------------
+    distill_dataset = MappedDataset(train_data, train_transform)
+    test_dataset = MappedDataset(test_data, test_transform)
+
+    # -------------------- poisoned test set --------------------
+    n_poisons_test = len(test_data) // n_classes
+    if dataset_flag == 'svhn':
+        n_poisons_test = 1500
+
+    poison_test_dataset = PoisonedDataset(
+        test_data,
+        poisoner,
+        eps=n_poisons_test,
+        label=label if label != -1 else None,
+        transform=test_transform,
+    )
+
+    return worker_datasets, poisoned_workers, distill_dataset, test_dataset, poison_test_dataset
 
 def construct_user_dataset(distill_dataset, labels, mask=None, target_label=None, include_labels=False):
     dataset = LabelWrappedDataset(distill_dataset, labels, include_labels)

@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from modules.base_utils.aggregator.trmean import aggr_trmean
 from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
+from modules.base_utils.aggregator.softkrum import krum as aggr_soft_multikrum
 
 DEFAULT_ATTACK_ITERATIONS = 20
 DEFAULT_EXPERT_CONFIG = {
@@ -92,7 +93,7 @@ def coalesce_attack_config(attack_config):
                                       **labels_kwargs}
     return {**DEFAULT_ATTACK_CONFIG, **attack_config}
 
-def agg(params, grad_buf, method, f=1):
+def agg(params, grad_buf, method, f=1, n=1):
     agg_grads = []
     for i, p in enumerate(params):
         grads = torch.stack(grad_buf[i], dim=0)
@@ -101,13 +102,16 @@ def agg(params, grad_buf, method, f=1):
             g = grads.mean(dim=0)
         elif method == "median":
             g = grads.median(dim=0).values
-
         elif method == "trmean":
             g = aggr_trmean(grads, f=f)
         elif method == "multikrum":
             g = aggr_multikrum(grads, f=f)
+        elif method == "softmultikrum":
+            g = aggr_soft_multikrum(grads, f=f, m=n-f-2)
         elif method == "krum":
             g = aggr_multikrum(grads, f=f, m=1)
+        elif method == "softkrum":
+            g = aggr_soft_multikrum(grads, f=f, m=1)
         else:
             raise ValueError(method)
         p.grad = g

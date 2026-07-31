@@ -13,7 +13,7 @@ import toml
 from collections import OrderedDict
 from modules.base_utils.aggregator.trmean import aggr_trmean
 from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
-
+from modules.base_utils.aggregator.softkrum import krum as aggr_soft_multikrum
 from modules.base_utils.datasets import make_dataloader
 
 if torch.cuda.is_available():
@@ -364,19 +364,23 @@ def mini_train_multi(
                     grads = torch.stack(grad_buffer[i], dim=0)
 
                     if agg_method == "mean":
-                        agg_grad = grads.mean(dim=0)
+                        g = grads.mean(dim=0)
                     elif agg_method == "median":
-                        agg_grad = grads.median(dim=0).values
+                        g = grads.median(dim=0).values
                     elif agg_method == "trmean":
-                        agg_grad = aggr_trmean(grads, f=f)
+                        g = aggr_trmean(grads, f=f)
                     elif agg_method == "multikrum":
-                        agg_grad = aggr_multikrum(grads, f=f)
+                        g = aggr_multikrum(grads, f=f)
+                    elif agg_method == "softmultikrum":
+                        g = aggr_soft_multikrum(grads, f=f, m=grads.shape[0]-f-2)
                     elif agg_method == "krum":
-                        agg_grad = aggr_multikrum(grads, f=f, m=1)
+                        g = aggr_multikrum(grads, f=f, m=1)
+                    elif agg_method == "softkrum":
+                        g = aggr_soft_multikrum(grads, f=f, m=1)
                     else:
                         raise ValueError(f"Unknown agg_method: {agg_method}")
 
-                    p.grad = agg_grad
+                    p.grad = g
 
                 opt.step()
 

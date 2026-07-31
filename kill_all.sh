@@ -5,9 +5,9 @@ BASE_DIR="$HOME/FLIP"
 MACHINES=(
 # Salle 30
 allemagne
-angleterre
+# angleterre
 autriche
-# belgique
+belgique
 espagne
 finlande
 france
@@ -19,36 +19,36 @@ islande
 lituanie
 malte
 monaco
-# pologne
-# portugal
-# roumanie
-# suede
+pologne
+portugal
+roumanie
+suede
 # Salle 31
-#albatros
-#autruche
-#bengali
-#coucou
-#dindon
-#epervier
-#faisan
-#gelinotte
-#hibou
-#harpie
-# jabiru
-# kamiche
-# linotte
-# loriol
-# mouette
-# nandou
-# ombrette
-# perdrix
+albatros
+autruche
+bengali
+coucou
+dindon
+epervier
+faisan
+gelinotte
+hibou
+# harpie
+jabiru
+kamiche
+linotte
+loriol
+mouette
+nandou
+ombrette
+perdrix
 # quetzal
-# quiscale
-# rouloul
-# sitelle
-# traquet
-# urabu
-# verdier
+quiscale
+rouloul
+sitelle
+traquet
+urabu
+verdier
 # Salle 32
 aerides
 barlia
@@ -57,7 +57,7 @@ diuris
 encyclia
 epipactis
 # gennaria
-habenaria
+# habenaria
 isotria
 ipsea
 liparis
@@ -67,7 +67,7 @@ neotinea
 oncidium
 ophrys
 orchis
-pleione
+# pleione
 pogonia
 serapias
 telipogon
@@ -87,54 +87,54 @@ dordogne
 doubs
 essonne
 finistere
-# gironde
+gironde
 indre
 jura
 landes
 loire
 manche
-marne
-mayenne
+# marne
+# mayenne
 morbihan
 moselle
 saone
-somme
-vendee
+# somme
+# vendee
 vosges
 # Salle 34
-# ablette
-# anchois
-# anguille
-# barbeau
-# barbue
-# baudroie
-# brochet
-# carrelet
-# gardon
-# gymnote
-# labre
-# lieu
-# lotte
-# mulet
-# murene
-# piranha
-# raie
-# requin
-# rouget
-# roussette
-# saumon
-# silure
-# sole
-# thon
-# truite
+ablette
+anchois
+anguille
+barbeau
+barbue
+baudroie
+brochet
+carrelet
+gardon
+gymnote
+labre
+lieu
+lotte
+mulet
+murene
+piranha
+raie
+requin
+rouget
+roussette
+saumon
+silure
+sole
+thon
+truite
 # Salle 35
-# acromion
-# apophyse
-# astragale
-# atlas
-# axis
-# coccyx
-# cote
+acromion
+apophyse
+astragale
+atlas
+axis
+coccyx
+cote
 cubitus
 cuboide
 femur
@@ -145,16 +145,16 @@ metacarpe
 parietal
 perone
 phalange
-# radius
+radius
 rotule
 sacrum
 sternum
 tarse
 temporal
 tibia
-#xiphoide
+xiphoide
 # Salle 36
-#bentley
+bentley
 bugatti
 cadillac
 chrysler
@@ -177,7 +177,7 @@ rover
 royce
 simca
 skoda
-venturi
+# venturi
 volvo
 )
 
@@ -198,3 +198,13 @@ for m in "${MACHINES[@]}"; do
 done
 
 echo "🔥 Kill done."
+
+
+# for m in "${MACHINES[@]}"; do
+#     (
+#         echo "=== $m ==="
+#         ssh -o ConnectTimeout=3 "$m" "python3 -c 'import matplotlib; print(\"matplotlib\", matplotlib.__version__)'"
+#     ) &
+# done
+
+# wait

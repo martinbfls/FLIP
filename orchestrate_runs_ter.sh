@@ -3,14 +3,14 @@ set -e
 set -x
 
 BASE_DIR="$HOME/FLIP"
-LOG_DIR="$BASE_DIR/logs_ter"
+LOG_DIR="$BASE_DIR/logs"
 
 mkdir -p "$LOG_DIR"
 
-DATASETS=("cifar") # "cifar_100" "tiny_imagenet"
+DATASETS=("cifar") # "cifar_100" "tiny_imagenet"  "svhn" "cifar" 
 ATTACK="backdoor"
-AGGREGATORS=("median" "trmean" "multikrum" "krum") #  
-BUDGETS=(0 150 300 500 1000 1500 2000 2500 5000)
+AGGREGATORS=("mean" "median" "trmean" "multikrum" "krum") #   
+BUDGETS=(150 300 500 1000 1500 2000 2500 5000) #0 
 N_CYCLES=10
 NUM_CLEAN=7
 NUM_POISONED=3
@@ -20,9 +20,9 @@ POISONERS=("optimized") #  "1xp" "4xl"
 MACHINES=(
 # Salle 30
 allemagne
-angleterre
+# angleterre
 autriche
-# belgique
+belgique
 espagne
 finlande
 france
@@ -34,36 +34,36 @@ islande
 lituanie
 malte
 monaco
-# pologne
-# portugal
-# roumanie
-# suede
+pologne
+portugal
+roumanie
+suede
 # Salle 31
-#albatros
-#autruche
-#bengali
-#coucou
-#dindon
-#epervier
-#faisan
-#gelinotte
-#hibou
-#harpie
-# jabiru
-# kamiche
-# linotte
-# loriol
-# mouette
-# nandou
-# ombrette
-# perdrix
+albatros
+autruche
+bengali
+coucou
+dindon
+epervier
+faisan
+gelinotte
+hibou
+# harpie
+jabiru
+kamiche
+linotte
+loriol
+mouette
+nandou
+ombrette
+perdrix
 # quetzal
-# quiscale
-# rouloul
-# sitelle
-# traquet
-# urabu
-# verdier
+quiscale
+rouloul
+sitelle
+traquet
+urabu
+verdier
 # Salle 32
 aerides
 barlia
@@ -72,7 +72,7 @@ diuris
 encyclia
 epipactis
 # gennaria
-habenaria
+# habenaria
 isotria
 ipsea
 liparis
@@ -82,7 +82,7 @@ neotinea
 oncidium
 ophrys
 orchis
-pleione
+# pleione
 pogonia
 serapias
 telipogon
@@ -102,54 +102,54 @@ dordogne
 doubs
 essonne
 finistere
-# gironde
+gironde
 indre
 jura
 landes
 loire
 manche
-marne
-mayenne
+# marne
+# mayenne
 morbihan
 moselle
 saone
-somme
-vendee
+# somme
+# vendee
 vosges
 # Salle 34
-# ablette
-# anchois
-# anguille
-# barbeau
-# barbue
-# baudroie
-# brochet
-# carrelet
-# gardon
-# gymnote
-# labre
-# lieu
-# lotte
-# mulet
-# murene
-# piranha
-# raie
-# requin
-# rouget
-# roussette
-# saumon
-# silure
-# sole
-# thon
-# truite
+ablette
+anchois
+anguille
+barbeau
+barbue
+baudroie
+brochet
+carrelet
+gardon
+gymnote
+labre
+lieu
+lotte
+mulet
+murene
+piranha
+raie
+requin
+rouget
+roussette
+saumon
+silure
+sole
+thon
+truite
 # Salle 35
-# acromion
-# apophyse
-# astragale
-# atlas
-# axis
-# coccyx
-# cote
+acromion
+apophyse
+astragale
+atlas
+axis
+coccyx
+cote
 cubitus
 cuboide
 femur
@@ -160,16 +160,16 @@ metacarpe
 parietal
 perone
 phalange
-# radius
+radius
 rotule
 sacrum
 sternum
 tarse
 temporal
 tibia
-#xiphoide
+xiphoide
 # Salle 36
-#bentley
+bentley
 bugatti
 cadillac
 chrysler
@@ -192,7 +192,7 @@ rover
 royce
 simca
 skoda
-venturi
+# venturi
 volvo
 )
 
@@ -277,9 +277,9 @@ rm -f "$LOG_DIR"/*.log "$LOG_DIR"/*.done || true
 #         IFS='|' read -r dataset poisoner aggregator run_id <<< "${GEN_JOBS[$INDEX]}"
 #         machine=${MACHINES[$i]}
 
-#         config="federated_experiments/${MODEL_FLAG}/${NUM_POISONED}vs${NUM_CLEAN}/${dataset}/${ATTACK}/${aggregator}/${poisoner}/gen_labels/${run_id}"
+#         config="federated_experiments/${MODEL_FLAG}/${NUM_POISONED}vs${NUM_CLEAN}/${dataset}/${ATTACK}/${aggregator}/${poisoner}_FLIP/gen_labels/${run_id}"
 
-#         safe_name="gen_${MODEL_FLAG}_${NUM_POISONED}vs${NUM_CLEAN}_${dataset}_${ATTACK}_${aggregator}_${poisoner}_${run_id}_${machine}"
+#         safe_name="gen_${MODEL_FLAG}_${NUM_POISONED}vs${NUM_CLEAN}_${dataset}_${ATTACK}_${aggregator}_${poisoner}_FLIP_${run_id}_${machine}"
 
 #         done_file="$LOG_DIR/${safe_name}.done"
 #         log_file="$LOG_DIR/${safe_name}.log"
@@ -337,10 +337,10 @@ while [ $INDEX -lt $TOTAL_TRAIN ]; do
         IFS='|' read -r dataset poisoner aggregator run_id budget <<< "${TRAIN_JOBS[$INDEX]}"
         machine=${MACHINES[$i]}
 
-        config="federated_experiments/${MODEL_FLAG}/${NUM_POISONED}vs${NUM_CLEAN}/${dataset}/${ATTACK}/${aggregator}/${poisoner}/train_user_${budget}/${run_id}"
+        config="federated_experiments/${MODEL_FLAG}/${NUM_POISONED}vs${NUM_CLEAN}/${dataset}/${ATTACK}/${aggregator}/${poisoner}_FLIP/train_user_${budget}/${run_id}"
 
         # ✅ BUG FIX → ajout budget dans le nom
-        safe_name="train_${MODEL_FLAG}_${NUM_POISONED}vs${NUM_CLEAN}_${dataset}_${ATTACK}_${aggregator}_${poisoner}_${budget}_${run_id}_${machine}"
+        safe_name="train_${MODEL_FLAG}_${NUM_POISONED}vs${NUM_CLEAN}_${dataset}_${ATTACK}_${aggregator}_${poisoner}_FLIP_${budget}_${run_id}_${machine}"
 
         done_file="$LOG_DIR/${safe_name}.done"
         log_file="$LOG_DIR/${safe_name}.log"

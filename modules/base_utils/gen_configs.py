@@ -4,11 +4,11 @@ from pathlib import Path
 NUM_POISONED = 3
 NUM_CLEAN = 7
 ATTACK = "backdoor"
-DATASETS = ["cifar", "svhn"] 
-POISONERS = ["1xs","optimized"]
+DATASETS = ["cifar", "svhn"] # , "cifar"
+POISONERS = ["optimized"] #"1xs",
 INIT="stripe"
-MODEL_FLAGS = ["convnext_micro"]
-AGGREGATORS = ["mean", "median", "trmean", "multikrum", "krum"]
+MODEL_FLAGS = ["r32p"] # , "convnext_micro"
+AGGREGATORS = ["mean", "median", "trmean", "multikrum", "krum"] #
 BUDGETS = [0, 150, 300, 500, 1000, 1500, 2000, 2500, 5000]
 N_CYCLES = 10
 GAMMA = 1.0
@@ -70,7 +70,7 @@ dataset = "{dataset}"
 source_label = 9
 target_label = 4
 poisoner = "{poisoner}"
-delta = "optimized_trigger/fed_opt_trig_{init}_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
+delta = "optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
 epochs = 20
 checkpoint_iters = 50
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
@@ -86,7 +86,7 @@ dataset = "{dataset}"
 source_label = 9
 target_label = 4
 poisoner = "{poisoner}"
-delta = "optimized_trigger/fed_opt_trig_{init}_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
+delta = "optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
 output_dir = "out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/"
 lambda = 0.0
 num_honests = {num_clean}
@@ -128,7 +128,7 @@ dataset = "{dataset}"
 source_label = 9
 target_label = 4
 poisoner = "{poisoner}"
-delta = "optimized_trigger/fed_opt_trig_{init}_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
+delta = "optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
 output_dir = "out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/{budget}"
 soft = false
 alpha = 0.0
@@ -153,20 +153,20 @@ def generate_all_configs():
                 opt_dir = BASE_DIR / f"{model_flag}/{NUM_POISONED}vs{NUM_CLEAN}/{dataset}/{ATTACK}/{aggregator}/opt_trigger"
                 lr = LEARNING_RATE.get(model_flag, 0.1)
                 wd = WEIGHT_DECAY.get(model_flag, 2e-4)
-                opt_config = OPT_TRIGGER_TEMPLATE.format(
-                    model_flag=model_flag,
-                    dataset=dataset,
-                    aggregator=aggregator,
-                    num_poisoned=NUM_POISONED,
-                    num_clean=NUM_CLEAN,
-                    init=INIT,
-                    lr=lr,
-                    wd=wd,
-                    milestones=MILESTONE.get(model_flag, [75, 125]),
-                    restart=str(RESTART).lower(),
-                    orthogonal=str(ORTHOGONAL).lower(),
-                )
-                write_config(opt_dir / "config.toml", opt_config)
+                # opt_config = OPT_TRIGGER_TEMPLATE.format(
+                #     model_flag=model_flag,
+                #     dataset=dataset,
+                #     aggregator=aggregator,
+                #     num_poisoned=NUM_POISONED,
+                #     num_clean=NUM_CLEAN,
+                #     init=INIT,
+                #     lr=lr,
+                #     wd=wd,
+                #     milestones=MILESTONE.get(model_flag, [75, 125]),
+                #     restart=str(RESTART).lower(),
+                #     orthogonal=str(ORTHOGONAL).lower(),
+                # )
+                # write_config(opt_dir / "config.toml", opt_config)
                 for poisoner in POISONERS:
                     for run_id in range(1, N_CYCLES + 1):
                         gen_label_dir = BASE_DIR / f"{model_flag}/{NUM_POISONED}vs{NUM_CLEAN}/{dataset}/{ATTACK}/{aggregator}/{poisoner}/gen_labels/{run_id}"
