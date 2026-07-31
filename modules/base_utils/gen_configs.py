@@ -65,7 +65,8 @@ expert_path = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoin
 device = "cuda"
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/houston"
+output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_1xs/0/"
+output_dir_trigger = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips"
 
 num_poisoned = {num_poisoned}
 num_honests = {num_clean}

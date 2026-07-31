@@ -276,6 +276,7 @@ def optimize_trigger(
 ):
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
     if (
         restart
         and Path(output_dir_trigger)
@@ -441,6 +442,14 @@ def run(experiment_name, module_name, **kwargs):
     scheduler_kwargs = args.get("scheduler_kwargs", {})
 
     output_dir = slurmify_path(args["output_dir"], slurm_id)
+    output_dir_trigger = slurmify_path(
+        args.get(
+            "output_dir_trigger",
+            "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger",
+        ),
+        slurm_id,
+    )
+    print(f"Output directory: {output_dir}")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     n_classes = get_n_classes(dataset_flag)
@@ -477,6 +486,7 @@ def run(experiment_name, module_name, **kwargs):
         expert_config=expert_config,
         expert_path=expert_path,
         output_dir=output_dir,
+        output_dir_trigger=output_dir_trigger,
         init=init,
         optim_kwargs=optim_kwargs,
         scheduler_kwargs=scheduler_kwargs,
@@ -499,10 +509,11 @@ def run(experiment_name, module_name, **kwargs):
         f"out/optimizing_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.png"
     )
 
-    os.makedirs("optimized_trigger", exist_ok=True)
+    Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
     torch.save(
         optimized_delta.detach().cpu(),
-        f"optimized_trigger/fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
+        Path(output_dir_trigger)
+        / f"fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
     )
 
 
