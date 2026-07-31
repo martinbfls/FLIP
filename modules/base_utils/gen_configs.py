@@ -179,20 +179,20 @@ def generate_all_configs():
                 )
                 lr = LEARNING_RATE.get(model_flag, 0.1)
                 wd = WEIGHT_DECAY.get(model_flag, 2e-4)
-                # opt_config = OPT_TRIGGER_TEMPLATE.format(
-                #     model_flag=model_flag,
-                #     dataset=dataset,
-                #     aggregator=aggregator,
-                #     num_poisoned=NUM_POISONED,
-                #     num_clean=NUM_CLEAN,
-                #     init=INIT,
-                #     lr=lr,
-                #     wd=wd,
-                #     milestones=MILESTONE.get(model_flag, [75, 125]),
-                #     restart=str(RESTART).lower(),
-                #     orthogonal=str(ORTHOGONAL).lower(),
-                # )
-                # write_config(opt_dir / "config.toml", opt_config)
+                opt_config = OPT_TRIGGER_TEMPLATE.format(
+                    model_flag=model_flag,
+                    dataset=dataset,
+                    aggregator=aggregator,
+                    num_poisoned=NUM_POISONED,
+                    num_clean=NUM_CLEAN,
+                    init=INIT,
+                    lr=lr,
+                    wd=wd,
+                    milestones=MILESTONE.get(model_flag, [75, 125]),
+                    restart=str(RESTART).lower(),
+                    orthogonal=str(ORTHOGONAL).lower(),
+                )
+                write_config(opt_dir / "config.toml", opt_config)
                 for poisoner in POISONERS:
                     for run_id in range(1, N_CYCLES + 1):
                         gen_label_dir = (
