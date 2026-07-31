@@ -30,6 +30,7 @@
 ###
 
 #SBATCH --job-name=flip_smoke_test
+#SBATCH --account=power
 #SBATCH --partition=maple
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

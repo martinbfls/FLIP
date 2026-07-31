@@ -1,15 +1,15 @@
 import os
 from pathlib import Path
 
-NUM_POISONED = 3
-NUM_CLEAN = 7
+NUM_POISONED = 1
+NUM_CLEAN = 0
 ATTACK = "backdoor"
-DATASETS = ["cifar", "svhn"]  # , "cifar"
+DATASETS = ["cifar"]  # , "cifar"
 POISONERS = ["optimized"]  # "1xs",
 INIT = "stripe"
 MODEL_FLAGS = ["r32p"]  # , "convnext_micro"
 AGGREGATORS = ["mean"]  # , "median", "trmean", "multikrum", "krum"
-BUDGETS = [0, 150, 300]  # , 500, 1000, 1500, 2000, 2500, 5000
+BUDGETS = [1500]  # , 500, 1000, 1500, 2000, 2500, 5000
 N_CYCLES = 1
 GAMMA = 1.0
 RESTART = False
