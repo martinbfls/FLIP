@@ -61,11 +61,11 @@ num_chckpt = 3
 
 init = "{init}"
 
-expert_path = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_1xs/{{}}/model_{{}}_{{}}.pth"
+expert_path = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_1xs/{{}}/model_{{}}_{{}}.pth"
 device = "cuda"
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-output_dir = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/houston"
+output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/houston"
 
 num_poisoned = {num_poisoned}
 num_honests = {num_clean}
@@ -84,14 +84,14 @@ trajectories = [50, 100, 150, 200]
 
 GEN_LABEL_TEMPLATE = """# Module to train and record an expert trajectory.
 [train_expert]
-output_dir = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_{poisoner}/0/"
+output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_{poisoner}/0/"
 model = "{model_flag}"
 trainer = "sgd"
 dataset = "{dataset}"
 source_label = 9
 target_label = 4
 poisoner = "{poisoner}"
-delta = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
+delta = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
 epochs = 20
 checkpoint_iters = 50
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
@@ -99,16 +99,16 @@ schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 
 # Module to generate attack labels from the expert trajectories.
 [federated_generate_labels]
-input_pths = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_{poisoner}/{{}}/model_{{}}_{{}}.pth"
-opt_pths = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_{poisoner}/{{}}/model_{{}}_{{}}_opt.pth"
+input_pths = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_{poisoner}/{{}}/model_{{}}_{{}}.pth"
+opt_pths = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/{model_flag}_{poisoner}/{{}}/model_{{}}_{{}}_opt.pth"
 expert_model = "{model_flag}"
 trainer = "sgd"
 dataset = "{dataset}"
 source_label = 9
 target_label = 4
 poisoner = "{poisoner}"
-delta = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
-output_dir = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/"
+delta = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
+output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/"
 lambda = 0.0
 num_honests = {num_clean}
 num_poisoned = {num_poisoned}
@@ -133,15 +133,15 @@ expert_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd
 # Module to flip labels at the provided budgets.
 [federated_select_flips]
 budgets = {budgets}
-input_label_glob = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/labels.npy"
-true_labels = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/true.npy"
-output_dir = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}"
+input_label_glob = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/labels.npy"
+true_labels = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/true.npy"
+output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}"
 num_honests = {num_clean}
 num_poisoned = {num_poisoned}
 """
 
 TRAIN_USER_TEMPLATE = """[federated_train_user]
-input_labels = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/"
+input_labels = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/"
 budget = {budget}
 user_model = "{model_flag}"
 trainer = "sgd"
@@ -149,8 +149,8 @@ dataset = "{dataset}"
 source_label = 9
 target_label = 4
 poisoner = "{poisoner}"
-delta = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
-output_dir = "/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/{budget}"
+delta = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger/{model_flag}_triggers_neurips/fed_opt_trig_stripe_{model_flag}_{dataset}_{aggregator}_{num_poisoned}vs{num_clean}.pt"
+output_dir = "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/{model_flag}/{num_poisoned}vs{num_clean}/{dataset}/{attack}/{aggregator}/{poisoner}/{run_id}/{budget}"
 soft = false
 alpha = 0.0
 num_honests = {num_clean}

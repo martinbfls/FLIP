@@ -42,7 +42,7 @@
 set -e
 set -x
 
-BASE_DIR="/shared/data1/Project/DLWP/j1067582/beaufiles/FLIP"  # confirmed shared storage path
+BASE_DIR="/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP"  # confirmed shared storage path
 cd "$BASE_DIR" || exit 1
 
 mkdir -p logs_slurm
