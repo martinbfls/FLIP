@@ -63,8 +63,7 @@ def run(experiment_name, module_name, **kwargs):
         if n > 0:
             idx_flipped = np.argsort(distances.min(axis=0))[-n:]
             labels_final[idx_flipped] = (
-                all_labels_local[idx_flipped]
-                - 50000 * true[idx_flipped]
+                all_labels_local[idx_flipped] - 50000 * true[idx_flipped]
             )
         else:
             idx_flipped = np.array([], dtype=int)
@@ -81,8 +80,7 @@ def run(experiment_name, module_name, **kwargs):
         base = N // num_workers
         remainder = N % num_workers
         sizes = np.array(
-            [base + (w < remainder) for w in range(num_workers)],
-            dtype=int
+            [base + (w < remainder) for w in range(num_workers)], dtype=int
         )
 
         flipped_split = np.array_split(idx_flipped, num_poisoned)
@@ -94,7 +92,7 @@ def run(experiment_name, module_name, **kwargs):
 
         for w in range(num_honests):
             sz = sizes[w]
-            sel = idx_clean[clean_ptr:clean_ptr + sz]
+            sel = idx_clean[clean_ptr : clean_ptr + sz]
             clean_ptr += sz
 
             worker_indices.append(sel)
@@ -107,11 +105,9 @@ def run(experiment_name, module_name, **kwargs):
             flipped_p = flipped_split[p]
             remaining = sz - len(flipped_p)
             if remaining < 0:
-                raise ValueError(
-                    f"Too many flipped samples for poisoned worker {w}"
-                )
+                raise ValueError(f"Too many flipped samples for poisoned worker {w}")
 
-            sel_clean = idx_clean[clean_ptr:clean_ptr + remaining]
+            sel_clean = idx_clean[clean_ptr : clean_ptr + remaining]
             clean_ptr += remaining
 
             sel = np.concatenate([sel_clean, flipped_p])

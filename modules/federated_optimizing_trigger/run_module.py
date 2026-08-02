@@ -262,15 +262,15 @@ def optimize_trigger(
     scheduler_kwargs={},
     expert_config={},
     # expert_path="/Data/mb/flip/out/checkpoints/r32p_1xs/{}/model_{}_{}.pth",
-    expert_path="/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/r32p_1xs/{}/model_{}_{}.pth",
+    expert_path="/shared/data1/Projects/DLWP/j1067582/martin/FLIP/out/checkpoints/r32p_1xs/{}/model_{}_{}.pth",
     chkpt_iters=50,
-    output_dir="/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/out/checkpoints/r32p_1xs/0/",
+    output_dir="/shared/data1/Projects/DLWP/j1067582/martin/FLIP/out/checkpoints/r32p_1xs/0/",
     epochs=20,
     init="stripe",
     num_honests=5,
     num_poisoned=5,
     model_flag="r32p",
-    output_dir_trigger="/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger",
+    output_dir_trigger="/shared/data1/Projects/DLWP/j1067582/martin/FLIP/optimized_trigger",
     restart=False,
     orthogonal=False,
 ):
@@ -445,7 +445,7 @@ def run(experiment_name, module_name, **kwargs):
     output_dir_trigger = slurmify_path(
         args.get(
             "output_dir_trigger",
-            "/shared/data1/Projects/DLWP/j1067582/beaufiles/FLIP/optimized_trigger",
+            "/shared/data1/Projects/DLWP/j1067582/martin/FLIP/optimized_trigger",
         ),
         slurm_id,
     )
