@@ -366,7 +366,34 @@ def get_clean_dataset(dataset_flag, train=True, big=False):
 
 
 def get_poison_dataset(dataset_flag, source_label, target_label, delta,
-                       train=True, train_pct=1.0, big=False):
+                       train=True, train_pct=1.0, big=False,
+                       lambda_target=None, lambda_overflow="clip", seed=0):
+    '''
+    Builds ConcatDataset([clean_dataset, poison_dataset]): all of
+    `base_dataset` plus a poisoned copy of (a subset of) its source-class
+    examples, triggered and relabeled to target_label.
+
+    lambda_target: if given, the fraction of the RETURNED dataset that is
+    poisoned, i.e. n_add / (n_base + n_add) == lambda_target, where n_base =
+    len(base_dataset) and n_add is the number of (possibly resampled)
+    source-class indices poisoned. This couples the expert-retraining
+    dataset's actual poison rate to whatever lambda_poison (= beta, by
+    default) the trigger objective assumes -- see optimize_trigger. If None
+    (default), every source-class example is poisoned (n_add = n_s, the
+    legacy fixed rate n_s / (n_base + n_s), CIFAR-10 ~= 0.0909).
+
+    n_add = round(lambda_target * n_base / (1 - lambda_target)) can exceed
+    n_s, the number of available source-class examples (whenever
+    lambda_target > beta_max := n_s / (n_base + n_s)). lambda_overflow then
+    controls what happens:
+      - "clip" (default): use all n_s source-class examples (n_add -> n_s)
+        and log lambda_target, the resulting effective lambda, and beta_max.
+      - "duplicate": resample n_add indices from the n_s source-class
+        examples WITH replacement (same underlying images, but each Subset
+        position is a fresh dataset entry so `transform` -- TRANSFORM_TRAIN_XY
+        for train=True -- re-applies independent augmentation per position
+        and per epoch).
+    '''
     transform = get_transforms(dataset_flag, train=train, big=big)
     base_dataset = load_dataset(dataset_flag, train=train)
 
@@ -376,6 +403,35 @@ def get_poison_dataset(dataset_flag, source_label, target_label, delta,
 
     labels = np.array([y for _, y in base_dataset])
     poison_inds = np.where(labels == source_label)[0]
+
+    if lambda_target is not None:
+        if not (0.0 < lambda_target < 1.0):
+            raise ValueError(f"lambda_target must be in (0, 1), got {lambda_target}")
+        n_base = len(base_dataset)
+        n_s = len(poison_inds)
+        n_add = round(lambda_target * n_base / (1 - lambda_target))
+        rng = np.random.RandomState(seed)
+
+        if n_add > n_s:
+            beta_max = n_s / (n_base + n_s)
+            if lambda_overflow == "clip":
+                print(
+                    f"[get_poison_dataset] lambda_overflow='clip': lambda_target="
+                    f"{lambda_target:.6f} needs n_add={n_add} > n_s={n_s} available "
+                    f"source-class ({dataset_flag}, source_label={source_label}, "
+                    f"train={train}) examples; clipping to n_add={n_s}. Effective "
+                    f"lambda={n_s / (n_base + n_s):.6f}, beta_max={beta_max:.6f}."
+                )
+            elif lambda_overflow == "duplicate":
+                poison_inds = rng.choice(poison_inds, size=n_add, replace=True)
+            else:
+                raise ValueError(
+                    f"Unknown lambda_overflow={lambda_overflow!r}, expected "
+                    "'clip' or 'duplicate'."
+                )
+        elif n_add < n_s:
+            poison_inds = rng.choice(poison_inds, size=n_add, replace=False)
+        # n_add == n_s: use poison_inds as-is.
 
     poisoner = pick_poisoner('optimized', dataset_flag, target_label, delta)
 

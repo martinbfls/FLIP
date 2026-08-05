@@ -29,7 +29,7 @@ device = "string: {cpu, cuda}. Device used for optimization. Defaults to cuda if
 ###
 lambda_b1 = "float: [0, +infty). Weight for B1 (magnitude of the poisoning-induced gradient shift)."
 lambda_b2 = "float: [0, +infty). Weight for B2 (label-flipping feasibility of that shift, in [0,1])."
-lambda_bd = "float: [0, +infty). Weight for L_bd, the backdoor cross-entropy loss on the triggered examples only."
+lambda_bd = "float: [0, +infty). Weight for L_bd, the backdoor cross-entropy loss on the triggered examples only. Defaults to 0.0: L_bd is satisfied by construction (the expert is retrained on the current trigger every outer step), so it yields no useful gradient signal for shaping delta -- it is still computed every batch for logging."
 lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu."
 lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta."
 lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta."
@@ -46,11 +46,22 @@ checkpoint_backward = "bool. Backward + free the per-checkpoint graph immediatel
 
 ###
 # Poisoning budget
+#
+# beta is the primary parameter: the fraction of the attacker's OWN data
+# shard it is able/willing to flip. It is a property of the attacker alone
+# -- NOT of any federated deployment the trigger will eventually be used
+# against -- and drives both the B2 polytope budget bound and (by default,
+# via lambda_poison='beta') the per-batch poisoning rate used to build the
+# poisoned expert-training/test datasets (see get_poison_dataset's
+# lambda_target). Pass exactly one of beta or flip_budget; passing both
+# raises.
 ###
-num_honests = "int. Assumed number of honest workers in the beta/lambda_poison budget formula."
-num_poisoned = "int. Assumed number of poisoned workers in the beta/lambda_poison budget formula."
-flip_budget = "int: {0,...,+infty). Number of label flips the attacker's budget affords per round; induces beta (the global polytope budget bound) and, when lambda_poison='beta', the per-batch poisoning rate."
-lambda_poison = "float or 'beta': (0,1]. Fraction of each batch's source-class examples that get triggered + relabeled. 'beta' (the default) resolves to flip_budget * (num_honests+num_poisoned) / (num_poisoned * n_train), matching the budget bound used for B2. Raises an explicit error if still None after resolution."
+beta = "float: (0, 1). Primary parameter. Fraction of the attacker's own data shard it can afford to flip."
+num_honests = "int. Assumed number of honest workers under ONE particular deployment size, used only to convert beta into flip_budget for human-readable logging/run naming. Not read by the objective."
+num_poisoned = "int. Assumed number of poisoned workers under that same assumed deployment size, same logging-only role as num_honests."
+flip_budget = "[OPTIONAL, legacy] int: {0,...,+infty). Number of label flips per round; if given (and beta is not), derives beta = flip_budget * (num_honests+num_poisoned) / (num_poisoned * n_train). Kept for backward compatibility -- prefer beta."
+lambda_poison = "float or 'beta': (0,1]. Fraction of each batch's source-class examples that get triggered + relabeled (in the objective) AND, via lambda_target, the fraction of the expert's poisoned train/test datasets that are poisoned. 'beta' (the default) resolves to beta directly, coupling the objective and the expert's actual training regime. Raises an explicit error if still None after resolution."
+lambda_overflow = "string: {clip, duplicate}. What to do when lambda_poison implies more poisoned examples than the source class has available (n_add > n_s, i.e. lambda_poison > beta_max = n_s/(n_train+n_s)). 'clip' (default) caps at n_s and logs beta_max. 'duplicate' resamples source-class examples with replacement (distinct augmentations per copy) to reach the exact target rate beyond beta_max."
 
 ###
 # B2 / label-flipping feasibility (exact QP projection of v onto W_beta)
@@ -75,3 +86,4 @@ init = "str. Trigger initialization"
 restart = "bool. Restart optimization from existing checkpoint"
 worker_batch_size = "int: {1,...,+infty}. Batch size for the (single) data loader batches are drawn from. Defaults to 256."
 metrics_log_path = "string. If set, path (slurm compatible) to a JSON file where per-step metrics (B1, B2, L_bd, clean_acc, poison_acc) are recorded across the n_steps optimization loop. Opt-in only; when unset, behavior and outputs are unchanged."
+beta_star_grid = "list[float]. If non-empty, a grid of candidate beta values; each batch, the checkpoint used for compute_beta_star rotates round-robin across sampled_k. Adds beta_star / beta_star_curve (last batch) and beta_star_distribution / beta_star_curve_mean (across all batches of the step) to metrics_log_path's history. Defaults to []."

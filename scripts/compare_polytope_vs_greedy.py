@@ -53,7 +53,7 @@ from modules.federated_optimizing_trigger.utils import (
     compute_v_polytope_distance,
     get_class_conditional_samples,
 )
-from modules.federated_optimizing_trigger.run_module import build_worker_loader
+from modules.federated_optimizing_trigger.run_module import build_loader
 
 torch.manual_seed(0)
 
@@ -174,8 +174,8 @@ beta = lambda_poison
 mu = get_mu(dataset_flag, target_label, device, model_flag=model_flag)
 delta = init_delta(mu.shape, horizontal=True, strength=6.0, freq=16, device=device, init="stripe")
 
-worker_loader = build_worker_loader(raw_train_dataset, worker_batch_size)
-loader_iter = iter(worker_loader)
+loader = build_loader(raw_train_dataset, worker_batch_size)
+loader_iter = iter(loader)
 
 pi = compute_class_frequencies(dataset_flag, n_classes)
 class_samples_raw = get_class_conditional_samples(dataset_flag, n_classes, 64, device)
@@ -252,6 +252,13 @@ for step in range(n_steps):
 finite_ratios = [r for r in ratios if r != float("inf")]
 mean_ratio = statistics.fmean(finite_ratios) if finite_ratios else float("nan")
 std_ratio = statistics.pstdev(finite_ratios) if len(finite_ratios) > 1 else 0.0
+if finite_ratios:
+    median_ratio = statistics.median(finite_ratios)
+    quantiles = statistics.quantiles(finite_ratios, n=4, method="inclusive") \
+        if len(finite_ratios) > 1 else [finite_ratios[0]] * 3
+    q1_ratio, q3_ratio = quantiles[0], quantiles[2]
+else:
+    median_ratio, q1_ratio, q3_ratio = float("nan"), float("nan"), float("nan")
 
 summary = {
     "n_steps": n_steps,
@@ -259,6 +266,8 @@ summary = {
     "beta": beta,
     "mean_ratio_polytope_over_greedy": mean_ratio,
     "std_ratio_polytope_over_greedy": std_ratio,
+    "median_ratio_polytope_over_greedy": median_ratio,
+    "iqr_ratio_polytope_over_greedy": [q1_ratio, q3_ratio],
     "records": records,
 }
 
@@ -267,6 +276,8 @@ with open("out/optimizing_trigger/polytope_vs_greedy.json", "w") as f:
     json.dump(summary, f, indent=2)
 
 print("\n=== summary ===")
-print(f"mean ratio dist_polytope / dist_greedy = {mean_ratio:.4f}")
-print(f"std  ratio dist_polytope / dist_greedy = {std_ratio:.4f}")
+print(f"mean   ratio dist_polytope / dist_greedy = {mean_ratio:.4f}")
+print(f"std    ratio dist_polytope / dist_greedy = {std_ratio:.4f}")
+print(f"median ratio dist_polytope / dist_greedy = {median_ratio:.4f}")
+print(f"IQR    ratio dist_polytope / dist_greedy = [{q1_ratio:.4f}, {q3_ratio:.4f}]")
 print("saved out/optimizing_trigger/polytope_vs_greedy.json")
