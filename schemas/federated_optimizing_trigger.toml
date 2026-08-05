@@ -1,6 +1,9 @@
 ###
 # federated_optimizing_trigger schema
-# Optimizes a backdoor trigger (delta) by matching aggregated gradients along expert training trajectories to those of clean (unpoisoned) training, while enforcing adversarial objectives.
+# Optimizes a backdoor trigger (delta) against a single objective: per sampled
+# expert checkpoint, compares the gradient shift a poisoned batch induces
+# (v = mu_p - g_c) to what an equivalent label-flipping attacker could have
+# produced (the feasible gradient polytope W_beta), via an exact QP projection.
 # Outputs optimized trigger tensors as .pt files.
 ###
 
@@ -11,10 +14,6 @@ model = "string: {r32p, r18, r18_tin, vgg, vgg_pretrain, vit_pretrain}. Model ar
 source_label = "int: {-1,0,...,9}. Source label. -1 means all source labels."
 target_label = "int: {0,1,...,9}. Target label for the backdoor attack."
 
-num_honests = "int. number of honest workers"
-num_poisoned = "int. number of poisoned workers"
-agg_method = "str. used aggregation"
-
 optim_kwargs = "dict: optimization arguments"
 schedule_kwargs = "dict: optimization arguments"
 
@@ -24,24 +23,45 @@ output_dir_trigger = "string. Path to output directory (slurm compatible)."
 device = "string: {cpu, cuda}. Device used for optimization. Defaults to cuda if available."
 
 ###
-# Loss weights
+# Loss weights: lambda_b1*B1 + lambda_b2*B2 + lambda_bd*L_bd
+#             + lambda_penalty*L_pen + lambda_delta*||delta|| + lambda_tv*L_tv
+# L_pen is always the hinge penalty (trigger_penalty_hinge).
 ###
-lambda_match = "float: [0, +infty). Weight for gradient matching loss."
-lambda_adv = "float: [0, +infty). Weight for adversarial loss on poisoned samples."
-lambda_penalty = "float: [0, +infty). Weight for trigger penalty relative to mu."
+lambda_b1 = "float: [0, +infty). Weight for B1 (magnitude of the poisoning-induced gradient shift)."
+lambda_b2 = "float: [0, +infty). Weight for B2 (label-flipping feasibility of that shift, in [0,1])."
+lambda_bd = "float: [0, +infty). Weight for L_bd, the backdoor cross-entropy loss on the triggered examples only."
+lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu."
 lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta."
+lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta."
+kappa = "float: [0, +infty). Hinge margin for the trigger penalty. Defaults to 0.0."
 
 ###
 # Trigger optimization hyperparameters
 ###
 epsilon = "float: (0, +infty). L_infinity bound on trigger delta."
-lr_delta = "float: (0, +infty). Learning rate for trigger and rho optimization."
-n_steps = "int: {1,...,+infty}. Number of trigger optimization steps."
+lr_delta = "float: (0, +infty). Learning rate for trigger optimization."
+n_steps = "int: {1,...,+infty}. Number of outer (retrain + optimize) steps."
+epochs = "int: {1,...,+infty}. Epochs of model retraining per outer step. Defaults to 20."
+checkpoint_backward = "bool. Backward + free the per-checkpoint graph immediately instead of accumulating all num_chckpt graphs before one backward call. Defaults to true (needed for num_chckpt beyond a handful without OOM)."
+
+###
+# Poisoning budget
+###
+num_honests = "int. Assumed number of honest workers in the beta/lambda_poison budget formula."
+num_poisoned = "int. Assumed number of poisoned workers in the beta/lambda_poison budget formula."
+flip_budget = "int: {0,...,+infty). Number of label flips the attacker's budget affords per round; induces beta (the global polytope budget bound) and, when lambda_poison='beta', the per-batch poisoning rate."
+lambda_poison = "float or 'beta': (0,1]. Fraction of each batch's source-class examples that get triggered + relabeled. 'beta' (the default) resolves to flip_budget * (num_honests+num_poisoned) / (num_poisoned * n_train), matching the budget bound used for B2. Raises an explicit error if still None after resolution."
+
+###
+# B2 / label-flipping feasibility (exact QP projection of v onto W_beta)
+###
+flip_qp_ridge = "float: [0, +infty). Small ridge regularization added to G^T G before solving the QP projection, for numerical stability. Defaults to 1e-6."
+flip_gradient_samples_per_class = "int: {1,...,+infty}. Number of training samples per class used to estimate the expected flip gradients G. Defaults to 64."
 
 ###
 # Checkpoint sampling (expert trajectory matching)
 ###
-alpha_ckpt = "float: (0,1]. Controls bias toward early or late checkpoints."
+alpha_ckpt = "float: (0,1]. Controls bias toward early or late checkpoints. Defaults to 0.01."
 num_chckpt = "int: {1,...,+infty}. Number of checkpoints sampled per step."
 
 ###
@@ -53,4 +73,5 @@ expert_path = "string. Format string path to expert checkpoints with '{}' placeh
 expert_config = "dict. Configuration describing expert checkpoints to load."
 init = "str. Trigger initialization"
 restart = "bool. Restart optimization from existing checkpoint"
-orthogonal = "bool. Optimize a trigger orthogonal to clean inputs gradients"
+worker_batch_size = "int: {1,...,+infty}. Batch size for the (single) data loader batches are drawn from. Defaults to 256."
+metrics_log_path = "string. If set, path (slurm compatible) to a JSON file where per-step metrics (B1, B2, L_bd, clean_acc, poison_acc) are recorded across the n_steps optimization loop. Opt-in only; when unset, behavior and outputs are unchanged."

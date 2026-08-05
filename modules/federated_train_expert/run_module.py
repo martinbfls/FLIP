@@ -7,8 +7,7 @@ import sys
 
 from modules.train_expert.utils import checkpoint_callback
 from modules.base_utils.datasets import get_matching_datasets, get_n_classes, pick_poisoner, build_federated_datasets
-from modules.base_utils.util import extract_toml, load_model, clf_eval, mini_train_multi,\
-                                    get_train_info, needs_big_ims, slurmify_path
+from modules.base_utils.util import extract_toml, load_model, clf_eval, mini_train_multi, get_train_info, needs_big_ims, slurmify_path
 
 
 def run(experiment_name, module_name, **kwargs):

@@ -48,16 +48,20 @@ dataset = "{dataset}"
 source_label = 9
 target_label = 4
 
-lambda_match = 1.0
-lambda_adv = 1.0
+lambda_b1 = 1.0
+lambda_b2 = 1.0
+lambda_bd = 1.0
 lambda_penalty = 1.0
 lambda_delta = 0.0
+lambda_tv = 0.0
+kappa = 0.0
 
 epsilon = 1.0
 lr_delta = 1e-2
 n_steps = 1
 alpha_ckpt = 0.01
 num_chckpt = 3
+checkpoint_backward = true
 
 init = "{init}"
 
@@ -70,10 +74,8 @@ output_dir_trigger = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP/optimized
 
 num_poisoned = {num_poisoned}
 num_honests = {num_clean}
-agg_method = "{aggregator}"
 
 restart = {restart}
-orthogonal = {orthogonal}
 
 [federated_optimizing_trigger.expert_config]
 experts = 1

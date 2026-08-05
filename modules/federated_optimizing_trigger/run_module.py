@@ -11,9 +11,14 @@ from modules.base_utils.util import (
 )
 from modules.federated_optimizing_trigger.utils import (
     sample_checkpoints,
-    cosine_grad_loss,
     compute_batch_gradients,
-    trigger_penalty,
+    trigger_penalty_hinge,
+    tv_loss,
+    compute_expected_flip_gradients,
+    compute_class_frequencies,
+    compute_v_polytope_distance,
+    compute_beta_star,
+    get_class_conditional_samples,
     get_mu,
     extract_experts,
     get_clean_dataset,
@@ -23,54 +28,230 @@ from modules.federated_optimizing_trigger.utils import (
     raw_to_preprocess,
     raw_to_trigger_preprocess,
     get_raw_clean_dataset,
-    match_loss,
 )
 from modules.train_expert.utils import checkpoint_callback
-from modules.federated_generate_labels.utils import agg as federated_aggregate
 import torch
 from pathlib import Path
 import os
+import json
 import matplotlib.pyplot as plt
 import copy
 
-
-def build_worker_loaders(dataset, num_workers, batch_size):
-    loaders = []
-    for _ in range(num_workers):
-        loader, _ = either_dataloader_dataset_to_both(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-        )
-        loaders.append(loader)
-    return loaders
+WINDOW_SIZE = 50
 
 
-def optimize_trigger_step_federated(
+def build_worker_loader(dataset, batch_size):
+    loader, _ = either_dataloader_dataset_to_both(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    return loader
+
+
+def _compute_step(
+    batch,
     expert_models,
-    worker_loaders,
-    num_honests,
-    num_poisoned,
-    agg_method,
+    sampled_k,
+    source_label,
+    target_label,
+    loss_fn,
+    delta,
+    device,
+    dataset_flag,
+    model_flag,
+    lambda_poison,
+    n_classes,
+    flip_grad_cache,
+    class_samples_raw,
+    pi,
+    beta,
+    flip_qp_ridge,
+    checkpoint_backward,
+    lambda_b1,
+    lambda_b2,
+    lambda_bd,
+    beta_star_grid=None,
+):
+    '''Single objective, no aggregator involved. Per sampled checkpoint theta_k:
+
+        g_c  = grad_theta loss(x, y)                          detached
+        mu_p = grad_theta loss(x_poisoned, y_poisoned)         create_graph=True
+               (a lambda_poison fraction of the batch's source-class examples
+               are triggered and relabeled to target_label)
+        v = mu_p - g_c
+
+        B1_k = ||v||^2 / (||mu_p||^2 + eps)                    magnitude of the
+                                                                 poisoning-induced
+                                                                 gradient shift
+        B2_k = dist(v, W_beta)^2 / (||v||^2 + eps)              feasibility of v
+                                                                 as a label-flip
+                                                                 mixture (in [0,1])
+
+    Both are averaged over sampled_k. Nothing here simulates multiple workers or
+    calls a robust aggregator: B1/B2 are purely a per-checkpoint gradient-geometry
+    comparison between "what the trigger does" (mu_p) and "what it would take to
+    get there by flipping labels" (the feasible polytope W_beta).
+
+    If beta_star_grid is non-empty, additionally computes (once per batch, from
+    the LAST sampled checkpoint's v only -- not averaged over sampled_k, which
+    would multiply the cost by num_chckpt and stop being negligible) the
+    normalized-B2-vs-beta curve and beta_star (see `compute_beta_star`).
+    '''
+    eps_den = 1e-8
+    n_exp = len(sampled_k)
+
+    x_raw, y = move_to_device(batch, device)
+    n_b = x_raw.shape[0]
+    x_clean = raw_to_preprocess(x_raw, dataset_flag=dataset_flag, model_flag=model_flag)
+
+    # mask / y_poison (which examples get poisoned, and to which label) are
+    # fixed for the whole batch/step -- shared across every sampled checkpoint.
+    mask = y == source_label
+    y_poison = y.clone()
+    has_poison = bool(mask.sum().item() > 0)
+    if has_poison:
+        idx_source = mask.nonzero(as_tuple=True)[0]
+        target_count = min(int(round(lambda_poison * n_b)), idx_source.numel())
+        perm = torch.randperm(idx_source.numel(), device=idx_source.device)[:target_count]
+        keep = idx_source[perm]
+        mask = torch.zeros_like(mask)
+        mask[keep] = True
+        y_poison[mask] = target_label
+
+    B1_sum, B2_sum, bd_loss_sum = None, None, None
+    n_valid = 0
+
+    for k in sampled_k:
+        M = expert_models[k].to(device).eval()
+        params = list(M.parameters())
+
+        # x_poisoned is rebuilt fresh per checkpoint (cheap: clone + masked
+        # elementwise add, not a forward pass) rather than shared across the
+        # sampled_k loop: under checkpoint_backward=True, freeing checkpoint
+        # k's graph would otherwise free the delta -> x_poisoned subgraph that
+        # every other checkpoint's forward pass also depends on, since it's
+        # the same tensor object -- causing "backward through the graph a
+        # second time" from the second checkpoint onward.
+        x_poisoned = x_clean.clone()
+        if has_poison:
+            x_poisoned[mask] = raw_to_trigger_preprocess(
+                x_raw[mask], delta, dataset_flag=dataset_flag, model_flag=model_flag,
+            )
+
+        grads_c, _ = compute_batch_gradients(
+            M, loss_fn, (x_clean, y), create_graph=False, retain_graph=False,
+        )
+        g_c = torch.cat([g.reshape(-1) for g in grads_c]).detach()
+
+        grads_p, logits_p = compute_batch_gradients(
+            M, loss_fn, (x_poisoned, y_poison), create_graph=True, retain_graph=True,
+        )
+        mu_p = torch.cat([g.reshape(-1) for g in grads_p])
+
+        v = mu_p - g_c
+
+        den1 = mu_p.detach().norm() ** 2 + eps_den
+        B1_k = (v ** 2).sum() / den1
+
+        if k in flip_grad_cache:
+            G_k, Q_k, pairs_k = flip_grad_cache[k]
+        else:
+            G_k, Q_k, pairs_k = compute_expected_flip_gradients(
+                M, loss_fn, class_samples_raw, n_classes, pi,
+                dataset_flag=dataset_flag, model_flag=model_flag, params=params,
+            )
+            flip_grad_cache[k] = (G_k, Q_k, pairs_k)
+
+        dist2, _ = compute_v_polytope_distance(
+            v, G_k, Q_k, pairs_k, beta, ridge=flip_qp_ridge,
+        )
+        den2 = v.detach().norm() ** 2 + eps_den
+        B2_k = dist2 / den2
+
+        # L_bd (backdoor loss): CE restricted to the actually-triggered examples
+        # (mask, post lambda_poison subsampling) -- NOT the whole batch, whose
+        # untriggered examples keep y_poison == y and would just add ordinary
+        # clean-classification loss unrelated to the backdoor objective.
+        L_bd_k = (
+            loss_fn(logits_p[mask], y_poison[mask])
+            if mask.sum() > 0 else torch.tensor(0.0, device=device)
+        )
+
+        if checkpoint_backward:
+            step_loss = (lambda_b1 * B1_k + lambda_b2 * B2_k + lambda_bd * L_bd_k) / n_exp
+            step_loss.backward()
+            B1_k, B2_k, L_bd_k = B1_k.detach(), B2_k.detach(), L_bd_k.detach()
+
+        if B1_sum is None:
+            B1_sum, B2_sum, bd_loss_sum = B1_k, B2_k, L_bd_k
+        else:
+            B1_sum = B1_sum + B1_k
+            B2_sum = B2_sum + B2_k
+            bd_loss_sum = bd_loss_sum + L_bd_k
+        n_valid += 1
+
+    B1 = B1_sum / n_valid
+    B2 = B2_sum / n_valid
+    L_bd = bd_loss_sum / n_valid
+
+    beta_star_curve, beta_star = None, None
+    if beta_star_grid:
+        # v, G_k, Q_k, pairs_k here are whatever the last sampled_k iteration
+        # left behind -- intentional (see docstring): a single checkpoint's
+        # worth of QP solves per batch keeps this negligible relative to the
+        # num_chckpt-checkpoint B1/B2 computation above.
+        beta_star_curve, beta_star = compute_beta_star(
+            v.detach(), G_k, Q_k, pairs_k, beta_star_grid, ridge=flip_qp_ridge,
+        )
+
+    return {
+        "B1": B1, "B2": B2, "L_bd": L_bd,
+        "beta_star_curve": beta_star_curve, "beta_star": beta_star,
+    }
+
+
+def optimize_trigger_step(
+    expert_models,
+    worker_loader,
     source_label,
     target_label,
     loss_fn,
     delta,
     mu,
+    mu_source,
     optimizer_delta,
-    lambda_match,
-    lambda_adv,
+    lambda_bd,
     lambda_penalty,
     lambda_delta,
+    lambda_tv,
+    kappa,
     alpha_ckpt,
     num_chckpt,
     epsilon,
+    lambda_poison,
+    n_classes,
+    class_samples_raw,
+    pi,
+    beta,
+    flip_qp_ridge,
+    lambda_b1,
+    lambda_b2,
+    run_tag,
     device="cuda",
     dataset_flag="cifar",
     init="stripe",
     model_flag="r32p",
-    orthogonal=False,
+    checkpoint_backward=True,
+    beta_star_grid=None,
 ):
+    '''Runs one outer step's worth of trigger-optimization batches against a
+    fixed set of expert checkpoints. Nothing here is federated: there is no
+    worker simulation and no aggregator (see `_compute_step`) -- `beta` and
+    `run_tag` (used only for the output filename) are both derived upstream,
+    in `optimize_trigger`, from whatever num_honests/num_poisoned mean for the
+    caller's experiment design.
+    '''
     sampled_k = sample_checkpoints(
         len(expert_models),
         num_chckpt,
@@ -78,143 +259,84 @@ def optimize_trigger_step_federated(
         device=device,
     )
 
-    total_steps = min(len(loader) for loader in worker_loaders)
+    # G/Q depend only on (checkpoint, dataset), not on the trigger: expert_models
+    # is fixed for the whole call, so a fresh cache here is reused across every
+    # batch of this call and discarded once these checkpoints (this outer
+    # training step's experts) are replaced.
+    flip_grad_cache = {}
 
-    zipped_loaders = zip(*worker_loaders)
-
+    total_steps = len(worker_loader)
     pbar = make_pbar(
-        zipped_loaders,
+        worker_loader,
         total=total_steps,
-        desc="Optimizing trigger (federated)",
+        desc="Optimizing trigger",
         leave=False,
     )
 
-    for batches in pbar:
+    hinge_window = []
+    metrics_history = {"B1": [], "B2": [], "L_bd": []}
+    last_beta_star_curve, last_beta_star = None, None
+
+    for batch in pbar:
         optimizer_delta.zero_grad()
 
-        agg_clean_sum = None
-        agg_mix_sum = None
-        mu_poison_sum = None
-
-        adv_loss_sum = 0.0
-        adv_count = 0
-
-        for k in sampled_k:
-            M = expert_models[k].to(device).eval()
-            params = list(M.parameters())
-
-            grad_buf_clean = [[] for _ in params]
-            grad_buf_mix = [[] for _ in params]
-
-            poison_worker_grads = []
-
-            for cid, batch in enumerate(batches):
-                x_raw, y = move_to_device(batch, device)
-                x_clean = raw_to_preprocess(
-                    x_raw, dataset_flag=dataset_flag, model_flag=model_flag
-                )
-
-                if cid < num_honests:
-                    grads, _ = compute_batch_gradients(
-                        M,
-                        loss_fn,
-                        (x_clean, y),
-                        create_graph=False,
-                        retain_graph=False,
-                    )
-
-                    for i, g in enumerate(grads):
-                        g_det = g.detach()
-                        grad_buf_clean[i].append(g_det)
-                        grad_buf_mix[i].append(g_det)
-
-                else:
-                    mask = y == source_label
-
-                    if mask.sum() == 0:
-                        continue
-
-                    y_poison = y.clone()
-                    y_poison[mask] = target_label
-
-                    x_poisoned = x_clean.clone()
-                    x_poisoned[mask] = raw_to_trigger_preprocess(
-                        x_raw[mask],
-                        delta,
-                        dataset_flag=dataset_flag,
-                        model_flag=model_flag,
-                    )
-
-                    grads, logits_adv = compute_batch_gradients(
-                        M,
-                        loss_fn,
-                        (x_poisoned, y_poison),
-                        create_graph=True,
-                        retain_graph=True,
-                    )
-
-                    for i, g in enumerate(grads):
-                        grad_buf_mix[i].append(g)
-
-                    flat = torch.cat([g.reshape(-1) for g in grads])
-                    poison_worker_grads.append(flat)
-
-                    adv_loss_sum += loss_fn(logits_adv, y_poison)
-                    adv_count += 1
-
-            agg_mix = federated_aggregate(
-                params, grad_buf_mix, agg_method, f=num_poisoned
-            )
-
-            flat_mix = torch.cat([g.reshape(-1) for g in agg_mix])
-
-            if len(poison_worker_grads) > 0:
-                mu_poison = torch.stack(poison_worker_grads).mean(0)
-            else:
-                mu_poison = torch.zeros_like(flat_mix)
-
-            if agg_clean_sum is None:
-                agg_mix_sum = flat_mix
-                mu_poison_sum = mu_poison
-            else:
-                agg_mix_sum += flat_mix
-                mu_poison_sum += mu_poison
-
-        n_exp = len(sampled_k)
-
-        agg_mix_mean = agg_mix_sum / n_exp
-        mu_poison_mean = mu_poison_sum / n_exp
-
-        L_match = cosine_grad_loss(agg_mix_mean, mu_poison_mean, orthogonal=orthogonal)
-
-        if adv_count > 0:
-            L_adv = adv_loss_sum / adv_count
-        else:
-            L_adv = torch.tensor(0.0, device=device)
-
-        L_pen = trigger_penalty(delta, mu)
-
-        L_tot = (
-            lambda_match * L_match
-            + lambda_adv * L_adv
-            + lambda_penalty * L_pen
-            + lambda_delta * delta.norm()
+        result = _compute_step(
+            batch, expert_models, sampled_k, source_label, target_label, loss_fn, delta,
+            device, dataset_flag, model_flag, lambda_poison, n_classes,
+            flip_grad_cache, class_samples_raw, pi, beta, flip_qp_ridge,
+            checkpoint_backward, lambda_b1, lambda_b2, lambda_bd,
+            beta_star_grid=beta_star_grid,
         )
+        B1, B2, L_bd = result["B1"], result["B2"], result["L_bd"]
+        beta_star_curve, beta_star = result["beta_star_curve"], result["beta_star"]
 
-        L_tot.backward()
+        L_pen = trigger_penalty_hinge(delta, mu, mu_source, kappa)
+        L_tv = tv_loss(delta)
+
+        if checkpoint_backward:
+            L_reg = (
+                lambda_penalty * L_pen
+                + lambda_delta * delta.norm()
+                + lambda_tv * L_tv
+            )
+            L_reg.backward()
+        else:
+            L_tot = (
+                lambda_b1 * B1
+                + lambda_b2 * B2
+                + lambda_bd * L_bd
+                + lambda_penalty * L_pen
+                + lambda_delta * delta.norm()
+                + lambda_tv * L_tv
+            )
+            L_tot.backward()
+
         optimizer_delta.step()
 
         with torch.no_grad():
             delta.clamp_(-epsilon, epsilon)
 
-        pbar.set_postfix(
-            {
-                "L_match": f"{L_match.item():.6f}",
-                "L_adv": f"{L_adv.item():.4f}",
-                "L_pen": f"{L_pen.item():.4f}",
-                "||delta||": f"{delta.norm().item():.4f}",
-            }
-        )
+        hinge_window.append(L_pen.item() > 0)
+        if len(hinge_window) > WINDOW_SIZE:
+            hinge_window.pop(0)
+
+        metrics_history["B1"].append(B1.item())
+        metrics_history["B2"].append(B2.item())
+        metrics_history["L_bd"].append(L_bd.item())
+        if beta_star_grid:
+            last_beta_star_curve, last_beta_star = beta_star_curve, beta_star
+
+        postfix = {
+            "B1": f"{B1.item():.6f}",
+            "B2": f"{B2.item():.6f}",
+            "L_bd": f"{L_bd.item():.4f}",
+            "L_pen": f"{L_pen.item():.4f}",
+            "hinge_rate": f"{sum(hinge_window) / len(hinge_window):.2f}",
+            "||delta||": f"{delta.norm().item():.4f}",
+        }
+        if beta_star_grid:
+            postfix["beta*"] = f"{beta_star:.4g}" if beta_star is not None else "None"
+        pbar.set_postfix(postfix)
 
     delta_img = delta.detach().cpu().numpy().transpose(1, 2, 0)
     delta_img = (delta_img - delta_img.min()) / (
@@ -225,17 +347,27 @@ def optimize_trigger_step_federated(
     plt.axis("off")
     os.makedirs("out/optimizing_trigger", exist_ok=True)
     plt.savefig(
-        f"out/optimizing_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.png"
+        f"out/optimizing_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{run_tag}.png"
     )
+    plt.close()
 
     delta_save = delta.detach().cpu()
     os.makedirs("optimized_trigger", exist_ok=True)
     torch.save(
         delta_save,
-        f"optimized_trigger/fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
+        f"optimized_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{run_tag}.pt",
     )
 
-    return delta
+    step_summary = {
+        key: (sum(vals) / len(vals) if vals else None)
+        for key, vals in metrics_history.items()
+    }
+    if beta_star_grid:
+        # Last batch's curve/beta_star, not averaged across batches (matches
+        # the existing clean_acc/poison_acc "last value of the step" convention).
+        step_summary["beta_star_curve"] = last_beta_star_curve
+        step_summary["beta_star"] = last_beta_star
+    return delta, step_summary
 
 
 def optimize_trigger(
@@ -243,13 +375,16 @@ def optimize_trigger(
     loss_fn,
     dataset_flag,
     mu,
+    mu_source,
     source_label,
     target_label,
-    agg_method,
-    lambda_match=1.0,
-    lambda_adv=1.0,
+    lambda_bd=1.0,
     lambda_penalty=0.1,
     lambda_delta=0.01,
+    lambda_b1=0.0,
+    lambda_b2=0.0,
+    lambda_tv=0.0,
+    kappa=0.0,
     alpha_ckpt=0.1,
     num_chckpt=4,
     epsilon=0.03,
@@ -258,39 +393,41 @@ def optimize_trigger(
     device="cuda",
     train_flag="sgd",
     batch_size=None,
+    epochs=20,
     optim_kwargs={},
     scheduler_kwargs={},
     expert_config={},
-    # expert_path="/Data/mb/flip/out/checkpoints/r32p_1xs/{}/model_{}_{}.pth",
     expert_path="/shared/data1/Projects/DLWP/j1067582/martin/FLIP/out/checkpoints/r32p_1xs/{}/model_{}_{}.pth",
     chkpt_iters=50,
     output_dir="/shared/data1/Projects/DLWP/j1067582/martin/FLIP/out/checkpoints/r32p_1xs/0/",
-    epochs=20,
     init="stripe",
     num_honests=5,
     num_poisoned=5,
     model_flag="r32p",
     output_dir_trigger="/shared/data1/Projects/DLWP/j1067582/martin/FLIP/optimized_trigger",
     restart=False,
-    orthogonal=False,
+    flip_budget=0,
+    lambda_poison=None,
+    checkpoint_backward=True,
+    worker_batch_size=256,
+    flip_qp_ridge=1e-6,
+    flip_gradient_samples_per_class=64,
+    metrics_log_path=None,
+    beta_star_grid=None,
 ):
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
-    if (
-        restart
-        and Path(output_dir_trigger)
-        .joinpath(
-            f"fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt"
-        )
-        .exists()
-    ):
-        delta = torch.load(
-            Path(output_dir_trigger).joinpath(
-                f"fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt"
-            ),
-            map_location=device,
-        )
+
+    # run_tag: only used for output filenames, computed here (not inside
+    # optimize_trigger_step, which no longer knows about num_honests/num_poisoned).
+    run_tag = f"{num_poisoned}vs{num_honests}"
+
+    trig_path = Path(output_dir_trigger).joinpath(
+        f"fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{run_tag}.pt"
+    )
+    if restart and trig_path.exists():
+        delta = torch.load(trig_path, map_location=device)
     else:
         delta = init_delta(
             mu.shape, horizontal=True, strength=6.0, freq=16, device=device, init=init
@@ -300,15 +437,40 @@ def optimize_trigger(
     optimizer_delta = torch.optim.Adam([delta], lr=lr_delta)
 
     raw_train_dataset = get_raw_clean_dataset(dataset_flag, train=True)
+    n_train = len(raw_train_dataset)
+    n_classes = get_n_classes(dataset_flag)
 
-    num_clients = num_honests + num_poisoned
-    worker_loaders = build_worker_loaders(
-        raw_train_dataset, num_clients, batch_size=128
+    n_w = num_honests + num_poisoned
+
+    # beta is the single global poisoning-budget bound (fraction, weighted by
+    # empirical class frequency, of gradient mass the attacker can afford to
+    # buy via label flips); lambda_poison is the actual per-batch flip rate
+    # applied when constructing the poisoned batch. Both derive from the same
+    # flip_budget, so the constraint and the simulated attack stay consistent.
+    beta = flip_budget * n_w / (num_poisoned * n_train)
+    if lambda_poison == "beta":
+        lambda_poison = beta
+    if lambda_poison is None:
+        raise ValueError(
+            "lambda_poison is None after resolution: pass a float in (0, 1], "
+            "or the string 'beta' to derive it from flip_budget (the default)."
+        )
+
+    worker_loader = build_worker_loader(raw_train_dataset, batch_size=worker_batch_size)
+
+    # pi (class frequencies) and class_samples_raw depend only on the dataset
+    # (not on the checkpoint or the trigger): computed once and reused across
+    # every step/checkpoint.
+    pi = compute_class_frequencies(dataset_flag, n_classes)
+    class_samples_raw = get_class_conditional_samples(
+        dataset_flag, n_classes, flip_gradient_samples_per_class, device
     )
 
     checkpoints_start = extract_experts(expert_config, expert_path)
 
     big_ims = needs_big_ims(model_flag)
+
+    history = [] if metrics_log_path else None
 
     for step in range(n_steps):
         print(f"\n=== Trigger optimization step {step + 1}/{n_steps} ===")
@@ -344,7 +506,7 @@ def optimize_trigger(
             big=big_ims,
         )
 
-        mini_train(
+        mini_train_out = mini_train(
             model=model,
             train_data=poison_train_dataset,
             test_data=[clean_test_dataset, poison_test_dataset],
@@ -355,7 +517,13 @@ def optimize_trigger(
             callback=lambda m, o, e, i: checkpoint_callback(
                 m, o, e, i, chkpt_iters, output_dir
             ),
+            record=history is not None,
         )
+        clean_acc, poison_acc = None, None
+        if history is not None:
+            _, clean_hist, poison_hist = mini_train_out
+            clean_acc = clean_hist[-1][0] if clean_hist else None
+            poison_acc = poison_hist[-1][0] if poison_hist else None
 
         expert_models = []
         for ckpt_path in checkpoints_start:
@@ -365,40 +533,66 @@ def optimize_trigger(
             M.eval()
             expert_models.append(M)
 
-        delta = optimize_trigger_step_federated(
+        delta, step_summary = optimize_trigger_step(
             expert_models=expert_models,
-            worker_loaders=worker_loaders,
-            num_honests=num_honests,
-            num_poisoned=num_poisoned,
-            agg_method=agg_method,
+            worker_loader=worker_loader,
             source_label=source_label,
             target_label=target_label,
             loss_fn=loss_fn,
             delta=delta,
             mu=mu,
+            mu_source=mu_source,
             optimizer_delta=optimizer_delta,
-            lambda_match=lambda_match,
-            lambda_adv=lambda_adv,
+            lambda_bd=lambda_bd,
             lambda_penalty=lambda_penalty,
             lambda_delta=lambda_delta,
+            lambda_tv=lambda_tv,
+            kappa=kappa,
             alpha_ckpt=alpha_ckpt,
             num_chckpt=num_chckpt,
             epsilon=epsilon,
+            lambda_poison=lambda_poison,
+            n_classes=n_classes,
+            class_samples_raw=class_samples_raw,
+            pi=pi,
+            beta=beta,
+            flip_qp_ridge=flip_qp_ridge,
+            lambda_b1=lambda_b1,
+            lambda_b2=lambda_b2,
+            run_tag=run_tag,
             device=device,
             dataset_flag=dataset_flag,
+            init=init,
             model_flag=model_flag,
-            orthogonal=orthogonal,
+            checkpoint_backward=checkpoint_backward,
+            beta_star_grid=beta_star_grid,
         )
 
         del expert_models
         torch.cuda.empty_cache()
+
+        if history is not None:
+            history.append({
+                "step": step,
+                "clean_acc": clean_acc,
+                "poison_acc": poison_acc,
+                **step_summary,
+            })
+
+    if metrics_log_path:
+        Path(metrics_log_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(metrics_log_path, "w") as f:
+            json.dump(history, f, indent=2)
 
     return delta.detach()
 
 
 def run(experiment_name, module_name, **kwargs):
     """
-    Optimizes and saves a trigger (delta).
+    Optimizes and saves a trigger (delta) against a single, non-federated
+    objective: per sampled expert checkpoint, compares the gradient shift a
+    poisoned batch induces to the feasible gradient polytope spanned by
+    expected label-flip directions. No worker simulation, no aggregator.
     """
 
     slurm_id = kwargs.get("slurm_id", None)
@@ -411,19 +605,16 @@ def run(experiment_name, module_name, **kwargs):
 
     num_honests = args.get("num_honests", 5)
     num_poisoned = args.get("num_poisoned", 5)
-    agg_method = args.get("agg_method", "mean")
 
-    lambda_match = args.get("lambda_match", 0.0)
-    lambda_adv = args.get("lambda_adv", 0.0)
+    lambda_bd = args.get("lambda_bd", 0.0)
     lambda_penalty = args.get("lambda_penalty", 0.0)
     lambda_delta = args.get("lambda_delta", 0.0)
 
     epsilon = args.get("epsilon", 0.1)
     lr_delta = args.get("lr_delta", 1e-2)
     n_steps = args.get("n_steps", 100)
-    orthogonal = args.get("orthogonal", False)
 
-    alpha_ckpt = args.get("alpha_ckpt", None)
+    alpha_ckpt = args.get("alpha_ckpt", 0.01)
     num_chckpt = args.get("num_chckpt", 15)
     restart = args.get("restart", False)
     expert_config = args.get("expert_config", {})
@@ -433,10 +624,21 @@ def run(experiment_name, module_name, **kwargs):
 
     init = args.get("init", "stripe")
 
-    if agg_method in ["krum", "trmean"]:
-        assert num_honests + num_poisoned > 2 * num_poisoned + 2, (
-            "Not enough honest clients for robust aggregation"
-        )
+    lambda_b1 = args.get("lambda_b1", 0.0)
+    lambda_b2 = args.get("lambda_b2", 0.0)
+    flip_budget = args.get("flip_budget", 0)
+    lambda_poison = args.get("lambda_poison", "beta")
+    kappa = args.get("kappa", 0.0)
+    lambda_tv = args.get("lambda_tv", 0.0)
+    checkpoint_backward = args.get("checkpoint_backward", True)
+    worker_batch_size = args.get("worker_batch_size", 256)
+    flip_qp_ridge = args.get("flip_qp_ridge", 1e-6)
+    flip_gradient_samples_per_class = args.get("flip_gradient_samples_per_class", 64)
+    epochs = args.get("epochs", 20)
+    metrics_log_path = args.get("metrics_log_path", None)
+    if metrics_log_path is not None:
+        metrics_log_path = slurmify_path(metrics_log_path, slurm_id)
+    beta_star_grid = args.get("beta_star_grid", [])
 
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
@@ -449,6 +651,17 @@ def run(experiment_name, module_name, **kwargs):
         ),
         slurm_id,
     )
+
+    if epochs < 5 and "out/checkpoints" in Path(output_dir).as_posix():
+        raise ValueError(
+            f"epochs={epochs} < 5 with output_dir={output_dir!r} pointing under "
+            "out/checkpoints/: this looks like a smoke/debug run about to overwrite "
+            "real training checkpoints (mini_train's checkpoint_callback writes into "
+            "output_dir every step). Use a temporary output_dir "
+            "(e.g. tempfile.mkdtemp()) for short/debug runs, or set epochs >= 5 for "
+            "a real training run."
+        )
+
     print(f"Output directory: {output_dir}")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -460,6 +673,7 @@ def run(experiment_name, module_name, **kwargs):
     model.eval()
 
     mu = get_mu(dataset_flag, y_target, device, model_flag=model_flag)
+    mu_source = get_mu(dataset_flag, y_source, device, model_flag=model_flag)
 
     print("Optimizing trigger...")
     loss_fn = torch.nn.CrossEntropyLoss()
@@ -467,14 +681,13 @@ def run(experiment_name, module_name, **kwargs):
         model=model,
         dataset_flag=dataset_flag,
         loss_fn=loss_fn,
-        agg_method=agg_method,
         num_honests=num_honests,
         num_poisoned=num_poisoned,
         mu=mu,
+        mu_source=mu_source,
         source_label=y_source,
         target_label=y_target,
-        lambda_match=lambda_match,
-        lambda_adv=lambda_adv,
+        lambda_bd=lambda_bd,
         lambda_penalty=lambda_penalty,
         lambda_delta=lambda_delta,
         alpha_ckpt=alpha_ckpt,
@@ -482,6 +695,7 @@ def run(experiment_name, module_name, **kwargs):
         epsilon=epsilon,
         lr_delta=lr_delta,
         n_steps=n_steps,
+        epochs=epochs,
         device=device,
         expert_config=expert_config,
         expert_path=expert_path,
@@ -492,7 +706,18 @@ def run(experiment_name, module_name, **kwargs):
         scheduler_kwargs=scheduler_kwargs,
         model_flag=model_flag,
         restart=restart,
-        orthogonal=orthogonal,
+        lambda_b1=lambda_b1,
+        lambda_b2=lambda_b2,
+        flip_budget=flip_budget,
+        lambda_poison=lambda_poison,
+        kappa=kappa,
+        lambda_tv=lambda_tv,
+        checkpoint_backward=checkpoint_backward,
+        worker_batch_size=worker_batch_size,
+        flip_qp_ridge=flip_qp_ridge,
+        flip_gradient_samples_per_class=flip_gradient_samples_per_class,
+        metrics_log_path=metrics_log_path,
+        beta_star_grid=beta_star_grid,
     )
 
     print("Optimized trigger obtained.")
@@ -506,14 +731,14 @@ def run(experiment_name, module_name, **kwargs):
     plt.title("Optimized Trigger (Delta)")
     plt.axis("off")
     plt.savefig(
-        f"out/optimizing_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.png"
+        f"out/optimizing_trigger/fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{num_poisoned}vs{num_honests}.png"
     )
 
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
     torch.save(
         optimized_delta.detach().cpu(),
         Path(output_dir_trigger)
-        / f"fed_opt_trig_{init}{'_orthogonal' if orthogonal else ''}_{model_flag}_{dataset_flag}_{agg_method}_{num_poisoned}vs{num_honests}.pt",
+        / f"fed_opt_trig_{init}_{model_flag}_{dataset_flag}_{num_poisoned}vs{num_honests}.pt",
     )
 
 
