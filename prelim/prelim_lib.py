@@ -683,3 +683,313 @@ def train_clean_checkpoints(model, dataset_flag, n_classes, device, epochs,
     paths["end"] = end_path
 
     return paths
+
+
+# --------------------------------------------------------------------------#
+# Instrumented aggregation rules (SPEC section 7)
+# --------------------------------------------------------------------------#
+#
+# Every rule this suite uses is a "select-then-average" rule: at coordinate j
+# it picks a set S_j of ell worker indices and returns their plain mean. That
+# is true of the four robust rules of the grid as the repo implements them
+# (see modules/base_utils/util.py mini_train_multi, l.366-381):
+#
+#   mean       S_j = all workers,                 ell = n_b
+#   cw_median  S_j = {lower median index},        ell = 1
+#   trmean     S_j = the n_b-2f middle values,    ell = n_b - 2f
+#   krum       S_j = {argmin krum score},         ell = 1        (multikrum m=1)
+#   multikrum  S_j = the m best krum scores,      ell = m = n_b-f-2
+#
+# so a single generic instrumentation covers all of them: each rule returns an
+# index array, and the aggregate is the gather-and-mean of that array. The
+# selection weights omega[i,j] = 1[i in S_j]/ell are NEVER materialised as an
+# (n_b, d) matrix, per SPEC section 7 -- only the (ell, d) index array is, and
+# ell <= n_b so that array is no larger than the gradient stack itself.
+#
+# cw_median follows torch.median's convention (LOWER median, ell = 1) rather
+# than the textbook "average of the two middle values" for even n_b. That is a
+# deliberate choice: the repo's per-tensor path is literally
+# `grads.median(dim=0).values`, and the flat/per_tensor concordance assertion
+# of SPEC section 2 can only be exact if the flat reference uses the same
+# convention.
+
+_REPO_TRMEAN = None
+_REPO_MULTIKRUM = None
+
+
+def _repo_aggregators():
+    """Lazy import of the repo's own rules (modules/ is read only)."""
+    global _REPO_TRMEAN, _REPO_MULTIKRUM
+    if _REPO_TRMEAN is None:
+        from modules.base_utils.aggregator.trmean import aggr_trmean
+        from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
+        _REPO_TRMEAN, _REPO_MULTIKRUM = aggr_trmean, aggr_multikrum
+    return _REPO_TRMEAN, _REPO_MULTIKRUM
+
+
+AGG_RULES = ("mean", "cw_median", "trmean", "krum", "multikrum")
+AGG_VARIANTS = ("flat", "per_tensor")
+
+
+def repo_aggregate(stack, rule, f):
+    """
+    The repo's own aggregation of an (n_b, ...) stack, dispatched exactly as
+    modules.base_utils.util.mini_train_multi does it. Imported, never
+    reimplemented -- this is what the `per_tensor` variant calls per parameter
+    tensor, and what the flat reference is checked against.
+    """
+    aggr_trmean, aggr_multikrum = _repo_aggregators()
+    if rule == "mean":
+        return stack.mean(dim=0)
+    if rule == "cw_median":
+        return stack.median(dim=0).values
+    if rule == "trmean":
+        return aggr_trmean(stack, f=f)
+    if rule == "krum":
+        return aggr_multikrum(stack, f=f, m=1)
+    if rule == "multikrum":
+        return aggr_multikrum(stack, f=f)
+    raise NotImplementedError(rule)
+
+
+def agg_ell(rule, n_b, f):
+    """|S_j| for each rule, i.e. how many messages actually reach the update."""
+    if rule == "mean":
+        return n_b
+    if rule in ("cw_median", "krum"):
+        return 1
+    if rule == "trmean":
+        return n_b - 2 * f
+    if rule == "multikrum":
+        return n_b - f - 2
+    raise NotImplementedError(rule)
+
+
+@dataclass
+class Selection:
+    """
+    Who reached the aggregate, and at which coordinates.
+
+    kind="global"     : idx has shape (ell,)      -- one set for every coordinate
+                        (krum, multikrum, mean); this is the case the theory
+                        assumes, and it forces osc(Abar) = 0 exactly.
+    kind="coordinate" : idx has shape (ell, d)    -- one set per coordinate
+                        (cw_median, trmean), and any rule under `per_tensor`,
+                        where the set is constant WITHIN a tensor and varies
+                        BETWEEN tensors.
+
+    `blocks` is the list of (start, end) parameter-tensor spans the selection
+    was built from: ((0, d),) for `flat`, one entry per parameter tensor for
+    `per_tensor`. It is what makes the between-tensor oscillation of Abar
+    attributable to a tensor rather than to a bare coordinate index.
+    """
+    kind: str
+    idx: torch.Tensor
+    ell: int
+    n_b: int
+    d: int
+    rule: str
+    variant: str
+    blocks: tuple = ()
+
+    @property
+    def chi_ell(self) -> float:
+        """chi_ell = (n_b - ell) / (ell * n_b)."""
+        return (self.n_b - self.ell) / (self.ell * self.n_b)
+
+    @property
+    def lam(self) -> float:
+        """
+        Lambda = max_j sum_i |w[i,j]| with w[i,j] = omega[i,j] - 1/n_b.
+
+        Closed form, independent of j for any select-then-average rule:
+        the ell selected workers each contribute |1/ell - 1/n_b| and the
+        n_b - ell others each contribute 1/n_b, so the sum telescopes to
+        2 (n_b - ell) / n_b = 2 * ell * chi_ell. Computing it in closed form
+        rather than by a max over d avoids a (n_b, d) intermediate and removes
+        any ambiguity about how Lambda is defined (SPEC section 8/E4 names
+        Lambda in the bound but does not define it).
+        """
+        return 2.0 * (self.n_b - self.ell) / self.n_b
+
+    def gather(self, G):
+        """(ell, d) stack of the selected values of G, an (n_b, d) tensor."""
+        if self.kind == "global":
+            return G[self.idx]
+        return torch.gather(G, 0, self.idx)
+
+    def aggregate(self, G):
+        return self.gather(G).mean(dim=0)
+
+    def A(self, mal_mask):
+        """
+        A_j = |S_j ∩ M| / ell as a (d,) tensor. mal_mask is a (n_b,) bool
+        tensor flagging the perturbed workers.
+        """
+        if self.kind == "global":
+            val = mal_mask[self.idx].to(torch.float32).sum() / self.ell
+            return val.expand(self.d).clone()
+        return mal_mask[self.idx].to(torch.float32).sum(dim=0) / self.ell
+
+    def split_PN(self, G, mal_mask):
+        """
+        The two halves of b_Agg - b_mean = sum_i w[i,j] g_i[j], split by worker
+        type: P over the perturbed workers M, N over the honest ones H. Both
+        are (d,) tensors. Computed from the (ell, d) gather plus two (d,) sums,
+        never from an (n_b, d) weight matrix.
+        """
+        sel = self.gather(G)
+        if self.kind == "global":
+            sel_mal = mal_mask[self.idx].to(torch.float32).unsqueeze(1)
+        else:
+            sel_mal = mal_mask[self.idx].to(torch.float32)
+        mal = mal_mask.to(torch.float32).unsqueeze(1)
+        P = (sel * sel_mal).sum(dim=0) / self.ell - (G * mal).sum(dim=0) / self.n_b
+        N = (sel * (1 - sel_mal)).sum(dim=0) / self.ell - (G * (1 - mal)).sum(dim=0) / self.n_b
+        return P, N
+
+
+def _krum_order(G, f):
+    """
+    Worker indices sorted by increasing Krum score, replicating
+    modules/base_utils/aggregator/multikrum.py::_compute_scores: pairwise
+    distances, then the sum of the n - f - 1 smallest distances per worker.
+    Vectorised here (the repo loops in Python over n(n-1)/2 pairs, which the
+    ~200-round E4/E5 replays would make the dominant cost) and checked against
+    the repo aggregate by `check_against_repo` below.
+    """
+    n = G.shape[0]
+    D = torch.cdist(G.unsqueeze(0), G.unsqueeze(0)).squeeze(0)
+    D = torch.nan_to_num(D, nan=float("inf"), posinf=float("inf"))
+    scores = []
+    for i in range(n):
+        d_i = torch.cat([D[i, :i], D[i, i + 1:]])
+        scores.append(float(torch.sort(d_i).values[:n - f - 1].sum()))
+    return torch.as_tensor(np.argsort(np.asarray(scores), kind="stable"), dtype=torch.long)
+
+
+def _select_block(G, rule, f):
+    """Selection for one (n_b, d_block) stack. Returns a Selection."""
+    n_b, d = G.shape
+    ell = agg_ell(rule, n_b, f)
+    if rule == "mean":
+        return Selection("global", torch.arange(n_b), n_b, n_b, d, rule, "flat")
+    if rule in ("cw_median", "trmean"):
+        order = torch.argsort(G, dim=0, stable=True)
+        if rule == "cw_median":
+            k = (n_b - 1) // 2          # torch.median == LOWER median
+            idx = order[k:k + 1]
+        else:
+            idx = order[f:n_b - f]
+        return Selection("coordinate", idx.contiguous(), ell, n_b, d, rule, "flat")
+    if rule in ("krum", "multikrum"):
+        order = _krum_order(G, f)
+        return Selection("global", order[:ell].contiguous(), ell, n_b, d, rule, "flat")
+    raise NotImplementedError(rule)
+
+
+def flat_blocks(model):
+    """[(start, end)] spans of each parameter tensor inside the flattened gradient."""
+    blocks, off = [], 0
+    for p in model.parameters():
+        n = p.numel()
+        blocks.append((off, off + n))
+        off += n
+    return tuple(blocks)
+
+
+def aggregate_instrumented(G, rule, f, variant="flat", blocks=None, check_repo=False,
+                           repo_tol=1e-5):
+    """
+    (aggregate, selection) for an (n_b, d) stack of FLATTENED gradients.
+
+    variant="flat"       -- one selection for the whole d-dimensional vector.
+                            The only variant the theory covers.
+    variant="per_tensor" -- the rule applied independently on each span of
+                            `blocks`, i.e. tensor by parameter tensor, the way
+                            modules/base_utils/util.py::mini_train_multi does
+                            it. The AGGREGATE of each block is produced by the
+                            repo's own function (repo_aggregate), not by a
+                            reimplementation; only the index bookkeeping is
+                            new, and `check_repo` asserts the two agree.
+
+    Under per_tensor the returned Selection is always kind="coordinate", even
+    for krum/multikrum: the set is constant within a tensor but varies between
+    tensors, which is exactly the osc(Abar) > 0 that SPEC section 7 predicts.
+    """
+    n_b, d = G.shape
+    if variant == "flat":
+        sel = _select_block(G, rule, f)
+        sel.blocks = ((0, d),)
+        sel.variant = "flat"
+        agg = sel.aggregate(G)
+        if check_repo:
+            check_against_repo(G, rule, f, agg, tol=repo_tol)
+        return agg, sel
+
+    if variant != "per_tensor":
+        raise NotImplementedError(variant)
+    if blocks is None:
+        raise ValueError("per_tensor needs `blocks` (see flat_blocks(model))")
+
+    ell = agg_ell(rule, n_b, f)
+    idx = torch.empty((ell, d), dtype=torch.long)
+    agg = torch.empty(d, dtype=G.dtype)
+    for (s, e) in blocks:
+        Gb = G[:, s:e].contiguous()
+        sel_b = _select_block(Gb, rule, f)
+        if sel_b.kind == "global":
+            idx[:, s:e] = sel_b.idx.unsqueeze(1).expand(ell, e - s)
+        else:
+            idx[:, s:e] = sel_b.idx
+        # The aggregate comes from the repo implementation, per SPEC section 7.
+        agg[s:e] = repo_aggregate(Gb, rule, f)
+        if check_repo:
+            ref = torch.gather(Gb, 0, idx[:, s:e]).mean(dim=0)
+            gap = float((ref - agg[s:e]).abs().max())
+            if gap > repo_tol:
+                raise AssertionError(
+                    f"per_tensor {rule}: instrumented selection disagrees with the repo "
+                    f"aggregate on block ({s},{e}): max|diff| = {gap:.3e} > {repo_tol:.1e}")
+    sel = Selection("coordinate", idx, ell, n_b, d, rule, "per_tensor", tuple(blocks))
+    return agg, sel
+
+
+def check_against_repo(G, rule, f, agg_flat, tol=1e-5):
+    """
+    SPEC section 2 assertion: the flat reference rule must agree with the repo
+    rule applied to the same stack. Returns the observed max|diff| and raises
+    if it exceeds `tol`.
+    """
+    ref = repo_aggregate(G, rule, f)
+    gap = float((ref - agg_flat).abs().max())
+    if gap > tol:
+        raise AssertionError(f"flat {rule}: max|flat - repo| = {gap:.3e} > {tol:.1e}")
+    return gap
+
+
+def osc(values):
+    """Oscillation max - min of a (d,) tensor; 0.0 exactly for a constant vector."""
+    t = torch.as_tensor(values)
+    return float(t.max() - t.min())
+
+
+def alpha_tilde(b, v):
+    """
+    Deviation-level alignment cos(b, v), clipped to [0, 1]. Same quantity as
+    alpha_tilde_star = sqrt(1 - dist^2/||v||^2) but evaluated at an ARBITRARY
+    deviation b rather than at the cone-projection optimum -- SPEC section 8/E4
+    asks for alpha_tilde(b_Agg) against alpha_tilde(b_mean).
+    """
+    b = torch.as_tensor(b, dtype=torch.float32)
+    v = torch.as_tensor(v, dtype=torch.float32)
+    den = float(b.norm()) * float(v.norm())
+    if den <= 0:
+        return float("nan")
+    return max(0.0, min(1.0, float(torch.dot(b, v)) / den))
+
+
+# SPEC section 5 names this function `masses_to_labels`; the implementation
+# above predates that name. Alias rather than rename, so existing callers keep
+# working and the spec's name resolves.
+masses_to_labels = flip_masses_to_labels
