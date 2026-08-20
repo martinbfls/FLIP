@@ -144,7 +144,7 @@ source_label, target_label = 9, 4
 num_honests, num_poisoned = 5, 5
 n_w = num_honests + num_poisoned
 flip_budget = 1500
-worker_batch_size = 256
+batch_size_trigger = 256
 n_steps = 20
 expert_path = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP/out/checkpoints/r32p_1xs/{}/model_{}_{}.pth"
 
@@ -174,7 +174,7 @@ beta = lambda_poison
 mu = get_mu(dataset_flag, target_label, device, model_flag=model_flag)
 delta = init_delta(mu.shape, horizontal=True, strength=6.0, freq=16, device=device, init="stripe")
 
-loader = build_loader(raw_train_dataset, worker_batch_size)
+loader = build_loader(raw_train_dataset, batch_size_trigger)
 loader_iter = iter(loader)
 
 pi = compute_class_frequencies(dataset_flag, n_classes)

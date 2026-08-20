@@ -4,8 +4,8 @@
 #
 # Slurm counterpart to orchestrate_runs.sh: runs the exact same gen_labels
 # -> train_user campaign, but instead of round-robining jobs over a
-# hardcoded pool of SSH machines, it packs them as concurrent `srun`
-# job steps inside a single Slurm allocation (see slurm_lib.sh).
+# hardcoded pool of SSH machines, it submits every experiment as its own
+# independent Slurm job (see slurm_lib.sh).
 #
 # The old orchestrate_runs.sh (and its bis/ter/trigger variants) are left
 # untouched and remain fully usable on the legacy SSH-pool infrastructure.
@@ -13,56 +13,37 @@
 # ---------------------------------------------------------------------
 # SUBMISSION
 # ---------------------------------------------------------------------
-# All #SBATCH directives below are placeholders (commented out) so this
-# script does not silently submit with made-up resource values. Either:
+# This script is NOT submitted with sbatch any more: it is a *submitter*,
+# run directly from a login-node shell. It returns as soon as all jobs are
+# queued.
 #
-#   (a) uncomment and edit the #SBATCH lines below, then:
-#         sbatch orchestrate_runs_slurm.sh
+#     bash orchestrate_runs_slurm.sh
 #
-#   (b) or leave them commented and pass resources on the command line:
-#         sbatch --job-name=flip_gen_train \
-#                --partition=<PARTITION> \
-#                --nodes=<N_NODES> \
-#                --gres=gpu:<GPUS_PER_NODE> \
-#                --cpus-per-task=<CPUS_PER_NODE> \
-#                --mem=<MEM_PER_NODE> \
-#                --time=<TIME_LIMIT> \
-#                orchestrate_runs_slurm.sh
+# Each experiment becomes one sbatch job asking for 1 GPU / 16 CPU / 32G /
+# 24h on cypress_dgx, so Slurm itself schedules up to 8 concurrent runs on
+# the 8 A100s of dgx-n01, and each run gets its own 24h walltime regardless
+# of how long the whole campaign takes.
 #
-# Whichever GPU total you request (nodes * gpus-per-node), set
-# N_PARALLEL_TASKS below to (that total / GPUS_PER_TASK) so the pool
-# executor uses all of it.
+# Resources and the conda env are configured at the top of slurm_lib.sh and
+# can be overridden from the environment, e.g.:
+#     CPUS_PER_TASK=12 bash orchestrate_runs_slurm.sh
 # ---------------------------------------------------------------------
 
-# #SBATCH --job-name=flip_gen_train
-# #SBATCH --partition=<PARTITION>
-# #SBATCH --nodes=<N_NODES>
-# #SBATCH --gres=gpu:<GPUS_PER_NODE>
-# #SBATCH --cpus-per-task=<CPUS_PER_NODE>
-# #SBATCH --mem=<MEM_PER_NODE>
-# #SBATCH --time=<TIME_LIMIT>
-# #SBATCH --constraint=<CONSTRAINT>
-# #SBATCH --output=logs_slurm/%x-%j.out
-
-set -x
 # NOTE: no `set -e` on purpose (same reasoning as orchestrate_runs_bis.sh):
-# one failed experiment must not tear down the whole allocation/pool.
+# one failed submission must not tear down the whole campaign.
 
-BASE_DIR="$HOME/FLIP"
+# Default to the directory this script lives in, so the repo can sit anywhere
+# (it is under /shared, not $HOME) and the script works from any cwd.
+BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "$BASE_DIR" || exit 1
+export BASE_DIR
 
 mkdir -p "$BASE_DIR/logs_slurm"
 
 source "$BASE_DIR/slurm_lib.sh"
 
-# ---------------------------------------------------------------------
-# Per-task resource placeholders (see slurm_lib.sh for details).
-# Fill these in to match what you requested via sbatch/#SBATCH above.
-# ---------------------------------------------------------------------
-GPUS_PER_TASK="${GPUS_PER_TASK:-1}"       # TODO
-CPUS_PER_TASK="${CPUS_PER_TASK:-4}"       # TODO
-MEM_PER_TASK="${MEM_PER_TASK:-16G}"       # TODO
-N_PARALLEL_TASKS="${N_PARALLEL_TASKS:-4}" # TODO: total GPUs allocated / GPUS_PER_TASK
+# Fail before anything is queued if the environment cannot support the plan.
+preflight_slurm || { echo "[ABORT] preflight failed, nothing submitted"; exit 1; }
 
 # ==========================================================
 # EXPERIMENT GRID (identical to orchestrate_runs.sh)
@@ -71,11 +52,13 @@ N_PARALLEL_TASKS="${N_PARALLEL_TASKS:-4}" # TODO: total GPUs allocated / GPUS_PE
 DATASET="cifar"
 ATTACK="backdoor"
 
-AGGREGATORS=("mean" "median" "krum" "trmean" "multikrum")
-POISONERS=("1xs")
+# Space-separated overrides, e.g.:
+#   AGGREGATORS=multikrum POISONERS=optimized bash orchestrate_runs_slurm.sh
+read -ra AGGREGATORS <<< "${AGGREGATORS:-mean median krum trmean multikrum}"
+read -ra POISONERS   <<< "${POISONERS:-1xs}"
 
 BUDGETS=(150 300 500 1000 1500 2000 2500 5000)
-N_CYCLES=10
+N_CYCLES="${N_CYCLES:-10}"
 
 NUM_CLEAN=7
 NUM_POISONED=3
@@ -104,10 +87,41 @@ done
 done
 
 echo "=============================="
-echo "GEN_LABELS SLURM POOL"
+echo "GEN_LABELS SLURM SUBMISSION"
 echo "=============================="
 
-run_job_pool_srun GEN_JOBS GEN
+EXPECTED_GEN=${#GEN_JOBS[@]}
+
+submit_job_pool_slurm GEN_JOBS GEN
+GEN_IDS=("${SUBMITTED_JOB_IDS[@]}")
+
+# The barrier must cover EVERY GEN job. A partially submitted phase would
+# produce a barrier on a subset, and TRAIN jobs would start on incomplete
+# labels -- so this is a hard abort, not a warning.
+if [ ${#GEN_IDS[@]} -ne "$EXPECTED_GEN" ]; then
+    echo "[ABORT] only ${#GEN_IDS[@]}/$EXPECTED_GEN GEN jobs were submitted."
+    echo "[ABORT] no barrier, no TRAIN. Cancel the partial phase with:"
+    echo "        scancel \$(awk '{print \$1}' logs_slurm/jobids_GEN.txt)"
+    exit 1
+fi
+
+# ==========================================================
+# GEN -> TRAIN BARRIER
+# ==========================================================
+# One tiny CPU job depending on afterok of every GEN job. TRAIN jobs then
+# depend on this single barrier instead of carrying a 50-id dependency list.
+# If any GEN job fails, the barrier's dependency can never be satisfied:
+# the barrier is cancelled, and the TRAIN jobs depending on it are cancelled
+# too (--kill-on-invalid-dep). Nothing trains on missing labels.
+
+BARRIER_ID=$(submit_barrier_slurm "flip_barrier_gen" "afterok:$(join_job_ids "${GEN_IDS[@]}")")
+
+if [ -z "$BARRIER_ID" ]; then
+    echo "[ERROR] barrier job submission failed, aborting before TRAIN"
+    exit 1
+fi
+
+echo "[BARRIER] job $BARRIER_ID waits for ${#GEN_IDS[@]} GEN jobs"
 
 # ==========================================================
 # BUILD TRAIN JOBS (GLOBAL)
@@ -134,11 +148,23 @@ done
 done
 
 echo "=============================="
-echo "TRAIN_USER SLURM POOL"
+echo "TRAIN_USER SLURM SUBMISSION"
 echo "=============================="
 
-run_job_pool_srun TRAIN_JOBS TRAIN
+EXPECTED_TRAIN=${#TRAIN_JOBS[@]}
+
+if ! submit_job_pool_slurm TRAIN_JOBS TRAIN "afterok:${BARRIER_ID}"; then
+    echo "[WARNING] only ${#SUBMITTED_JOB_IDS[@]}/$EXPECTED_TRAIN TRAIN jobs were submitted."
+    echo "[WARNING] GEN and the barrier are queued and safe; resubmit the missing"
+    echo "[WARNING] TRAIN jobs against barrier $BARRIER_ID once the cause is fixed."
+fi
 
 echo "=============================="
-echo "ALL DONE"
+echo "ALL SUBMITTED"
+echo "  GEN     : ${#GEN_IDS[@]} jobs   (ids in logs_slurm/jobids_GEN.txt)"
+echo "  BARRIER : $BARRIER_ID"
+echo "  TRAIN   : ${#SUBMITTED_JOB_IDS[@]} jobs  (ids in logs_slurm/jobids_TRAIN.txt)"
+echo ""
+echo "  squeue -u \$USER"
+echo "  scancel \$(awk '{print \$1}' logs_slurm/jobids_*.txt)   # cancel everything"
 echo "=============================="

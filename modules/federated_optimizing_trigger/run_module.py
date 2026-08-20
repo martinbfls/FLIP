@@ -31,6 +31,8 @@ from modules.federated_optimizing_trigger.utils import (
 )
 from modules.train_expert.utils import checkpoint_callback
 import torch
+from torch.utils.data import ConcatDataset, Subset
+import numpy as np
 from pathlib import Path
 import os
 import json
@@ -123,6 +125,12 @@ def _compute_step(
         mask = torch.zeros_like(mask)
         mask[keep] = True
         y_poison[mask] = target_label
+
+    # Actually-realized poison fraction of this batch, post idx_source.numel()
+    # capping above -- can fall short of lambda_poison whenever lambda_poison
+    # > the batch's naturally-source-labeled fraction (~= pi_source); see
+    # optimize_trigger's source_duplication and its 5%-deviation warning.
+    lambda_effective = mask.sum().item() / n_b if n_b > 0 else 0.0
 
     B1_sum, B2_sum, bd_loss_sum = None, None, None
     n_valid = 0
@@ -218,7 +226,7 @@ def _compute_step(
         )
 
     return {
-        "B1": B1, "B2": B2, "L_bd": L_bd,
+        "B1": B1, "B2": B2, "L_bd": L_bd, "lambda_effective": lambda_effective,
         "beta_star_curve": beta_star_curve, "beta_star": beta_star,
     }
 
@@ -284,7 +292,7 @@ def optimize_trigger_step(
     )
 
     hinge_window = []
-    metrics_history = {"B1": [], "B2": [], "L_bd": []}
+    metrics_history = {"B1": [], "B2": [], "L_bd": [], "lambda_effective": []}
     last_beta_star_curve, last_beta_star = None, None
     beta_star_history = {"beta_star": [], "beta_star_curve": []} if beta_star_grid else None
     # Round-robin cursor into sampled_k for compute_beta_star: batch i uses
@@ -344,6 +352,7 @@ def optimize_trigger_step(
         metrics_history["B1"].append(B1.item())
         metrics_history["B2"].append(B2.item())
         metrics_history["L_bd"].append(L_bd.item())
+        metrics_history["lambda_effective"].append(result["lambda_effective"])
         if beta_star_grid:
             last_beta_star_curve, last_beta_star = beta_star_curve, beta_star
             beta_star_history["beta_star"].append(beta_star)
@@ -353,6 +362,7 @@ def optimize_trigger_step(
             "B1": f"{B1.item():.6f}",
             "B2": f"{B2.item():.6f}",
             "L_bd": f"{L_bd.item():.4f}",
+            "lambda_eff": f"{result['lambda_effective']:.4f}",
             "L_pen": f"{L_pen.item():.4f}",
             "hinge_rate": f"{sum(hinge_window) / len(hinge_window):.2f}",
             "||delta||": f"{delta.norm().item():.4f}",
@@ -441,8 +451,9 @@ def optimize_trigger(
     flip_budget=None,
     lambda_poison=None,
     lambda_overflow="clip",
+    source_duplication=False,
     checkpoint_backward=True,
-    worker_batch_size=256,
+    batch_size_trigger=256,
     flip_qp_ridge=1e-6,
     flip_gradient_samples_per_class=64,
     metrics_log_path=None,
@@ -514,12 +525,42 @@ def optimize_trigger(
             "or the string 'beta' (the default) to derive it from beta."
         )
 
-    loader = build_loader(raw_train_dataset, batch_size=worker_batch_size)
-
-    # pi (class frequencies) and class_samples_raw depend only on the dataset
-    # (not on the checkpoint or the trigger): computed once and reused across
-    # every step/checkpoint.
+    # pi (class frequencies) depends only on the dataset (not on the
+    # checkpoint or the trigger): computed once and reused both below (for
+    # source_duplication) and further down for the B2 objective.
     pi = compute_class_frequencies(dataset_flag, n_classes)
+    pi_source = pi[source_label]
+
+    trigger_opt_dataset = raw_train_dataset
+    if source_duplication and lambda_poison > pi_source:
+        # _compute_step's per-batch masking caps target_count at
+        # idx_source.numel() (the batch's naturally-source-labeled examples,
+        # ~= pi_source * n_b): lambda_poison above pi_source can never
+        # actually be realized per batch no matter how high it's set. Fix:
+        # duplicate (with replacement) the same n_add extra source-class
+        # examples get_poison_dataset's lambda_overflow="duplicate" would add
+        # to the expert's train set at lambda_target=lambda_poison (same
+        # ratio), so idx_source is large enough for target_count to reach
+        # round(lambda_poison * n_b) instead of being capped.
+        n_add = round(lambda_poison * n_train / (1 - lambda_poison))
+        labels = np.array([y for _, y in raw_train_dataset.dataset])
+        source_indices = np.where(labels == source_label)[0]
+        dup_rng = np.random.RandomState(0)
+        dup_indices = dup_rng.choice(source_indices, size=n_add, replace=True)
+        trigger_opt_dataset = ConcatDataset(
+            [raw_train_dataset, Subset(raw_train_dataset, dup_indices)]
+        )
+        print(
+            f"[optimize_trigger] source_duplication: lambda_poison={lambda_poison:.6f} "
+            f"> pi_source={pi_source:.6f}; duplicated {n_add} extra source-class "
+            "examples into the trigger-optimization loader (same n_add ratio as the "
+            "expert's lambda_overflow='duplicate' train set)."
+        )
+
+    loader = build_loader(trigger_opt_dataset, batch_size=batch_size_trigger)
+
+    # class_samples_raw depends only on the dataset -- computed once and
+    # reused across every step/checkpoint.
     class_samples_raw = get_class_conditional_samples(
         dataset_flag, n_classes, flip_gradient_samples_per_class, device
     )
@@ -546,9 +587,7 @@ def optimize_trigger(
 
         # lambda_target=lambda_poison couples the expert's actual retraining
         # poison rate to the rate the trigger objective assumes (both equal
-        # beta by default) -- see get_poison_dataset's docstring. Applied to
-        # both the train and test poison datasets so the measured ASR
-        # (poison_test_dataset) matches the regime the expert was trained on.
+        # beta by default) -- see get_poison_dataset's docstring.
         poison_train_dataset = get_poison_dataset(
             dataset_flag,
             source_label,
@@ -562,6 +601,15 @@ def optimize_trigger(
 
         clean_test_dataset = get_clean_dataset(dataset_flag, train=False, big=big_ims)
 
+        # include_clean=False, lambda_target=None: every source-class test
+        # example is triggered and relabeled, none are left clean. This is
+        # the strict ASR test set -- with include_clean=True (the default),
+        # poison_acc would be measured on a ConcatDataset dominated by
+        # untriggered clean examples and would mostly track clean accuracy
+        # instead of attack success. lambda_target is deliberately NOT
+        # applied here (unlike poison_train_dataset above): ASR should
+        # reflect success on the whole source class, not on whatever
+        # fraction the training regime happened to poison.
         poison_test_dataset = get_poison_dataset(
             dataset_flag,
             source_label,
@@ -569,8 +617,7 @@ def optimize_trigger(
             delta_eval,
             train=False,
             big=big_ims,
-            lambda_target=lambda_poison,
-            lambda_overflow=lambda_overflow,
+            include_clean=False,
         )
 
         mini_train_out = mini_train(
@@ -637,6 +684,30 @@ def optimize_trigger(
 
         del expert_models
         torch.cuda.empty_cache()
+
+        # lambda_effective: mean, over this step's batches, of mask.sum()/n_b
+        # -- the poison fraction the objective actually realized per batch,
+        # as opposed to lambda_poison, the fraction it targeted. These can
+        # diverge whenever lambda_poison > pi_source (see source_duplication
+        # above): _compute_step caps target_count at the batch's naturally-
+        # source-labeled count.
+        lambda_effective = step_summary.get("lambda_effective")
+        if lambda_effective is not None:
+            rel_dev = (
+                abs(lambda_effective - lambda_poison) / lambda_poison
+                if lambda_poison > 0 else float("inf")
+            )
+            print(
+                f"lambda_effective={lambda_effective:.6f} (target lambda_poison="
+                f"{lambda_poison:.6f}, relative deviation={rel_dev:.2%})"
+            )
+            if rel_dev > 0.05:
+                print(
+                    f"WARNING: lambda_effective deviates from lambda_poison by "
+                    f"{rel_dev:.2%} (> 5%). pi_source={pi_source:.6f} -- if "
+                    f"lambda_poison > pi_source, set source_duplication=True to "
+                    "close this gap."
+                )
 
         if history is not None:
             history.append({
@@ -721,10 +792,11 @@ def run(experiment_name, module_name, **kwargs):
     flip_budget = args.get("flip_budget", None)
     lambda_poison = args.get("lambda_poison", "beta")
     lambda_overflow = args.get("lambda_overflow", "clip")
+    source_duplication = args.get("source_duplication", False)
     kappa = args.get("kappa", 0.0)
     lambda_tv = args.get("lambda_tv", 0.0)
     checkpoint_backward = args.get("checkpoint_backward", True)
-    worker_batch_size = args.get("worker_batch_size", 256)
+    batch_size_trigger = args.get("batch_size_trigger", 256)
     flip_qp_ridge = args.get("flip_qp_ridge", 1e-6)
     flip_gradient_samples_per_class = args.get("flip_gradient_samples_per_class", 64)
     epochs = args.get("epochs", 20)
@@ -805,10 +877,11 @@ def run(experiment_name, module_name, **kwargs):
         flip_budget=flip_budget,
         lambda_poison=lambda_poison,
         lambda_overflow=lambda_overflow,
+        source_duplication=source_duplication,
         kappa=kappa,
         lambda_tv=lambda_tv,
         checkpoint_backward=checkpoint_backward,
-        worker_batch_size=worker_batch_size,
+        batch_size_trigger=batch_size_trigger,
         flip_qp_ridge=flip_qp_ridge,
         flip_gradient_samples_per_class=flip_gradient_samples_per_class,
         metrics_log_path=metrics_log_path,

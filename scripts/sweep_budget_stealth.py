@@ -4,19 +4,21 @@ scripts/sweep_budget_stealth.py
 For each beta in a grid and each epsilon in a grid: optimizes a trigger
 against that (beta, epsilon) via modules.federated_optimizing_trigger's
 optimize_trigger, retrains one more fresh expert on the resulting delta
-(same lambda_poison=beta rate used by the objective, coupled into the
-expert's poisoned train/test datasets via lambda_target -- see
+(train set coupled to lambda_poison=beta via lambda_target -- see
 get_poison_dataset), and measures:
 
   - CTA: clean test accuracy (clf_eval on the ordinary clean test set).
-  - ASR: attack success rate -- accuracy, on the TRIGGERED-ONLY portion of
-    the poisoned test set (excluding the untouched clean examples
-    get_poison_dataset concatenates in), of predicting target_label.
+  - ASR: attack success rate -- accuracy, on get_poison_dataset's
+    include_clean=False test set (every source-class example triggered and
+    relabeled, no untouched clean examples mixed in), of predicting
+    target_label.
 
-lambda_overflow="duplicate" is used throughout (not the default "clip") so
-that beta can be swept past beta_max = n_s / (n_train + n_s) (~=0.0909 for a
-balanced 10-class CIFAR-10 source class) without the actual poison rate
-silently saturating -- see get_poison_dataset's docstring.
+lambda_overflow="duplicate" is used for the training set (not the default
+"clip") so that beta can be swept past beta_max = n_s / (n_train + n_s)
+(~=0.0909 for a balanced 10-class CIFAR-10 source class) without the actual
+poison rate silently saturating -- see get_poison_dataset's docstring. The
+ASR test set uses every source-class example regardless of beta (no
+lambda_target), matching optimize_trigger's own poison_test_dataset.
 
 Does NOT use ||delta|| as a stealth proxy. init_delta starts at strength=6.0
 and optimize_trigger_step's `delta.clamp_(-epsilon, epsilon)` runs after
@@ -53,7 +55,6 @@ os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
-from torch.utils.data import Subset
 
 from modules.base_utils.datasets import get_n_classes
 from modules.base_utils.util import (
@@ -116,16 +117,14 @@ def retrain_and_measure(model_flag, dataset_flag, source_label, target_label,
         train=True, big=big_ims, lambda_target=beta, lambda_overflow="duplicate",
     )
     clean_test_dataset = get_clean_dataset(dataset_flag, train=False, big=big_ims)
-    poison_test_dataset = get_poison_dataset(
+    # include_clean=False, no lambda_target: every source-class test example
+    # is triggered and relabeled, none left clean -- the strict ASR test set
+    # (see get_poison_dataset's docstring; a ConcatDataset with clean
+    # examples mixed in would mostly track clean accuracy instead).
+    asr_only_dataset = get_poison_dataset(
         dataset_flag, source_label, target_label, delta,
-        train=False, big=big_ims, lambda_target=beta, lambda_overflow="duplicate",
+        train=False, big=big_ims, include_clean=False,
     )
-    # get_poison_dataset returns ConcatDataset([clean_dataset, poison_dataset]);
-    # the last len(poison_test_dataset) - len(clean_test_dataset) entries are
-    # the triggered-and-relabeled examples -- isolate them for a true ASR
-    # (as opposed to accuracy over the clean+poison mixture).
-    n_clean = len(clean_test_dataset)
-    asr_only_dataset = Subset(poison_test_dataset, range(n_clean, len(poison_test_dataset)))
 
     batch_size_, epochs_, opt, lr_scheduler = get_train_info(
         expert.parameters(), "sgd", epochs=epochs,
@@ -202,8 +201,8 @@ def print_time_estimate(args):
         "poison_train_dataset on this GPU/model/dataset, T_batch is the "
         "per-batch cost of one optimize_trigger_step iteration (dominated by "
         "num_chckpt backward passes + num_chckpt OSQP QP solves), and B is "
-        "worker_batch_size-determined batches per outer step (~= n_train / "
-        "worker_batch_size).\n"
+        "batch_size_trigger-determined batches per outer step (~= n_train / "
+        "batch_size_trigger).\n"
         "Plug in your own measured T_epoch/T_batch (this sandbox has no "
         "GPU/dataset/expert checkpoints to benchmark against) and multiply by "
         f"{n_runs} to size n_steps/epochs/grid resolution before running for real."

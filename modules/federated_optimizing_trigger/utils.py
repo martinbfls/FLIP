@@ -367,11 +367,22 @@ def get_clean_dataset(dataset_flag, train=True, big=False):
 
 def get_poison_dataset(dataset_flag, source_label, target_label, delta,
                        train=True, train_pct=1.0, big=False,
-                       lambda_target=None, lambda_overflow="clip", seed=0):
+                       lambda_target=None, lambda_overflow="clip", seed=0,
+                       include_clean=True):
     '''
-    Builds ConcatDataset([clean_dataset, poison_dataset]): all of
-    `base_dataset` plus a poisoned copy of (a subset of) its source-class
-    examples, triggered and relabeled to target_label.
+    Builds a poisoned copy of (a subset of) `base_dataset`'s source-class
+    examples, triggered and relabeled to target_label. If include_clean=True
+    (default), returns ConcatDataset([clean_dataset, poison_dataset]): all of
+    `base_dataset` plus that poisoned copy. If include_clean=False, returns
+    just MappedDataset(MappedDataset(Subset(base, poison_inds), poisoner),
+    transform) -- every returned example is triggered and labeled
+    target_label, with no untriggered examples mixed in.
+
+    Use include_clean=False for ASR measurement: accuracy on the
+    include_clean=True ConcatDataset is dominated by untriggered clean
+    examples (it mostly tracks clean accuracy, not attack success). Combine
+    with lambda_target=None (poison every source-class example) for the
+    strict-ASR test set.
 
     lambda_target: if given, the fraction of the RETURNED dataset that is
     poisoned, i.e. n_add / (n_base + n_add) == lambda_target, where n_base =
@@ -435,11 +446,14 @@ def get_poison_dataset(dataset_flag, source_label, target_label, delta,
 
     poisoner = pick_poisoner('optimized', dataset_flag, target_label, delta)
 
-    clean_dataset = MappedDataset(base_dataset, transform)
     poison_subset = Subset(base_dataset, poison_inds)
     poison_dataset = MappedDataset(poison_subset, poisoner)
     poison_dataset = MappedDataset(poison_dataset, transform)
 
+    if not include_clean:
+        return poison_dataset
+
+    clean_dataset = MappedDataset(base_dataset, transform)
     return ConcatDataset([clean_dataset, poison_dataset])
 
 
