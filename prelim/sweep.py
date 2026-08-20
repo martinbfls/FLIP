@@ -291,7 +291,7 @@ def _run_e1_main(model_name, checkpoint, seed, raw_dataset, all_targets, entry, 
     shard_samples_raw = {}
     for y in np.unique(shard_true_targets):
         idx_y = worker_shard[shard_true_targets == y]
-        xs = torch.stack([raw_dataset[int(i)][0] for i in idx_y])
+        xs = torch.stack([raw_dataset[int(i)][0] for i in idx_y]).to(EVAL_DEVICE)
         shard_samples_raw[int(y)] = xs
     Gbar_s, grad_c_s, pi_s, pairs_s, col_s, Q_s = pl.class_conditional_shifts(
         m, shard_samples_raw, DATASET_FLAG, N_CLASSES, EVAL_DEVICE, loss_fn=pl.clf_loss, model_flag=None)
