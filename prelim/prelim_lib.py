@@ -38,7 +38,7 @@ from modules.base_utils.datasets import shard_dataset_indices, StripePoisoner
 from modules.base_utils.model.resnet import resnet32
 from modules.base_utils.model.model import SequentialImageNetworkMod
 from modules.base_utils.util import (
-    mini_train_multi, clf_loss, DEFAULT_SGD_KWARGS, DEFAULT_SGD_SCHED_KWARGS,
+    mini_train_multi, clf_loss, clf_eval, DEFAULT_SGD_KWARGS, DEFAULT_SGD_SCHED_KWARGS,
 )
 from modules.federated_optimizing_trigger.utils import (
     compute_class_frequencies,
@@ -613,6 +613,56 @@ def compute_grad_bd(model, loss_fn, class_samples_raw, y_source, y_target,
     flat = torch.cat([g.reshape(-1) for g in grad]).detach().cpu().to(torch.float32)
     model.zero_grad(set_to_none=True)
     return flat
+
+
+def effect_rate(model, dataset_flag, y_source, y_target, device, model_flag=None,
+                 trigger="stripe", n_max=None, batch_size=512):
+    """
+    Backdoor attack success rate (SPEC section 8/E6 "effect rate"): the
+    fraction of TRIGGERED test examples truly of class y_source that the
+    model classifies as y_target. Built from the raw TEST split (never seen
+    during training, poisoned or otherwise) -- get_raw_clean_dataset(train=
+    False), filtered to y_source, T applied in raw [0,1] space via
+    apply_trigger (same mechanism as compute_grad_bd/E1-E5, never the
+    training-time poisoning: label flips never touch pixels anywhere in this
+    suite -- see flip_masses_to_labels/masses_to_labels), then the same
+    raw_to_preprocess normalization as every other model input here.
+
+    n_max: cap on the number of y_source test examples used (None = all,
+    CIFAR-10 has 1000 per class). batch_size: forward-pass chunking only, the
+    reported rate is exact over whatever examples are used.
+    """
+    test_raw = get_raw_clean_dataset(dataset_flag, train=False)
+    xs = [x for x, y in test_raw if y == y_source]
+    if n_max is not None:
+        xs = xs[:n_max]
+    if not xs:
+        raise ValueError(f"effect_rate: no test examples of class {y_source} found")
+    x_raw = torch.stack(xs)
+
+    model.eval()
+    n_target = 0
+    with torch.no_grad():
+        for start in range(0, len(x_raw), batch_size):
+            chunk = x_raw[start:start + batch_size].to(device)
+            x_trig = apply_trigger(chunk, trigger)
+            x = raw_to_preprocess(x_trig, dataset_flag=dataset_flag, model_flag=model_flag)
+            logits = model(x)
+            pred = logits.argmax(dim=1)
+            n_target += int((pred == y_target).sum().item())
+    return n_target / len(x_raw)
+
+
+def clean_accuracy(model, dataset_flag, device, model_flag=None):
+    """
+    Standard test accuracy on the CLEAN (untriggered, truly-labelled) test
+    split, via the repo's own clf_eval -- get_clean_dataset(train=False)
+    already yields normalized (preprocessed) tensors, exactly what clf_eval
+    expects (it infers the device from the model itself).
+    """
+    test_ds = get_clean_dataset(dataset_flag, train=False)
+    acc, _loss = clf_eval(model, test_ds)
+    return acc
 
 
 # --------------------------------------------------------------------------#

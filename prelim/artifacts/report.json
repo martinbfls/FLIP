@@ -1,0 +1,765 @@
+{
+  "sec0": {
+    "rows": [
+      [
+        "Date du rapport",
+        "2026-08-21 00:02"
+      ],
+      [
+        "Commit git",
+        "f1cff8f (dirty)"
+      ],
+      [
+        "torch",
+        "2.8.0"
+      ],
+      [
+        "numpy",
+        "1.26.4"
+      ],
+      [
+        "osqp",
+        "1.1.3"
+      ],
+      [
+        "Device entrainement / evaluation",
+        "mps / cpu"
+      ],
+      [
+        "Duree totale du sweep",
+        "1202s (~20.0 min)"
+      ],
+      [
+        "Cellules executees / en cache / en echec",
+        "2 / 6 / 0"
+      ],
+      [
+        "Lignes dans metrics.csv",
+        "36412"
+      ],
+      [
+        "Entrees dans failures.log",
+        "0"
+      ]
+    ]
+  },
+  "sec1": {
+    "grid": {
+      "models": [
+        "linear",
+        "cnn"
+      ],
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "checkpoints": [
+        "begin",
+        "mid",
+        "end"
+      ],
+      "betas": [
+        0.01,
+        0.03,
+        0.1
+      ],
+      "transforms": [
+        "identity",
+        "stripe"
+      ],
+      "n_p": [
+        3
+      ],
+      "aggregators": [
+        "mean",
+        "cw_median",
+        "trmean",
+        "krum",
+        "multikrum"
+      ],
+      "include_e6": false
+    },
+    "failed_cells": [],
+    "gbar_seconds": []
+  },
+  "sec2": {
+    "assertions": [
+      {
+        "name": "Relation de budget ||u_i||_1*gamma == ||ubar*||_1",
+        "scope": "par modele (checkpoint=end)",
+        "status": "PASS",
+        "value": 1.3877787807814457e-17,
+        "threshold": 1e-06
+      },
+      {
+        "name": "solve_qp(capacity=False) == project_gradient (depot)",
+        "scope": "par modele (checkpoint=end)",
+        "status": "PASS",
+        "value": 0.0,
+        "threshold": 1e-06
+      },
+      {
+        "name": "alpha_tilde_star: contrainte de budget inactive a l'optimum (NNLS)",
+        "scope": "par modele (checkpoint=end)",
+        "status": "PASS",
+        "value": 2.7285282728409863e-06,
+        "threshold": 0.01
+      },
+      {
+        "name": "Masses de flip realisees vs demandees : ecart relatif max (>=1 flip attendu)",
+        "scope": "toutes cellules E1",
+        "status": "FAIL",
+        "value": 0.3090952448948847,
+        "threshold": 0.1
+      },
+      {
+        "name": "Agregateur aplati == depot (5 regles, sur un stack reel de gradients, checkpoint=end)",
+        "scope": "par modele",
+        "status": "PASS",
+        "value": 0.0,
+        "threshold": 1e-05
+      },
+      {
+        "name": "Aucun NaN/Inf dans le CSV (NaN=0, Inf=0)",
+        "scope": "metrics.csv entier",
+        "status": "PASS",
+        "value": 0,
+        "threshold": 0
+      }
+    ]
+  },
+  "E1": {
+    "table_cnn": [
+      [
+        "begin",
+        "a_source_target",
+        "0.996",
+        "9.31",
+        "0.997",
+        "8.63"
+      ],
+      [
+        "begin",
+        "b_other_pair",
+        "0.990",
+        "9.14",
+        "0.996",
+        "9.50"
+      ],
+      [
+        "begin",
+        "c_uniform",
+        "0.677",
+        "18.8",
+        "0.749",
+        "13.0"
+      ],
+      [
+        "begin",
+        "d_qp",
+        "0.999",
+        "8.95",
+        "1.000",
+        "8.84"
+      ],
+      [
+        "begin",
+        "e_random1",
+        "0.782",
+        "15.8",
+        "0.888",
+        "14.3"
+      ],
+      [
+        "begin",
+        "f_random2",
+        "0.675",
+        "8.56",
+        "0.875",
+        "10.7"
+      ],
+      [
+        "mid",
+        "a_source_target",
+        "0.998",
+        "9.38",
+        "0.999",
+        "9.24"
+      ],
+      [
+        "mid",
+        "b_other_pair",
+        "0.985",
+        "9.28",
+        "0.994",
+        "9.18"
+      ],
+      [
+        "mid",
+        "c_uniform",
+        "0.992",
+        "9.01",
+        "0.994",
+        "9.04"
+      ],
+      [
+        "mid",
+        "d_qp",
+        "1.000",
+        "9.06",
+        "1.00",
+        "9.11"
+      ],
+      [
+        "mid",
+        "e_random1",
+        "0.991",
+        "9.12",
+        "0.994",
+        "9.17"
+      ],
+      [
+        "mid",
+        "f_random2",
+        "0.993",
+        "9.17",
+        "0.995",
+        "9.19"
+      ],
+      [
+        "end",
+        "a_source_target",
+        "0.997",
+        "9.17",
+        "0.999",
+        "9.07"
+      ],
+      [
+        "end",
+        "b_other_pair",
+        "0.990",
+        "9.36",
+        "0.998",
+        "9.22"
+      ],
+      [
+        "end",
+        "c_uniform",
+        "0.991",
+        "8.65",
+        "0.993",
+        "9.00"
+      ],
+      [
+        "end",
+        "d_qp",
+        "1.000",
+        "9.03",
+        "1.00",
+        "9.06"
+      ],
+      [
+        "end",
+        "e_random1",
+        "0.985",
+        "8.67",
+        "0.991",
+        "9.05"
+      ],
+      [
+        "end",
+        "f_random2",
+        "0.989",
+        "8.98",
+        "0.993",
+        "9.31"
+      ]
+    ],
+    "table_linear": [
+      [
+        "begin",
+        "a_source_target",
+        "0.972",
+        "8.57",
+        "0.999",
+        "9.04"
+      ],
+      [
+        "begin",
+        "b_other_pair",
+        "0.699",
+        "12.5",
+        "0.988",
+        "9.28"
+      ],
+      [
+        "begin",
+        "c_uniform",
+        "0.929",
+        "10.6",
+        "0.961",
+        "9.49"
+      ],
+      [
+        "begin",
+        "d_qp",
+        "0.994",
+        "9.01",
+        "1.000",
+        "9.08"
+      ],
+      [
+        "begin",
+        "e_random1",
+        "0.911",
+        "10.7",
+        "0.954",
+        "9.35"
+      ],
+      [
+        "begin",
+        "f_random2",
+        "0.919",
+        "10.9",
+        "0.956",
+        "9.82"
+      ],
+      [
+        "mid",
+        "a_source_target",
+        "0.969",
+        "8.55",
+        "0.999",
+        "8.98"
+      ],
+      [
+        "mid",
+        "b_other_pair",
+        "0.688",
+        "13.2",
+        "0.990",
+        "9.28"
+      ],
+      [
+        "mid",
+        "c_uniform",
+        "0.904",
+        "9.75",
+        "0.960",
+        "9.30"
+      ],
+      [
+        "mid",
+        "d_qp",
+        "0.993",
+        "8.90",
+        "1.000",
+        "9.04"
+      ],
+      [
+        "mid",
+        "e_random1",
+        "0.886",
+        "10.1",
+        "0.952",
+        "9.18"
+      ],
+      [
+        "mid",
+        "f_random2",
+        "0.888",
+        "9.87",
+        "0.955",
+        "9.65"
+      ],
+      [
+        "end",
+        "a_source_target",
+        "0.970",
+        "8.63",
+        "0.999",
+        "9.02"
+      ],
+      [
+        "end",
+        "b_other_pair",
+        "0.693",
+        "13.4",
+        "0.991",
+        "9.23"
+      ],
+      [
+        "end",
+        "c_uniform",
+        "0.907",
+        "9.97",
+        "0.961",
+        "9.31"
+      ],
+      [
+        "end",
+        "d_qp",
+        "0.993",
+        "8.95",
+        "1.000",
+        "9.05"
+      ],
+      [
+        "end",
+        "e_random1",
+        "0.887",
+        "10.2",
+        "0.953",
+        "9.22"
+      ],
+      [
+        "end",
+        "f_random2",
+        "0.896",
+        "10.1",
+        "0.957",
+        "9.61"
+      ]
+    ],
+    "seed_robustness": [
+      [
+        "cnn",
+        "0.997 [0.995, 0.999]",
+        "9.28 [9.17, 9.35]",
+        3
+      ],
+      [
+        "linear",
+        "0.964 [0.956, 0.970]",
+        "8.78 [8.63, 8.95]",
+        3
+      ]
+    ],
+    "snr_table": [
+      [
+        "cnn",
+        "0.0100",
+        "full",
+        "9.29",
+        "-"
+      ],
+      [
+        "cnn",
+        "0.0100",
+        "64",
+        "20.0",
+        "0.0578"
+      ],
+      [
+        "cnn",
+        "0.0100",
+        "256",
+        "12.9",
+        "0.112"
+      ],
+      [
+        "cnn",
+        "0.0100",
+        "1024",
+        "10.6",
+        "0.245"
+      ],
+      [
+        "cnn",
+        "0.0300",
+        "full",
+        "9.17",
+        "-"
+      ],
+      [
+        "cnn",
+        "0.0300",
+        "64",
+        "9.76",
+        "0.168"
+      ],
+      [
+        "cnn",
+        "0.0300",
+        "256",
+        "8.92",
+        "0.307"
+      ],
+      [
+        "cnn",
+        "0.0300",
+        "1024",
+        "9.25",
+        "0.693"
+      ],
+      [
+        "cnn",
+        "0.100",
+        "full",
+        "9.17",
+        "-"
+      ],
+      [
+        "cnn",
+        "0.100",
+        "64",
+        "9.76",
+        "0.168"
+      ],
+      [
+        "cnn",
+        "0.100",
+        "256",
+        "8.92",
+        "0.307"
+      ],
+      [
+        "cnn",
+        "0.100",
+        "1024",
+        "9.25",
+        "0.693"
+      ],
+      [
+        "linear",
+        "0.0100",
+        "full",
+        "11.0",
+        "-"
+      ],
+      [
+        "linear",
+        "0.0100",
+        "64",
+        "57.4",
+        "0.0183"
+      ],
+      [
+        "linear",
+        "0.0100",
+        "256",
+        "29.5",
+        "0.0357"
+      ],
+      [
+        "linear",
+        "0.0100",
+        "1024",
+        "15.7",
+        "0.0867"
+      ],
+      [
+        "linear",
+        "0.0300",
+        "full",
+        "8.63",
+        "-"
+      ],
+      [
+        "linear",
+        "0.0300",
+        "64",
+        "20.0",
+        "0.0544"
+      ],
+      [
+        "linear",
+        "0.0300",
+        "256",
+        "12.3",
+        "0.104"
+      ],
+      [
+        "linear",
+        "0.0300",
+        "1024",
+        "9.50",
+        "0.246"
+      ],
+      [
+        "linear",
+        "0.100",
+        "full",
+        "8.63",
+        "-"
+      ],
+      [
+        "linear",
+        "0.100",
+        "64",
+        "20.0",
+        "0.0544"
+      ],
+      [
+        "linear",
+        "0.100",
+        "256",
+        "12.3",
+        "0.104"
+      ],
+      [
+        "linear",
+        "0.100",
+        "1024",
+        "9.50",
+        "0.246"
+      ]
+    ],
+    "verdicts": [
+      "**cnn** : FAIL (min cos_shard = 0.749, seuil 0.99)",
+      "**linear** : FAIL (min cos_shard = 0.952, seuil 0.99)"
+    ],
+    "anomalies": [
+      "cnn/begin/a_source_target : err_rel(shard) = 8.63 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/begin/b_other_pair : err_rel(shard) = 9.50 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/begin/c_uniform : err_rel(shard) = 13.0 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/begin/d_qp : err_rel(shard) = 8.84 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/begin/e_random1 : err_rel(shard) = 14.3 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/begin/f_random2 : err_rel(shard) = 10.7 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/mid/a_source_target : err_rel(shard) = 9.24 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/mid/b_other_pair : err_rel(shard) = 9.18 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/mid/c_uniform : err_rel(shard) = 9.04 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/mid/d_qp : err_rel(shard) = 9.11 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/mid/e_random1 : err_rel(shard) = 9.17 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/mid/f_random2 : err_rel(shard) = 9.19 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/end/a_source_target : err_rel(shard) = 9.07 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/end/b_other_pair : err_rel(shard) = 9.22 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/end/c_uniform : err_rel(shard) = 9.00 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/end/d_qp : err_rel(shard) = 9.06 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/end/e_random1 : err_rel(shard) = 9.05 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "cnn/end/f_random2 : err_rel(shard) = 9.31 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/begin/a_source_target : err_rel(shard) = 9.04 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/begin/b_other_pair : err_rel(shard) = 9.28 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/begin/c_uniform : err_rel(shard) = 9.49 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/begin/d_qp : err_rel(shard) = 9.08 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/begin/e_random1 : err_rel(shard) = 9.35 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/begin/f_random2 : err_rel(shard) = 9.82 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/mid/a_source_target : err_rel(shard) = 8.98 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/mid/b_other_pair : err_rel(shard) = 9.28 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/mid/c_uniform : err_rel(shard) = 9.30 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/mid/d_qp : err_rel(shard) = 9.04 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/mid/e_random1 : err_rel(shard) = 9.18 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/mid/f_random2 : err_rel(shard) = 9.65 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/end/a_source_target : err_rel(shard) = 9.02 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/end/b_other_pair : err_rel(shard) = 9.23 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/end/c_uniform : err_rel(shard) = 9.31 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/end/d_qp : err_rel(shard) = 9.05 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/end/e_random1 : err_rel(shard) = 9.22 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)",
+      "linear/end/f_random2 : err_rel(shard) = 9.61 (>100% -- ||Gbar@u|| est petit devant le bruit residuel a ce budget, cf. table ci-dessus ; cos reste eleve, donc la DIRECTION est correcte, seule la magnitude relative de l'erreur est grande)"
+    ]
+  },
+  "E2": {
+    "verdicts": [
+      "**cnn (decisif, T=stripe)** : FAIL (SATURE) -- median(varpi)=0.999 (a moins de 1% du plafond 1.0, donc SATURE -- pas de marge exploitable demontree malgre varpi<1 au sens strict), median(baseline)=9.15e-06 ; identity donne median(varpi)=1.00, quasi identique -- donc pas un artefact du cas degenere T=identity, le plafond de rang domine reellement sous le vrai trigger",
+      "**linear** : test d'implementation seulement (rang exact C(C-1), non decisif)"
+    ],
+    "anomalies": [
+      "cnn/identity: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/identity: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/identity: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/identity: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/identity: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/identity: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/stripe: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/stripe: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)",
+      "cnn/stripe: varpi=1.00 > 1 (hors [0,1] -- au-dela de la tolerance du solveur OSQP eps~1e-6 utilisee par dist_to_cone/rank_ratio, a surveiller mais pas un signe de bug de signe/formule)"
+    ]
+  },
+  "E3": {
+    "verdicts": [
+      "**cnn** : FAIL -- min cos(u*,u*)=0.322, ecart one-shot=0.416%",
+      "**linear** : PASS -- min cos(u*,u*)=1.000, ecart one-shot=6.49e-06%"
+    ]
+  },
+  "E4": {
+    "verdicts": [
+      "**cnn** : PASS -- structure flat (krum=0, multikrum=0, attendu 0 les deux) OK ; divergence per_tensor multikrum=0.0100 (attendu >0) (krum: selection_rate~0 dans les deux variantes -- degenere, osc(Abar)=0 non informatif ici, voir Anomalies), 0 violation(s) de la borne theorique sur 20 cellules",
+      "**linear** : PASS -- structure flat (krum=0, multikrum=0, attendu 0 les deux) OK ; divergence per_tensor multikrum=0.0267 (attendu >0) ; krum per_tensor=0.0167 (attendu >0), 0 violation(s) de la borne theorique sur 20 cellules"
+    ],
+    "anomalies": [
+      "cnn : krum (flat et per_tensor) a selection_rate~0 a ce point de deploiement -- aucun worker perturbe jamais choisi, la prediction osc(Abar)>0 sous per_tensor n'est pas testable ici (pas une violation, un regime degenere)"
+    ]
+  },
+  "E5": {
+    "verdicts": [
+      "**cnn** : FAIL -- courbes confirmant une baisse de selection >= 10pt entre v_hat=0.1 et v_hat=10 : 1/10 courbes (10%) (coudes estimes par regle : voir table ci-dessus -- a prendre avec prudence vu le bruit de Monte-Carlo, cf. Anomalies) ; la selection ne varie pas assez avec v_hat sous ce budget de rounds reduit pour confirmer la prediction la plus falsifiable du modele",
+      "**linear** : FAIL -- courbes confirmant une baisse de selection >= 10pt entre v_hat=0.1 et v_hat=10 : 0/15 courbes (0%) (coudes estimes par regle : voir table ci-dessus -- a prendre avec prudence vu le bruit de Monte-Carlo, cf. Anomalies) ; la selection ne varie pas assez avec v_hat sous ce budget de rounds reduit pour confirmer la prediction la plus falsifiable du modele"
+    ],
+    "knees": {
+      "cnn/0.0100/mean": 0.1,
+      "cnn/0.0100/cw_median": 1.232846739442066,
+      "cnn/0.0100/trmean": 1.232846739442066,
+      "cnn/0.0100/krum": 0.1519911082952934,
+      "cnn/0.0100/multikrum": 2.848035868435802,
+      "cnn/0.0300/mean": 0.1,
+      "cnn/0.0300/cw_median": 0.3511191734215131,
+      "cnn/0.0300/trmean": 0.3511191734215131,
+      "cnn/0.0300/krum": 0.8111308307896873,
+      "cnn/0.0300/multikrum": 0.1519911082952934,
+      "linear/0.0100/mean": 0.1,
+      "linear/0.0100/cw_median": 0.1,
+      "linear/0.0100/trmean": 1.232846739442066,
+      "linear/0.0100/krum": 1.232846739442066,
+      "linear/0.0100/multikrum": 0.8111308307896873,
+      "linear/0.0300/mean": 0.1,
+      "linear/0.0300/cw_median": 0.533669923120631,
+      "linear/0.0300/trmean": 0.533669923120631,
+      "linear/0.0300/krum": 0.1519911082952934,
+      "linear/0.0300/multikrum": 0.3511191734215131,
+      "linear/0.100/mean": 0.1,
+      "linear/0.100/cw_median": 2.848035868435802,
+      "linear/0.100/trmean": 0.8111308307896873,
+      "linear/0.100/krum": 0.2310129700083159,
+      "linear/0.100/multikrum": 0.1519911082952934
+    }
+  },
+  "E6": {
+    "verdicts": []
+  },
+  "E7": {
+    "verdicts": [
+      "**cnn** : PASS (partiel -- selection croit avec n_p malgre ubar* qui varie car les plafonds saturent) -- max||ubar*(n_p)-ubar*(ref)||_inf=0.0300, plafonds actifs sur au moins un n_p=oui, selection croissante en n_p (cw_median/krum)=oui",
+      "**linear** : PASS (partiel -- selection croit avec n_p malgre ubar* qui varie car les plafonds saturent) -- max||ubar*(n_p)-ubar*(ref)||_inf=0.0300, plafonds actifs sur au moins un n_p=oui, selection croissante en n_p (cw_median/krum)=oui"
+    ]
+  },
+  "sec10": {
+    "rows": [
+      [
+        "E1",
+        "Implementation et transfert de Gbar",
+        "FAIL"
+      ],
+      [
+        "E2",
+        "Plafond de rang (config cnn uniquement)",
+        "FAIL"
+      ],
+      [
+        "E3",
+        "Stabilite one-shot",
+        "FAIL"
+      ],
+      [
+        "E4",
+        "Reponse des agregateurs robustes (informatif, non-gate)",
+        "PASS"
+      ],
+      [
+        "E5",
+        "Existence du levier de furtivite",
+        "FAIL"
+      ],
+      [
+        "E7",
+        "Etaler le budget sur n_p (informatif, non-gate)",
+        "PASS"
+      ],
+      [
+        "E6",
+        "Pouvoir predictif du residu (informatif, non-gate, cher)",
+        "INCONCLUSIF"
+      ]
+    ]
+  }
+}

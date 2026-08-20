@@ -392,13 +392,25 @@ def _run_e1_seed_and_snr(model_name, entry_end, raw_dataset, all_targets, seeds,
 # --------------------------------------------------------------------------#
 # E2 (per checkpoint, all BETAS)
 # --------------------------------------------------------------------------#
-def _run_e2(model_name, checkpoint, betas, entry, d_total, rows, done_pairs):
+def _run_e2(model_name, checkpoint, betas, transforms, entry, d_total, rows, done_pairs):
+    """
+    Per SPEC section 8/E2's own decomposition formula ("with T = identity, v/lam
+    = Gbar[:,(9,4)]/pi[9] + (g[9][9]-grad_c)"), T=identity makes v almost
+    tautologically lie in Gbar's column span -- varpi~1 there tests the
+    degenerate case, not whether the rank ceiling leaves exploitable room
+    against a REAL trigger. So this loops every transform in TRANSFORMS
+    (grad_bd already computed/cached per transform by _get_entry, no extra
+    Gbar cost): "identity" stays as the reference/degenerate case, "stripe" is
+    the one that actually exercises T != identity and is what E2's verdict
+    should be decided on.
+    """
     Gbar, grad_c, pi, pairs, Q = entry["Gbar"], entry["grad_c"], entry["pi"], entry["pairs"], entry["Q"]
     eff_rank = pl.effective_rank(Q)
     baseline = eff_rank / d_total
 
     # Numeric twin of the eigenvalue-spectrum figure: 11 decile points (P100..P0,
-    # i.e. largest to smallest) instead of all P=90 eigenvalues.
+    # i.e. largest to smallest) instead of all P=90 eigenvalues. Q = Gbar^T Gbar
+    # does not depend on the transform, so this is recorded once (not per transform).
     eigvals = np.clip(np.linalg.eigvalsh(Q), 0, None)[::-1]
     for pct in range(0, 101, 10):
         idx = min(len(eigvals) - 1, int(round((100 - pct) / 100 * (len(eigvals) - 1))))
@@ -406,39 +418,44 @@ def _run_e2(model_name, checkpoint, betas, entry, d_total, rows, done_pairs):
                 f"eigval_Q_p{pct}", float(eigvals[idx]))
 
     for beta in betas:
-        v = beta * (entry["grad_bd"]["identity"] - grad_c)
-        v_norm = float(v.norm())
-        v_norm_sq = v_norm ** 2
-        c_qp = (Gbar.T @ v).numpy().astype(np.float64)
-
+        # reachable_radius (20 restarts x 50 projected-ascent steps over the
+        # full gradient dim) depends only on (Gbar, beta, pi, gamma, pairs) --
+        # NOT on transform -- so it's computed once per beta here, outside the
+        # transform loop, rather than once per (beta, transform) redundantly.
         radius = pl.reachable_radius(Gbar, beta, pi, GAMMA, pairs)
-        varsigma = radius["varsigma"]
-        rho = beta * varsigma
-        v_hat = v_norm / rho if rho > 0 else float("inf")
+        for transform in transforms:
+            v = beta * (entry["grad_bd"][transform] - grad_c)
+            v_norm = float(v.norm())
+            v_norm_sq = v_norm ** 2
+            c_qp = (Gbar.T @ v).numpy().astype(np.float64)
 
-        varpi = pl.rank_ratio(Q, c_qp, v_norm_sq) if v_norm_sq > 0 else float("nan")
-        dist2, alpha_tilde_star, _ = pl.dist_to_cone(Q, c_qp, v_norm_sq, pairs)
+            varsigma = radius["varsigma"]
+            rho = beta * varsigma
+            v_hat = v_norm / rho if rho > 0 else float("inf")
 
-        grad_c_norm = float(grad_c.norm())
-        ratio = radius["lower_ascent"] / grad_c_norm if grad_c_norm > 0 else float("inf")
-        Theta = math.asin(ratio) if ratio <= 1 else float("nan")
+            varpi = pl.rank_ratio(Q, c_qp, v_norm_sq) if v_norm_sq > 0 else float("nan")
+            dist2, alpha_tilde_star, _ = pl.dist_to_cone(Q, c_qp, v_norm_sq, pairs)
 
-        grad_p = grad_c + v
-        cos_gp_gc = float(torch.nn.functional.cosine_similarity(
-            grad_p.unsqueeze(0), grad_c.unsqueeze(0)).item())
-        angle_gp_gc_deg = math.degrees(math.acos(max(-1.0, min(1.0, cos_gp_gc))))
+            grad_c_norm = float(grad_c.norm())
+            ratio = radius["lower_ascent"] / grad_c_norm if grad_c_norm > 0 else float("inf")
+            Theta = math.asin(ratio) if ratio <= 1 else float("nan")
 
-        s_beta = beta / (GAMMA * min(pi.values()))
+            grad_p = grad_c + v
+            cos_gp_gc = float(torch.nn.functional.cosine_similarity(
+                grad_p.unsqueeze(0), grad_c.unsqueeze(0)).item())
+            angle_gp_gc_deg = math.degrees(math.acos(max(-1.0, min(1.0, cos_gp_gc))))
 
-        vals = dict(varsigma=varsigma, rho=rho, radius_upper=radius["upper"],
-                    radius_lower_simple=radius["lower_simple"], radius_lower_ascent=radius["lower_ascent"],
-                    v_norm=v_norm, v_hat=v_hat, varpi=varpi, baseline=baseline,
-                    alpha_tilde_star=alpha_tilde_star,
-                    sqrt_varpi=math.sqrt(varpi) if varpi >= 0 else float("nan"),
-                    grad_c_norm=grad_c_norm, Theta_rad=Theta, angle_gp_gc_deg=angle_gp_gc_deg,
-                    cos_gp_gc=cos_gp_gc, s_beta=s_beta)
-        for k, val in vals.items():
-            _record(rows, done_pairs, model_name, None, checkpoint, beta, "identity", "E2", k, val)
+            s_beta = beta / (GAMMA * min(pi.values()))
+
+            vals = dict(varsigma=varsigma, rho=rho, radius_upper=radius["upper"],
+                        radius_lower_simple=radius["lower_simple"], radius_lower_ascent=radius["lower_ascent"],
+                        v_norm=v_norm, v_hat=v_hat, varpi=varpi, baseline=baseline,
+                        alpha_tilde_star=alpha_tilde_star,
+                        sqrt_varpi=math.sqrt(varpi) if varpi >= 0 else float("nan"),
+                        grad_c_norm=grad_c_norm, Theta_rad=Theta, angle_gp_gc_deg=angle_gp_gc_deg,
+                        cos_gp_gc=cos_gp_gc, s_beta=s_beta)
+            for k, val in vals.items():
+                _record(rows, done_pairs, model_name, None, checkpoint, beta, transform, "E2", k, val)
 
 
 # --------------------------------------------------------------------------#
@@ -527,7 +544,7 @@ def _run_e3_shared(model_name, checkpoints, cache, rows, done_pairs):
 # --------------------------------------------------------------------------#
 # Assertions (see report.py Sec2; computed once per model, at checkpoint=end)
 # --------------------------------------------------------------------------#
-def _run_assertions(model_name, entry_end, rows, done_pairs):
+def _run_assertions(model_name, entry_end, raw_dataset, all_targets, seed, rows, done_pairs):
     Gbar, grad_c, pi, pairs, Q = (entry_end["Gbar"], entry_end["grad_c"], entry_end["pi"],
                                    entry_end["pairs"], entry_end["Q"])
     v = E1_BETA * (entry_end["grad_bd"]["identity"] - grad_c)
@@ -551,6 +568,27 @@ def _run_assertions(model_name, entry_end, rows, done_pairs):
     _record(rows, done_pairs, model_name, None, "end", E1_BETA, "identity", "assertions",
             "alpha_tilde_budget_frac_of_bigbeta", frac_of_bigbeta)
 
+    # SPEC section 2/6: "flat reference aggregator agreeing with the repo one"
+    # -- already exhaustively checked on synthetic tensors in tests/test_units.py
+    # (all 5 rules, 26/26); this repeats it once on a REAL (n_b, d) stack of
+    # actual worker gradients at checkpoint=end, rather than relying on the
+    # synthetic evidence alone.
+    m = entry_end["model"]
+    shards = pl.shard_indices(raw_dataset, N_B, seed=seed)
+    G_check = torch.stack([
+        pl.worker_gradient(m, pl.clf_loss, raw_dataset, np.asarray(shards[i])[:SIM_BATCH],
+                            all_targets[np.asarray(shards[i])[:SIM_BATCH]],
+                            DATASET_FLAG, None, batch_size=SIM_BATCH, device=EVAL_DEVICE)
+        for i in range(N_B)
+    ], dim=0)
+    max_gap = 0.0
+    for rule in AGGREGATORS:
+        agg_flat, _sel = pl.aggregate_instrumented(G_check, rule, F, variant="flat")
+        gap = pl.check_against_repo(G_check, rule, F, agg_flat)
+        max_gap = max(max_gap, gap)
+    _record(rows, done_pairs, model_name, None, "end", E1_BETA, "identity", "assertions",
+            "flat_aggregator_vs_repo_max_abs_diff", max_gap)
+
 
 # --------------------------------------------------------------------------#
 # E4 / E5 / E7 -- deployment and selection response
@@ -567,11 +605,40 @@ def _run_assertions(model_name, entry_end, rows, done_pairs):
 # "krum:flat" / "krum:per_tensor". That keeps the tidy row exactly as
 # specified while still letting the report pivot on the variant.
 
-E4_ROUNDS = 200          # "~200 aggregation rounds" (SPEC section 8/E4)
-E5_ROUNDS = 40           # 12 taus x 3 betas of these, so shorter on purpose
-E7_ROUNDS = 200
-SIM_BATCH = 64           # minibatch size per worker per round
+# Round counts / SIM_BATCH sized against a real benchmark on this machine
+# (r32p/CPU, checkpoint=end, batch=64): worker_gradient costs ~0.41s/call, so
+# a naive "200 rounds x 10 workers" E4 costs ~820s PER TRANSFORM alone --
+# already past SPEC section 1's ten-minute-per-block budget on cnn before
+# E5's (beta, tau) product or E7's n_p sweep are even counted. Cut SIM_BATCH
+# in half (64 -> 32, still a realistic minibatch, not a toy) and the round
+# counts down from SPEC section 8's "~200" hint, budgeted so EACH of E4/E5/E7
+# individually stays near ~5-8 minutes on cnn (linear is ~140x cheaper per
+# call and comes along for free): E4 ~4min (2 transforms x 60 rounds), E5
+# ~7min (3 betas x 12 taus x 6 rounds), E7 ~5min (3 n_p x 50 rounds). This
+# trades round count for tractability -- documented explicitly rather than
+# silently, since it weakens the Monte-Carlo precision of Abar/oscillation
+# estimates relative to SPEC's "~200" language.
+E4_ROUNDS = 60
+E5_ROUNDS = 6            # x 12 taus x 3 betas = 216 rounds total per checkpoint
+E7_ROUNDS = 50
+SIM_BATCH = 32           # minibatch size per worker per round (was 64)
 E5_N_TAU = 12            # 12-point log grid on v_hat in [0.1, 10]
+
+# E5 follow-up (this session): the E1_BETA=0.10 curve came back looking flat
+# under E5_ROUNDS=6/SIM_BATCH=32, but for ell=1 rules (krum, cw_median) that's
+# 6 near-Bernoulli draws per point -- standard error ~sqrt(0.25/6)~0.2, bigger
+# than the 0.10 margin the verdict tests for. Two independent levers, applied
+# ONLY at beta=E1_BETA (the reference operating point already used by
+# E1/E3/E4/E7) to keep the added cost bounded: more rounds (direct fix for the
+# per-round Bernoulli noise) AND a larger minibatch (reduces the round-to-round
+# gradient noise that flips near-tied krum/cw_median selections in the first
+# place, so each round is less noisy on its own -- likely more effective per
+# unit of compute than rounds alone). At 12 taus x 50 rounds x batch=64 on cnn
+# (~0.41s/call x 10 workers): ~2470s (~41min); beta in {0.01, 0.03} keep the
+# original settings (cheap, already computed, kept as lower-power supplementary
+# evidence rather than recomputed).
+E5_ROUNDS_REF = 50
+E5_SIM_BATCH_REF = 64
 E5_VHAT_RANGE = (0.1, 10.0)
 N_P_E7 = [2, 3, 5]
 COORD_SUBSAMPLE = 20000  # coordinates kept for the coordinate-wise E5 statistics
@@ -794,7 +861,7 @@ def _run_e4(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_datas
 
 
 def _run_e5(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_dataset,
-            all_targets, rows, done_pairs, n_rounds=E5_ROUNDS):
+            all_targets, rows, done_pairs, n_rounds=E5_ROUNDS, batch_size=SIM_BATCH):
     """
     E5: the same deployment, re-solved against tau*v for 12 taus spanning
     v_hat in [0.1, 10]. No transform optimisation anywhere -- only the demanded
@@ -814,7 +881,7 @@ def _run_e5(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_datas
     for vhat_target in targets:
         tau = float(vhat_target * rho / v_norm)
         plan = _deploy_plan(entry, beta, transform, n_p, seed, raw_dataset, all_targets, tau=tau)
-        sim = _simulate(m, plan, raw_dataset, blocks, n_rounds, SIM_BATCH, seed,
+        sim = _simulate(m, plan, raw_dataset, blocks, n_rounds, batch_size, seed,
                         AGGREGATORS, pl.AGG_VARIANTS)
 
         # P_k(v): the reachable part of the demanded deviation at this tau, i.e.
@@ -832,8 +899,18 @@ def _run_e5(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_datas
             a = Abar.numpy()[sub]
             r = ratio.numpy()[sub]
             out = {}
-            if np.std(a) > 0 and np.std(r) > 0:
-                out["spearman_A_vs_Pk_over_s"] = float(_st.spearmanr(r, a).statistic)
+            # Undefined (NaN) whenever Abar is constant over the subsample --
+            # always true for "mean" (A_j == gamma everywhere by construction)
+            # and for flat krum/multikrum (kind="global", one set for every
+            # coordinate), and possible near tau~0 where the bias signal is
+            # negligible for any rule. `np.std(a) > 0` alone isn't a tight
+            # enough guard (float noise can keep it just above 0 while scipy's
+            # own tolerance still calls the input constant) -- check the
+            # computed statistic itself and skip recording rather than write NaN.
+            if np.std(a) > 1e-9 and np.std(r) > 1e-9:
+                stat = float(_st.spearmanr(r, a).statistic)
+                if not math.isnan(stat):
+                    out["spearman_A_vs_Pk_over_s"] = stat
             # Numeric twin of the coordinate-wise figure: mean Abar per decile of
             # the predictor |P_k(v)_j| / s_j.
             edges = np.percentile(r, DECILES)
@@ -858,6 +935,15 @@ def _run_e5(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_datas
                 "Pk_norm_over_gamma_sigma_c",
                 float(Pk.norm()) / (plan["gamma"] * sigma_c) if sigma_c > 0 else float("nan"),
                 n_p=n_p, tau=tau)
+
+    # Sentinel row with tau=None (unlike every other E5 row, tagged by its
+    # specific tau), written ONLY after all E5_N_TAU taus complete -- gives
+    # run_all's resume logic a single, stable config_id per (model,
+    # checkpoint, beta, transform, n_p) to check for completeness. Recording
+    # it upfront instead would falsely mark a beta "done" if the loop crashed
+    # partway through, silently skipping the remaining taus on resume.
+    _record(rows, done_pairs, model_name, seed, checkpoint, beta, transform, "E5",
+            "n_tau_points", float(E5_N_TAU), n_p=n_p)
 
 
 def _run_e7(model_name, checkpoint, seed, beta, transform, entry, raw_dataset, all_targets,
@@ -904,6 +990,198 @@ def _run_e7(model_name, checkpoint, seed, beta, transform, entry, raw_dataset, a
 
 
 # --------------------------------------------------------------------------#
+# E6 -- predictive power of the feasibility measures (the one expensive
+# block, behind --include-e6). Unlike E1-E5/E7 (static-checkpoint analysis
+# or gradient-snapshot replay), E6 runs REAL federated training: a fresh
+# r32p model, poisoned via label flips only (never pixel triggers -- see
+# flip_masses_to_labels/effect_rate's own docstrings) on n_p of n_b workers
+# for ~30 rounds, then measures actual attack success and clean accuracy.
+# --------------------------------------------------------------------------#
+E6_MODEL_FLAG = "r32p"
+E6_MAX_TRAIN = 10000
+E6_ROUNDS = 30
+E6_AGGREGATORS = ("mean", "trmean")
+# 3 source/target pairs x 3 betas = 9, truncated to 8 per SPEC section 8/E6
+# ("spread the predictor, not cover the grid"): (9,4) is the pair used
+# throughout E1-E5/E7; (0,5) and (2,7) are two more pairs spread across the
+# class space so the predictor (varpi/v_hat/alpha_tilde_star/a_over_rho2)
+# isn't evaluated at a single, possibly atypical, (source,target). The last
+# cell of the cartesian product (2,7)@beta=0.10 is the one dropped.
+E6_PAIRS = [(9, 4), (0, 5), (2, 7)]
+E6_CONFIGS = [(y_s, y_t, b) for (y_s, y_t) in E6_PAIRS for b in BETAS][:8]
+E6_TRANSFORM = "stripe"          # the actual trigger used for grad_bd, poisoning-eval, and effect_rate
+E6_TEST_N_MAX = 500              # cap on triggered-test-set size for effect_rate (CIFAR-10: 1000/class)
+
+
+def _predictor_at_round0(model, class_samples_raw, pi, y_source, y_target, beta):
+    """
+    The four SPEC section 8/E6 predictors (a_over_rho2, alpha_tilde_star,
+    v_hat, varpi), computed ONCE from the model's state at round 0 -- exactly
+    the same machinery as E2/E3 (class_conditional_shifts, solve_qp,
+    dist_to_cone, rank_ratio, reachable_radius), just for a single
+    (y_source, y_target, beta) instead of the checkpoint x beta grid. Returns
+    (predictors_dict, ubar_star) -- ubar_star is reused by the caller to
+    build the actual poisoned worker datasets, so the deployed attack is
+    solved against EXACTLY the (y_source, y_target) pair being scored, not
+    the suite-wide default (9, 4).
+    """
+    Gbar, grad_c, pi_, pairs, col_index, Q = pl.class_conditional_shifts(
+        model, class_samples_raw, DATASET_FLAG, N_CLASSES, EVAL_DEVICE,
+        loss_fn=pl.clf_loss, model_flag=None)
+    grad_bd = pl.compute_grad_bd(model, pl.clf_loss, class_samples_raw, y_source, y_target,
+                                  DATASET_FLAG, EVAL_DEVICE, model_flag=None, trigger=E6_TRANSFORM)
+    v = beta * (grad_bd - grad_c)
+    v_norm_sq = float(v.norm() ** 2)
+    c_qp = (Gbar.T @ v).numpy().astype(np.float64)
+
+    ubar_star = pl.solve_qp(Q, c_qp, beta, pi, GAMMA, pairs, scope="aggregate", capacity=True)
+    u_np = ubar_star.numpy()
+    quad = float(u_np @ Q @ u_np)
+    a = float(v.numpy().astype(np.float64) @ v.numpy().astype(np.float64)) - 2 * float(np.dot(u_np, c_qp)) + quad
+
+    radius = pl.reachable_radius(Gbar, beta, pi, GAMMA, pairs)
+    rho = beta * radius["varsigma"]
+    v_hat = float(v.norm()) / rho if rho > 0 else float("nan")
+    varpi = pl.rank_ratio(Q, c_qp, v_norm_sq) if v_norm_sq > 0 else float("nan")
+    _, alpha_tilde_star, _ = pl.dist_to_cone(Q, c_qp, v_norm_sq, pairs)
+
+    predictors = dict(
+        a_over_rho2=a / (rho ** 2 + 1e-12),
+        alpha_tilde_star=alpha_tilde_star,
+        v_hat=v_hat,
+        varpi=varpi,
+    )
+    return predictors, ubar_star, pairs
+
+
+def _e6_worker_datasets(raw_dataset, all_targets, train_idx, pairs, ubar_star, y_source, y_target,
+                        n_p, seed, device):
+    """
+    Builds the N_B in-memory (preprocessed-tensor) worker datasets for one E6
+    training run: n_p workers get their shard's labels realized from
+    u_i = ubar_star/gamma via flip_masses_to_labels (label flips only, no
+    pixel trigger -- see effect_rate's docstring for where T actually enters),
+    the rest keep their true labels. Returns (datasets, max_shard_len) --
+    max_shard_len sizes the per-round batch so each worker contributes
+    exactly one full-shard batch per mini_train_multi "epoch" == one round.
+
+    train_idx: the E6_MAX_TRAIN-sized subsample of raw_dataset's GLOBAL
+    indices (SPEC section 8/E6: "r32p / CIFAR-10 at 10000 examples"), fixed
+    once per _run_e6 call and shared across all configs -- shard_indices is
+    called on `range(len(train_idx))` (local 0..len-1) since it only needs a
+    length, and the resulting local shard indices are mapped back through
+    train_idx to real raw_dataset positions before any indexing into it.
+    """
+    u_i = (ubar_star.numpy() / GAMMA)
+    u_i_dict = {p: float(u_i[j]) for j, p in enumerate(pairs)}
+    local_shards = pl.shard_indices(range(len(train_idx)), N_B, seed=seed)
+
+    datasets, max_len = [], 0
+    for i in range(N_B):
+        idx = train_idx[np.asarray(local_shards[i])]
+        true_t = all_targets[idx]
+        if i < n_p:
+            rng = np.random.RandomState(seed * 1000 + i)
+            tgt, _ = pl.masses_to_labels(true_t, u_i_dict, pairs, rng)
+        else:
+            tgt = true_t.copy()
+        x_raw = torch.stack([raw_dataset[int(j)][0] for j in idx]).to(device)
+        x = pl.raw_to_preprocess(x_raw, dataset_flag=DATASET_FLAG, model_flag=None)
+        y = torch.as_tensor(tgt, dtype=torch.long, device=device)
+        datasets.append(torch.utils.data.TensorDataset(x, y))
+        max_len = max(max_len, len(idx))
+    return datasets, max_len
+
+
+def _run_e6(seed, raw_dataset, all_targets, class_samples_raw, pi, rows, done_pairs):
+    """
+    One full pass over E6_CONFIGS x E6_AGGREGATORS: for each, a FRESH r32p
+    model is initialised, the round-0 predictor is computed and used to solve
+    the deployed attack (u_i on n_p=N_P[0] of N_B workers), the model trains
+    for E6_ROUNDS real federated rounds under agg_method (mean/trmean), and
+    the final model is scored for effect_rate (backdoor ASR) and
+    clean_accuracy. Spearman correlations between effect_rate and each
+    predictor are computed per aggregator across the (up to) 8 configs.
+    """
+    n_p = N_P[0]
+    per_agg_points = {agg: {"effect": [], "clean": [], "predictors": []} for agg in E6_AGGREGATORS}
+
+    # SPEC section 8/E6: "r32p / CIFAR-10 at 10000 examples" -- one fixed
+    # subsample shared across all E6_CONFIGS (not re-drawn per config), same
+    # spirit as MODEL_CFG["cnn"]["max_train"] used elsewhere in this file.
+    rng_sub = np.random.RandomState(seed)
+    train_idx = rng_sub.choice(len(raw_dataset), size=min(E6_MAX_TRAIN, len(raw_dataset)), replace=False)
+
+    for cfg_idx, (y_source, y_target, beta) in enumerate(E6_CONFIGS):
+        # `checkpoint` is repurposed to carry the (y_source, y_target) pair
+        # tag -- SPEC section 5's tidy schema has no dedicated column for it,
+        # and _cid() is computed from (model, seed, checkpoint, beta,
+        # transform, experiment, aggregator, n_p, tau): without the pair in
+        # one of those fields, different pairs AT THE SAME beta would collide
+        # on the same config_id and silently overwrite each other's rows via
+        # _record's done_pairs dedup. Same reuse-the-checkpoint-field pattern
+        # as _run_e3_shared's checkpoint=f"{n1}_vs_{n2}".
+        pair_tag = f"p{y_source}-{y_target}"
+        torch.manual_seed(seed * 10000 + cfg_idx)
+        model0 = pl.build_model(E6_MODEL_FLAG, N_CLASSES, EVAL_DEVICE)
+        model0.eval()
+        predictors, ubar_star, pairs = _predictor_at_round0(
+            model0, class_samples_raw, pi, y_source, y_target, beta)
+
+        for metric, val in predictors.items():
+            _record(rows, done_pairs, "cnn", seed, f"round0_{pair_tag}", beta, E6_TRANSFORM, "E6",
+                    metric, val, n_p=n_p, tau=None)
+
+        for agg_method in E6_AGGREGATORS:
+            model = pl.build_model(E6_MODEL_FLAG, N_CLASSES, TRAIN_DEVICE)
+            model.load_state_dict(model0.state_dict())
+            model.train()
+
+            datasets, max_len = _e6_worker_datasets(
+                raw_dataset, all_targets, train_idx, pairs, ubar_star, y_source, y_target,
+                n_p, seed, TRAIN_DEVICE)
+            opt = torch.optim.SGD(model.parameters(), **pl.DEFAULT_SGD_KWARGS)
+            sched_kwargs = {k: v for k, v in pl.DEFAULT_SGD_SCHED_KWARGS.items()}
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, **sched_kwargs)
+            pl.mini_train_multi(
+                model=model, train_datasets=datasets, test_data=None,
+                batch_size=max_len + 1, opt=opt, scheduler=scheduler, epochs=E6_ROUNDS,
+                agg_method=agg_method, f=F,
+            )
+
+            model.eval()
+            eff = pl.effect_rate(model, DATASET_FLAG, y_source, y_target, TRAIN_DEVICE,
+                                 model_flag=None, trigger=E6_TRANSFORM, n_max=E6_TEST_N_MAX)
+            clean_acc = pl.clean_accuracy(model, DATASET_FLAG, TRAIN_DEVICE, model_flag=None)
+
+            _record(rows, done_pairs, "cnn", seed, f"end_{pair_tag}", beta, E6_TRANSFORM, "E6",
+                    "effect_rate", eff, aggregator=agg_method, n_p=n_p, tau=None)
+            _record(rows, done_pairs, "cnn", seed, f"end_{pair_tag}", beta, E6_TRANSFORM, "E6",
+                    "clean_accuracy", clean_acc, aggregator=agg_method, n_p=n_p, tau=None)
+
+            per_agg_points[agg_method]["effect"].append(eff)
+            per_agg_points[agg_method]["clean"].append(clean_acc)
+            per_agg_points[agg_method]["predictors"].append(predictors)
+            del model
+        del model0
+
+    from scipy import stats as _st
+    for agg_method in E6_AGGREGATORS:
+        pts = per_agg_points[agg_method]
+        n = len(pts["effect"])
+        for pred_name in ("a_over_rho2", "alpha_tilde_star", "v_hat", "varpi"):
+            xs = [p[pred_name] for p in pts["predictors"]]
+            ys = pts["effect"]
+            if n >= 3 and np.std(xs) > 1e-9 and np.std(ys) > 1e-9:
+                r = float(_st.spearmanr(xs, ys).statistic)
+                if not math.isnan(r):
+                    _record(rows, done_pairs, "cnn", seed, "summary", None, E6_TRANSFORM, "E6",
+                            f"spearman_effect_vs_{pred_name}", r, aggregator=agg_method, n_p=n_p, tau=None)
+        _record(rows, done_pairs, "cnn", seed, "summary", None, E6_TRANSFORM, "E6",
+                "n_configs", float(n), aggregator=agg_method, n_p=n_p, tau=None)
+
+
+# --------------------------------------------------------------------------#
 # Orchestration
 # --------------------------------------------------------------------------#
 def _flush_csv(rows):
@@ -913,7 +1191,7 @@ def _flush_csv(rows):
 
 
 def run_all(models=None, seeds=None, checkpoints=None, betas=None, transforms=None,
-            include_e6=False, resume=True, cache_gbar=False):
+            include_e6=False, resume=True, cache_gbar=True):
     models = models if models is not None else MODELS
     seeds = seeds if seeds is not None else SEEDS
     checkpoints = checkpoints if checkpoints is not None else CHECKPOINTS
@@ -948,17 +1226,29 @@ def run_all(models=None, seeds=None, checkpoints=None, betas=None, transforms=No
         cache = {}
 
         for checkpoint in checkpoints:
-            cid_e2 = [_cid(model_name, None, checkpoint, b, "identity", "E2") for b in betas]
+            cid_e2 = [_cid(model_name, None, checkpoint, b, t, "E2") for b in betas for t in transforms]
             cid_e3 = _cid(model_name, None, checkpoint, E1_BETA, "identity", "E3")
             cid_e1main = _cid(model_name, seeds[0], checkpoint, E1_BETA, "identity", "E1")
             ckpt_done = all(c in done_cids for c in cid_e2) and cid_e3 in done_cids and cid_e1main in done_cids
+            # `entry` (Gbar/grad_c/grad_bd/model) is always loaded into `cache[checkpoint]`,
+            # even when E1-E3 are already cached: E4/E5/E7 below (and E3-shared) need
+            # cache["end"]/cache[checkpoints] populated in-memory for THIS run_all()
+            # call regardless of whether E1-E3 themselves need recomputing. Loading is
+            # cheap when cache_gbar=True and the .npz cache hits (no ~250s recompute).
+            try:
+                entry = _get_entry(model_name, checkpoint, cfg, ckpt_paths, class_samples_raw, pi,
+                                    transforms, cache, cache_gbar, timing)
+            except Exception:
+                _log_failure(model_name, None, checkpoint, "entry load (Gbar/grad_c/grad_bd)")
+                counts["failed"] += 1
+                failed_cells.append(dict(model=model_name, seed="*", checkpoint=checkpoint,
+                                          reason="entry load failed -- see failures.log"))
+                continue
             if ckpt_done:
                 counts["cached"] += 1
                 continue
             try:
-                entry = _get_entry(model_name, checkpoint, cfg, ckpt_paths, class_samples_raw, pi,
-                                    transforms, cache, cache_gbar, timing)
-                _run_e2(model_name, checkpoint, betas, entry, entry["Gbar"].shape[0], rows, done_pairs)
+                _run_e2(model_name, checkpoint, betas, transforms, entry, entry["Gbar"].shape[0], rows, done_pairs)
                 _run_e3_per_checkpoint(model_name, checkpoint, entry, rows, done_pairs)
                 counts["run"] += 1
             except Exception:
@@ -999,7 +1289,7 @@ def run_all(models=None, seeds=None, checkpoints=None, betas=None, transforms=No
                 if not (all(c in done_cids for c in cid_seedrob) and all(c in done_cids for c in cid_snr)):
                     _run_e1_seed_and_snr(model_name, cache["end"], raw_dataset, all_targets,
                                          seeds, betas, rows, done_pairs)
-                _run_assertions(model_name, cache["end"], rows, done_pairs)
+                _run_assertions(model_name, cache["end"], raw_dataset, all_targets, seeds[0], rows, done_pairs)
         except Exception:
             _log_failure(model_name, None, "end", "E1 seed/SNR + assertions")
             counts["failed"] += 1
@@ -1008,9 +1298,81 @@ def run_all(models=None, seeds=None, checkpoints=None, betas=None, transforms=No
 
         _flush_csv(rows)
 
+        # ---- Step 2/3: E4 (aggregator response), E5 (selection/saturation), --
+        # E7 (spreading n_p) -- all at checkpoint=end only, per this file's own
+        # scoping note above _run_e4/_run_e5/_run_e7 (SPEC section 8 fixes the
+        # checkpoint for these three blocks; E4 sweeps transform, E5 sweeps
+        # (beta, tau) internally, E7 sweeps n_p internally).
+        try:
+            if "end" in cache:
+                entry_end = cache["end"]
+                # Per-subitem resume gating (transform for E4, beta for E5):
+                # an all-or-nothing gate on the whole block would silently
+                # redo already-completed, expensive sub-items (e.g. a crash
+                # after E5's beta=0.01/0.03 finish but before the ~41min
+                # beta=0.10 reference run completes would otherwise redo
+                # 0.01/0.03 too on resume) -- checked individually instead.
+                for transform in transforms:
+                    cid_t = _cid(model_name, seeds[0], "end", E1_BETA, transform, "E4", n_p=N_P[0])
+                    if cid_t in done_cids:
+                        continue
+                    _run_e4(model_name, "end", seeds[0], E1_BETA, transform, N_P[0],
+                            entry_end, raw_dataset, all_targets, rows, done_pairs)
+                    _flush_csv(rows)
+
+                for beta in betas:
+                    cid_b = _cid(model_name, seeds[0], "end", beta, "identity", "E5", n_p=N_P[0], tau=None)
+                    if cid_b in done_cids:
+                        continue
+                    # Reference operating point (E1_BETA) gets the boosted
+                    # round count/batch size (see E5_ROUNDS_REF/E5_SIM_BATCH_REF
+                    # above) to resolve whether the earlier flat curve was
+                    # genuine or Monte-Carlo noise; other betas keep the
+                    # original cheaper settings as supplementary evidence.
+                    if beta == E1_BETA:
+                        _run_e5(model_name, "end", seeds[0], beta, "identity", N_P[0],
+                                entry_end, raw_dataset, all_targets, rows, done_pairs,
+                                n_rounds=E5_ROUNDS_REF, batch_size=E5_SIM_BATCH_REF)
+                    else:
+                        _run_e5(model_name, "end", seeds[0], beta, "identity", N_P[0],
+                                entry_end, raw_dataset, all_targets, rows, done_pairs)
+                    _flush_csv(rows)
+
+                cid_e7 = [_cid(model_name, seeds[0], "end", E1_BETA, "identity", "E7", n_p=n_p)
+                          for n_p in N_P_E7]
+                if not all(c in done_cids for c in cid_e7):
+                    _run_e7(model_name, "end", seeds[0], E1_BETA, "identity", entry_end,
+                            raw_dataset, all_targets, rows, done_pairs)
+                    _flush_csv(rows)
+                counts["run"] += 1
+        except Exception:
+            _log_failure(model_name, None, "end", "E4/E5/E7")
+            counts["failed"] += 1
+            failed_cells.append(dict(model=model_name, seed="*", checkpoint="end",
+                                      reason="E4/E5/E7 failed -- see failures.log"))
+
+        _flush_csv(rows)
+
     if include_e6:
-        print("[run_all] include_e6=True mais E6 n'est pas encore implemente cette session "
-              "(voir prelim/prelim.ipynb, ordre de travail: E4/E5/E7 avant E6).")
+        # E6 always uses r32p/cnn regardless of `models` (SPEC section 8/E6),
+        # so it runs once here, not per model_name. raw_dataset/all_targets/
+        # class_samples_raw/pi don't depend on model_name -- whatever the
+        # per-model loop above last computed them as (or the values computed
+        # before that loop, for `pi`) is reused as-is.
+        cid_e6 = [_cid("cnn", seeds[0], "summary", None, E6_TRANSFORM, "E6",
+                       aggregator=agg, n_p=N_P[0], tau=None) for agg in E6_AGGREGATORS]
+        if all(c in done_cids for c in cid_e6):
+            print("[run_all] E6 deja complet (cache) -- rien a faire.")
+        else:
+            try:
+                _run_e6(seeds[0], raw_dataset, all_targets, class_samples_raw, pi, rows, done_pairs)
+                counts["run"] += 1
+            except Exception:
+                _log_failure("cnn", seeds[0], "E6", "E6")
+                counts["failed"] += 1
+                failed_cells.append(dict(model="cnn", seed=seeds[0], checkpoint="E6",
+                                         reason="E6 failed -- see failures.log"))
+            _flush_csv(rows)
 
     df_final = _flush_csv(rows)
 
@@ -1049,7 +1411,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--include-e6", action="store_true")
     p.add_argument("--no-resume", action="store_true")
-    p.add_argument("--cache-gbar", action="store_true",
-                    help="persist Gbar/grad_c to prelim/artifacts/cache/ as float16 (~167MB for r32p)")
+    p.add_argument("--no-cache-gbar", action="store_true",
+                    help="disable the float16 Gbar/grad_c disk cache under prelim/artifacts/cache/ "
+                         "(~167MB for r32p) -- on by default since _get_entry now runs "
+                         "unconditionally (E3-shared/E4/E5/E7 need every checkpoint's entry loaded "
+                         "into memory even when E1-E3 are fully cached and skipped); without this "
+                         "cache, every resumed run re-pays the ~250s x 3 checkpoints x len(models) "
+                         "Gbar recompute on r32p")
     args = p.parse_args()
-    run_all(include_e6=args.include_e6, resume=not args.no_resume, cache_gbar=args.cache_gbar)
+    run_all(include_e6=args.include_e6, resume=not args.no_resume, cache_gbar=not args.no_cache_gbar)
