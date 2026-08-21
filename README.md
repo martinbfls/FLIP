@@ -47,6 +47,36 @@ Each module corresponds to a step of the FLIP or BRoADflip pipeline.
 4. `select_flips` — selecting label flips and distributing across workers
 5. `federated_train_user` — evaluation module
 
+### Mean aggregation: joint trigger / inversion-policy optimization
+
+Two threat models for jointly optimizing the trigger delta and the label-inversion policy
+under mean aggregation, for a given inversion budget beta -- see each module's schema for the
+exact objective. Both reuse `train_expert` / `federated_select_flips` / `federated_train_user`
+unchanged, and produce trigger `.pt` / metric artifacts in the same conventions as
+`federated_optimizing_trigger`, so the two threat models are directly comparable.
+
+**Threat model "expert" (P^mean)** — co-optimizes delta and an explicit policy u over label
+flips (in place of `federated_optimizing_trigger`'s implicit QP optimum), then materializes u
+into concrete flips:
+
+1. `train_expert` (poisoner="1xs") — bootstraps the expert checkpoint trajectory
+2. `federated_optimizing_trigger_policy` — jointly optimizes delta and the policy u
+3. `federated_policy_to_flips` — materializes u into per-worker label flips (same output
+   layout as `federated_select_flips`)
+4. `federated_train_user` — victim training and ASR evaluation against the optimized trigger
+
+**Threat model "direct"** — extends `federated_generate_labels` to jointly optimize
+continuous poisoned labels and delta directly, via the trajectory-matching alignment loss
+plus a backdoor-efficacy term:
+
+1. `train_expert` (poisoner="1xs") — bootstraps the (shared) expert checkpoint trajectory
+2. `federated_generate_labels_trigger` — jointly optimizes labels_syn and delta
+3. `federated_select_flips` — discretizes labels_syn into per-worker flips at a given budget
+4. `federated_train_user` — victim training and ASR evaluation against the optimized trigger
+
+See `experiments/federated_experiments/threat_model_expert/` and
+`experiments/federated_experiments/threat_model_direct/` for worked (smoke-scale) examples.
+
 More details are available in the `schemas/` folder.
 
 ---

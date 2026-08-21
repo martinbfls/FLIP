@@ -1,0 +1,99 @@
+###
+# federated_optimizing_trigger_policy schema
+# Threat model "expert" (P^mean): jointly optimizes a backdoor trigger (delta) AND an
+# explicit label-flipping attack policy (u) under mean aggregation, in place of
+# federated_optimizing_trigger's QP-projected w*:
+#
+#   min_{|delta|_inf<=epsilon, u in U_beta}
+#       E_k[ ||Gbar(theta_bar_k) u - v_k(delta)||^2 / rho_k^2 ]
+#       + lambda_bd * E_k[ E_X[ loss_c(f_theta_bar_k(T_delta(X)), y_target) ] ]
+#   s.t.  theta_bar_{k+1} = theta_bar_k - eta_k grad(theta_bar_k),  lambda = beta
+#
+# Gbar(theta_bar_k) is the same pi_y-weighted expected label-flip gradient direction
+# federated_optimizing_trigger's B2 term already uses (compute_expected_flip_gradients);
+# u replaces its implicit QP optimum with a policy parameter, jointly trained with delta.
+# lambda=beta is enforced exactly as in federated_optimizing_trigger (lambda_poison
+# resolves to beta by default, coupling the objective's poisoning rate AND the expert's
+# actual retraining poison rate).
+#
+# Outputs the optimized trigger as a .pt file (same naming convention as
+# federated_optimizing_trigger) and the optimized policy (u, the (y,c) pairs it is indexed
+# by, beta, n_train) as a .npz file, consumed downstream by federated_policy_to_flips.
+###
+
+[federated_optimizing_trigger_policy]
+dataset = "string: {cifar, cifar_100, tiny_imagenet}. Dataset used for training."
+model = "string: {r32p, r18, r18_tin, vgg, vgg_pretrain, vit_pretrain}. Model architecture."
+
+source_label = "int: {-1,0,...,9}. Source label. -1 means all source labels."
+target_label = "int: {0,1,...,9}. Target label for the backdoor attack."
+
+optim_kwargs = "dict: optimization arguments for the outer expert-retraining loop."
+scheduler_kwargs = "dict: optimization arguments for the outer expert-retraining loop."
+
+output_dir = "string. Path to output directory for expert-retraining checkpoints (slurm compatible)."
+output_dir_trigger = "string. Path to output directory for the optimized trigger .pt (slurm compatible)."
+
+device = "string: {cpu, cuda}. Device used for optimization. Defaults to cuda if available."
+
+###
+# Loss weights: B2 + lambda_bd*L_bd + lambda_penalty*L_pen + lambda_delta*||delta|| + lambda_tv*L_tv
+# B2 is the alignment term ||Gbar(theta_bar_k) u - v_k(delta)||^2 / rho_k^2 (coefficient
+# fixed at 1, matching the (P^mean) objective as stated). lambda_bd is kappa in the
+# (P^mean) formula -- named lambda_bd (not kappa) for consistency with
+# federated_optimizing_trigger, where kappa already names the hinge-penalty margin below.
+# L_pen/L_tv/||delta|| are optional trigger regularizers, reused unchanged from
+# federated_optimizing_trigger for stability; they are not part of (P^mean) itself and
+# default to 0.
+###
+lambda_bd = "float: [0, +infty). Weight for L_bd (kappa in the P^mean formula: weight of the backdoor loss on triggered examples). Defaults to 1.0."
+lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu. Defaults to 0.0."
+lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta. Defaults to 0.0."
+lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta. Defaults to 0.0."
+kappa = "float: [0, +infty). Hinge margin for the (optional) trigger penalty -- NOT the P^mean formula's kappa (see lambda_bd). Defaults to 0.0."
+
+###
+# Trigger optimization hyperparameters
+###
+epsilon = "float: (0, +infty). L_infinity bound on trigger delta."
+lr_delta = "float: (0, +infty). Learning rate for trigger optimization (Adam)."
+lr_policy = "float: (0, +infty). Learning rate for policy optimization (Adam)."
+n_steps = "int: {1,...,+infty}. Number of outer (retrain + optimize) steps."
+epochs = "int: {1,...,+infty}. Epochs of model retraining per outer step. Defaults to 20."
+checkpoint_backward = "bool. Backward + free the per-checkpoint graph immediately instead of accumulating all num_chckpt graphs before one backward call. Defaults to true."
+
+###
+# Poisoning budget -- same resolution as federated_optimizing_trigger
+# (resolve_beta_and_lambda_poison): beta is the primary parameter, the fraction of the
+# attacker's OWN data shard it can flip; U_beta = {u>=0, sum(u)<=beta} is exactly this
+# same budget applied to the policy u.
+###
+beta = "float: (0, 1). Primary parameter. Fraction of the attacker's own data shard it can afford to flip; also the budget bounding u."
+num_honests = "int. Assumed number of honest workers under ONE particular deployment size, used only to convert beta into flip_budget for human-readable logging/run naming. Not read by the objective."
+num_poisoned = "int. Assumed number of poisoned workers under that same assumed deployment size, same logging-only role as num_honests."
+lambda_poison = "float or 'beta': (0,1]. Target fraction of each batch's source-class examples that get triggered + relabeled (in the objective) AND, via lambda_target, the fraction of the expert's poisoned train dataset that is poisoned. 'beta' (the default) resolves to beta directly -- this is what guarantees lambda=beta."
+lambda_overflow = "string: {clip, duplicate}. What to do when lambda_poison implies more poisoned examples than the source class has available. See federated_optimizing_trigger."
+
+###
+# Checkpoint sampling (expert trajectory matching) -- identical semantics to
+# federated_optimizing_trigger.
+###
+alpha_ckpt = "float: (0,1]. Controls bias toward early or late checkpoints. Defaults to 0.01."
+num_chckpt = "int: {1,...,+infty}. Number of checkpoints sampled per step."
+
+###
+# Expert trajectory configuration
+###
+expert_path = "string. Format string path to expert checkpoints with '{}' placeholders."
+
+[OPTIONAL]
+expert_config = "dict. Configuration describing expert checkpoints to load."
+init = "str. Trigger initialization."
+restart = "bool. Restart optimization from existing checkpoint."
+batch_size_trigger = "int: {1,...,+infty}. Batch size for the trigger+policy-optimization data loader. Defaults to 256."
+flip_gradient_samples_per_class = "int: {1,...,+infty}. Number of training samples per class used to estimate Gbar. Defaults to 64."
+source_duplication = "bool. See federated_optimizing_trigger. Defaults to false."
+metrics_log_path = "string. If set, path (slurm compatible) to a JSON file where per-step metrics (B2, L_bd, lambda_effective, beta_used=sum(u), clean_acc, poison_acc) are recorded across the n_steps optimization loop."
+policy_optim_kwargs = "dict. Optional extra keyword arguments for the policy's Adam optimizer."
+output_dir_policy = "string. Path to output directory for the optimized policy .npz (slurm compatible). Defaults to 'optimized_policy'."
+flip_budget = "[legacy] int: {0,...,+infty). Number of label flips per round; if given (and beta is not), derives beta. Mutually exclusive with beta -- kept for backward compatibility, prefer beta."

@@ -1,0 +1,61 @@
+###
+# federated_generate_labels_trigger schema
+# Threat model "direct" (P^direct): extends federated_generate_labels to jointly optimize
+# continuous poisoned logit labels (labels_syn) AND a backdoor trigger (delta), via federated
+# trajectory matching. Unlike federated_generate_labels, the trigger is not a fixed input
+# (no `poisoner`/`delta` fields) -- it is optimized alongside the labels.
+#
+# Adds, on top of the unmodified MTT alignment loss + L1 label regularization already
+# implemented in federated_generate_labels: a backdoor-efficacy term (lambda_bd, i.e. kappa
+# in the (P^mean)/(P^direct) formulas) and the trigger's own |delta|_inf<=epsilon constraint
+# plus optional regularizers -- same terms/names as federated_optimizing_trigger_policy, for
+# direct comparability between the two threat models.
+#
+# Outputs the same labels.npy/true.npy/losses.npy as federated_generate_labels (consumed
+# unchanged by federated_select_flips), plus the optimized trigger as a .pt file (same naming
+# convention as federated_optimizing_trigger/federated_optimizing_trigger_policy).
+###
+
+[federated_generate_labels_trigger]
+input_pths = "string. Format string path to model checkpoint .pth files with three '{}'s."
+opt_pths = "string. Format string path to optimizer checkpoint .pth files with three '{}'s."
+output_dir = "string. Path to output directory (slurm compatible)."
+output_dir_trigger = "string. Path to output directory for the optimized trigger .pt (slurm compatible)."
+expert_model = "string: {r32p, r18, r18_tin, vgg, vgg_pretrain, vit_pretrain}. For ResNets, VGG-19s, and ViTs. Also used as the trigger's model_flag (needs_big_ims / preprocessing)."
+dataset = "string: {cifar, cifar_100, tiny_imagenet, svhn}. For CIFAR-10, CIFAR-100, Tiny Imagenet and SVHN datasets."
+source_label = "int: {-1,0,...,9}. Specifies label to mimic. -1 indicates all labels."
+target_label = "int: {0,1,...,9}. Specifies label to attack."
+
+###
+# Trigger hyperparameters -- same names as federated_optimizing_trigger_policy.
+###
+epsilon = "float: (0, +infty). L_infinity bound on trigger delta."
+lr_delta = "float: (0, +infty). Learning rate for trigger optimization (Adam)."
+
+###
+# Loss weights: grand_loss (MTT alignment + lam*L1 reg, unchanged) is further extended, via an
+# isolated backward pass restricted to delta, with lambda_bd*L_bd (kappa in the P^mean/P^direct
+# formulas: weight of the backdoor loss on triggered examples), and, added directly into
+# grand_loss: lambda_penalty*L_pen + lambda_delta*||delta|| + lambda_tv*L_tv (optional trigger
+# regularizers, reused unchanged from federated_optimizing_trigger, default 0).
+###
+lambda_bd = "float: [0, +infty). Weight for L_bd (kappa in the P^mean/P^direct formulas). Defaults to 1.0."
+
+[OPTIONAL]
+batch_size = "int: {0,1,...,infty}. Specifies batch size. Set to default for trainer if omitted."
+epochs = "int: {0,1,...,infty}. Specifies number of epochs. Set to default for trainer if omitted."
+train_pct = "float: [0, 1]. Specifies percentage of dataset available to attacker. Set to 1 by default."
+lambda = "float: [0, infty]. Specifies label L1-regularization parameter. Set to 0 by default."
+expert_config = "dict. Specifies expert checkpoints. Set to default if omitted."
+attack_config = "dict. Specifies algorithm parameters. Set to default if omitted."
+num_honests = "int: {0,1,...,infty}. Num of honest workers."
+num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers."
+clean_trajectory = "bool. Train expert on clean or poisoned data."
+agg_method = "str: aggregation method for the (differentiable) student gradient aggregation."
+attack = "str: attack performed."
+gamma = "float: [0, 1]. Weight stealthy/backdoor."
+init = "str. Trigger initialization. Defaults to 'stripe' (sinusoidal)."
+lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu. Defaults to 0.0."
+lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta. Defaults to 0.0."
+lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta. Defaults to 0.0."
+kappa = "float: [0, +infty). Hinge margin for the (optional) trigger penalty -- NOT the P^mean/P^direct formulas' kappa (see lambda_bd). Defaults to 0.0."

@@ -349,6 +349,62 @@ def compute_beta_star(v, G, Q, pairs, betas, ridge=1e-6):
     return dist2_curve, beta_star
 
 
+def resolve_beta_and_lambda_poison(beta, flip_budget, lambda_poison, num_poisoned, num_honests, n_train):
+    '''
+    Resolves (beta, flip_budget, lambda_poison) from whichever of beta/flip_budget was
+    passed, and couples lambda_poison to beta when lambda_poison == "beta" (the default).
+
+    beta -- the fraction of the attacker's OWN shard it can afford to flip -- is the
+    primary parameter: it is a property of the attacker alone, not of the federated
+    deployment it will eventually be used against (see `optimize_trigger`'s docstring).
+    num_honests/num_poisoned exist only to translate beta into a "number of flips per
+    round" for human-readable logging/run naming under one particular assumed deployment
+    size; they play no role in the trigger objective itself. Pass exactly one of beta or
+    flip_budget; passing both raises.
+
+    lambda_poison == "beta" resolves to beta directly, coupling the objective's per-batch
+    poisoning rate (and, via lambda_target, the expert's actual retraining poison rate) to
+    beta -- this is what guarantees lambda == beta throughout the pipeline.
+
+    Returns (beta, flip_budget, lambda_poison).
+    '''
+    n_w = num_honests + num_poisoned
+
+    if beta is not None and flip_budget is not None:
+        raise ValueError(
+            "Pass exactly one of `beta` or `flip_budget`, not both -- "
+            f"got beta={beta} and flip_budget={flip_budget}. beta is the "
+            "primary parameter; flip_budget is accepted only for backward "
+            "compatibility and, when passed alone, is converted to beta "
+            "via beta = flip_budget * n_w / (num_poisoned * n_train)."
+        )
+    elif beta is not None:
+        if not (0.0 < beta < 1.0):
+            raise ValueError(f"beta must be in (0, 1), got {beta}")
+        flip_budget = round(beta * num_poisoned * n_train / n_w)  # logging/run-name only
+    elif flip_budget is not None:
+        beta = flip_budget * n_w / (num_poisoned * n_train)
+    else:
+        raise ValueError("Pass beta (preferred) or flip_budget (legacy).")
+
+    print(
+        f"beta={beta:.6f} (attacker's own-shard flip fraction) -- assuming "
+        f"num_poisoned={num_poisoned}, num_honests={num_honests}, n_train={n_train} "
+        f"this is flip_budget~={flip_budget:.1f} flips/round (logging only, not "
+        "used by the objective)."
+    )
+
+    if lambda_poison == "beta":
+        lambda_poison = beta
+    if lambda_poison is None:
+        raise ValueError(
+            "lambda_poison is None after resolution: pass a float in (0, 1], "
+            "or the string 'beta' (the default) to derive it from beta."
+        )
+
+    return beta, flip_budget, lambda_poison
+
+
 def extract_experts(expert_config, expert_path):
     config = {**DEFAULT_EXPERT_CONFIG, **expert_config}
     expert_starts = []

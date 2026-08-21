@@ -1,0 +1,28 @@
+###
+# federated_policy_to_flips schema
+# Threat model "expert" (P^mean), step 2: materializes the continuous attack policy u
+# (u, pairs, beta, n_train -- produced by federated_optimizing_trigger_policy as a .npz) into
+# a concrete set of per-example label flips, then partitions them across workers using the
+# SAME logic as federated_select_flips (modules/federated_select_flips/utils.py's
+# partition_across_workers).
+#
+# u is not restricted to the (source_label, target_label) pair: it spans all ordered class
+# pairs (y, c), same as the feasible polytope W_beta federated_optimizing_trigger compares
+# against -- so materialization can flip any class pair the policy assigned weight to.
+#
+# Outputs the same layout as federated_select_flips: true.npy, {budget}_idx_flipped.npy,
+# {budget}_idx_clean.npy, worker{w}/{budget}_labels.npy, worker{w}/{budget}_indices.npy
+# (budget = the actually-realized number of flips). This lets federated_train_user be reused
+# UNCHANGED to train and evaluate the victim.
+###
+
+[federated_policy_to_flips]
+policy_path = "string. Path to the policy .npz produced by federated_optimizing_trigger_policy (slurm compatible)."
+dataset = "string: {cifar, cifar_100, tiny_imagenet, svhn}. Dataset the policy was optimized against."
+output_dir = "string. Path to output directory (slurm compatible)."
+num_honests = "int: {0,1,...,infty}. Num of honest workers."
+num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers."
+
+[OPTIONAL]
+one_hot_temp = "float: (0, +infty). Logit value assigned to a flipped example's new (target) class -- softmax(one_hot_temp) approximates a hard label; unflipped examples keep value 1.0 (true.npy's convention). Defaults to DEFAULT_ATTACK_CONFIG['one_hot_temp'] (5.0), matching federated_generate_labels' synthetic-label initialization scale."
+seed = "int. RNG seed for the per-class shuffles used to pick which examples get flipped, and for the worker partitioning. Defaults to 0."

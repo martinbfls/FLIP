@@ -28,6 +28,7 @@ from modules.federated_optimizing_trigger.utils import (
     raw_to_preprocess,
     raw_to_trigger_preprocess,
     get_raw_clean_dataset,
+    resolve_beta_and_lambda_poison,
 )
 from modules.train_expert.utils import checkpoint_callback
 import torch
@@ -493,37 +494,9 @@ def optimize_trigger(
     # exist only to translate beta into a "number of flips per round" for
     # human-readable logging/run naming under one particular assumed
     # deployment size; they play no role in the trigger objective itself.
-    if beta is not None and flip_budget is not None:
-        raise ValueError(
-            "Pass exactly one of `beta` or `flip_budget`, not both -- "
-            f"got beta={beta} and flip_budget={flip_budget}. beta is the "
-            "primary parameter; flip_budget is accepted only for backward "
-            "compatibility and, when passed alone, is converted to beta "
-            "via beta = flip_budget * n_w / (num_poisoned * n_train)."
-        )
-    elif beta is not None:
-        if not (0.0 < beta < 1.0):
-            raise ValueError(f"beta must be in (0, 1), got {beta}")
-        flip_budget = round(beta * num_poisoned * n_train / n_w)  # logging/run-name only
-    elif flip_budget is not None:
-        beta = flip_budget * n_w / (num_poisoned * n_train)
-    else:
-        raise ValueError("Pass beta (preferred) or flip_budget (legacy).")
-
-    print(
-        f"beta={beta:.6f} (attacker's own-shard flip fraction) -- assuming "
-        f"num_poisoned={num_poisoned}, num_honests={num_honests}, n_train={n_train} "
-        f"this is flip_budget~={flip_budget:.1f} flips/round (logging only, not "
-        "used by the objective)."
+    beta, flip_budget, lambda_poison = resolve_beta_and_lambda_poison(
+        beta, flip_budget, lambda_poison, num_poisoned, num_honests, n_train,
     )
-
-    if lambda_poison == "beta":
-        lambda_poison = beta
-    if lambda_poison is None:
-        raise ValueError(
-            "lambda_poison is None after resolution: pass a float in (0, 1], "
-            "or the string 'beta' (the default) to derive it from beta."
-        )
 
     # pi (class frequencies) depends only on the dataset (not on the
     # checkpoint or the trigger): computed once and reused both below (for
