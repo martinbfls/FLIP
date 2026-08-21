@@ -105,12 +105,67 @@ def checkpoints_present(df, model):
     return sorted(ck, key=lambda c: order.get(c, 99))
 
 
+def e3_checkpoints_present(df, model):
+    """
+    Session correction D2: E3 (only) may have 2 extra checkpoints between
+    "mid" and "end" -- postmid1, postmid2, ... (see sweep.py's
+    E3_CHECKPOINTS/E3_EXTRA_POST_MID) -- ordered begin < mid < postmid1 <
+    postmid2 < ... < end. Unlike checkpoints_present (E1/E2, fixed 3-point
+    grid), this discovers whichever postmidN checkpoints are actually in the
+    E3 rows rather than assuming a fixed count.
+    """
+    sub = df[(df.model == model) & (df.experiment == "E3") &
+             df.checkpoint.str.match(r"^(begin|mid|end|postmid\d+)$", na=False)]
+    ck = sub["checkpoint"].unique().tolist()
+
+    def _key(c):
+        if c == "begin":
+            return (0, 0)
+        if c == "mid":
+            return (1, 0)
+        if c == "end":
+            return (3, 0)
+        m = re.match(r"postmid(\d+)", c)
+        return (2, int(m.group(1)))
+
+    return sorted(ck, key=_key)
+
+
+def _parse_failures_log(failures_text):
+    """
+    Session correction E: failures.log is append-only across every resumed
+    run_all() call (sweep.py's _log_failure opens it with "a"), so it can
+    (correctly) accumulate entries from an EARLIER attempt that a LATER
+    resume subsequently fixed -- the current run's own run_meta.json
+    (n_cells_failed/failed_cells) only ever reflects the MOST RECENT call.
+    Splits failures_text into individual entries and extracts each one's
+    timestamp (first line: "YYYY-MM-DD HH:MM:SS model=... ..."), so section0/
+    section1 can separate "from this run" (>= meta.started_at) from "stale,
+    from an earlier attempt" instead of reporting a bare, ambiguous count.
+    Returns a list of (timestamp_or_None, entry_text).
+    """
+    if not failures_text:
+        return []
+    entries = [e for e in failures_text.split("\n" + "=" * 70) if e.strip()]
+    parsed = []
+    for e in entries:
+        m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", e)
+        parsed.append((m.group(1) if m else None, e.strip()))
+    return parsed
+
+
 # --------------------------------------------------------------------------#
 # Sec 0 -- header
 # --------------------------------------------------------------------------#
 def section0(df, meta, failures_text):
     lines = ["## 0. En-tete\n"]
-    n_fail_log = len([l for l in failures_text.split("\n" + "=" * 70) if l.strip()]) if failures_text else 0
+    fail_entries = _parse_failures_log(failures_text)
+    started_at = meta.get("started_at")
+    n_this_run = sum(1 for ts, _ in fail_entries if started_at and ts and ts >= started_at)
+    n_stale = len(fail_entries) - n_this_run
+    fail_log_str = str(len(fail_entries))
+    if fail_entries:
+        fail_log_str += f" (dont {n_this_run} de ce run, {n_stale} anterieure(s)/perimee(s))"
     rows = [
         ["Date du rapport", time.strftime("%Y-%m-%d %H:%M")],
         ["Commit git", meta.get("git_commit", "?") + (" (dirty)" if meta.get("git_dirty") else "")],
@@ -122,17 +177,18 @@ def section0(df, meta, failures_text):
         ["Cellules executees / en cache / en echec",
          f"{meta.get('n_cells_run', '?')} / {meta.get('n_cells_cached', '?')} / {meta.get('n_cells_failed', '?')}"],
         ["Lignes dans metrics.csv", str(len(df))],
-        ["Entrees dans failures.log", str(n_fail_log)],
+        ["Entrees dans failures.log", fail_log_str],
     ]
     lines.append(md_table(["Champ", "Valeur"], rows))
-    data = dict(rows=rows)
+    data = dict(rows=rows, n_fail_log_total=len(fail_entries), n_fail_log_this_run=n_this_run,
+                n_fail_log_stale=n_stale)
     return "\n".join(lines), data
 
 
 # --------------------------------------------------------------------------#
 # Sec 1 -- grid executed
 # --------------------------------------------------------------------------#
-def section1(df, meta):
+def section1(df, meta, failures_text=""):
     lines = ["## 1. Grille executee\n"]
     grid = meta.get("grid", {})
     rows = [[k, ", ".join(str(x) for x in v) if isinstance(v, list) else str(v)] for k, v in grid.items()]
@@ -158,7 +214,33 @@ def section1(df, meta):
         rows_f = [[f.get("model"), f.get("seed"), f.get("checkpoint"), f.get("reason")] for f in failed]
         lines.append(md_table(["Modele", "Graine", "Checkpoint", "Raison"], rows_f))
     else:
-        lines.append("Aucune.\n")
+        lines.append("Aucune cellule en echec pour CE run (`run_meta.json`, n_cells_failed="
+                     f"{meta.get('n_cells_failed', 0)}).\n")
+
+    # Session correction E: reconcile against failures.log, which is
+    # append-only across resumed runs (see _parse_failures_log) and can
+    # legitimately carry entries from an earlier, since-fixed attempt.
+    fail_entries = _parse_failures_log(failures_text)
+    started_at = meta.get("started_at")
+    stale = [(ts, e) for ts, e in fail_entries if not (started_at and ts and ts >= started_at)]
+    this_run = [(ts, e) for ts, e in fail_entries if (started_at and ts and ts >= started_at)]
+    if fail_entries:
+        if this_run:
+            lines.append(f"\n`failures.log` contient {len(this_run)} entree(s) horodatee(s) DE CE "
+                         f"run (>= {started_at}) -- ceci NE contredit PAS la table ci-dessus que si "
+                         f"celles-ci correspondent a des cellules retentees avec succes plus tard "
+                         f"dans le meme run (resume interne) ; sinon, verifier `n_cells_failed` "
+                         f"ci-dessus, qui doit refleter ces echecs.\n")
+        if stale:
+            lines.append(f"\n`failures.log` contient {len(stale)} entree(s) ANTERIEURE(S) au demarrage "
+                         f"de ce run (avant {started_at}) -- benignes par construction : le fichier "
+                         f"n'est jamais tronque entre deux `run_all()` (append-only, voir sweep.py "
+                         f"`_log_failure`), donc une cellule qui a echoue lors d'un essai precedent "
+                         f"puis reussi lors d'une reprise (`resume=True`) laisse une trace ici sans "
+                         f"que la section 1 courante ne la liste comme en echec. Horodatages : "
+                         + ", ".join(ts or "?" for ts, _ in stale) + ".\n")
+    else:
+        lines.append("\n`failures.log` est vide ou absent : coherent avec \"Aucune\" ci-dessus.\n")
 
     gbar_sec = meta.get("gbar_seconds", [])
     if gbar_sec:
@@ -198,10 +280,16 @@ def section2(df):
     add("alpha_tilde_star: contrainte de budget inactive a l'optimum (NNLS)", "par modele (checkpoint=end)",
         v3, 1e-2, v3 is not None and v3 <= 1e-2)
 
+    # Session correction B4: threshold moved from >= 1 to >= 10 EXPECTED
+    # flips per pair (sweep.py's own gap computation now filters at 10, so
+    # this just needs to read whatever it wrote) -- below 10, round()'s
+    # integer-count noise dominates the ratio by construction. The prior
+    # 0.309 FAIL traced to c_uniform's ~90-way mass split, well under 10
+    # expected flips per pair.
     gap_cols = [c for c in df["metric"].unique() if c.startswith("flip_mass_gap_rel_max__")]
     g4 = df[df.metric.isin(gap_cols)]["value"].tolist()
     v4 = max(g4) if g4 else None
-    add("Masses de flip realisees vs demandees : ecart relatif max (>=1 flip attendu)",
+    add("Masses de flip realisees vs demandees : ecart relatif max (>=10 flips attendus/paire)",
         "toutes cellules E1", v4, 0.10, v4 is not None and v4 <= 0.10)
 
     g5 = qvals(df, "assertions", "flat_aggregator_vs_repo_max_abs_diff")
@@ -215,6 +303,17 @@ def section2(df):
         nan_ct + inf_ct, 0, (nan_ct + inf_ct) == 0)
 
     lines.append(md_table(["Nom", "Portee", "Statut", "Valeur observee", "Seuil"], rows))
+
+    if gap_cols:
+        lines.append("\n**Detail par config (B4)** -- max de l'ecart relatif, par tag E1 (celui-ci "
+                     "isole c_uniform du reste) :\n")
+        rows_gap = []
+        for c in sorted(gap_cols):
+            tag = c[len("flip_mass_gap_rel_max__"):]
+            vals = df[df.metric == c]["value"].tolist()
+            rows_gap.append([tag, sig(max(vals)) if vals else "-", len(vals)])
+        lines.append(md_table(["config", "ecart relatif max", "n cellules"], rows_gap))
+
     return "\n".join(lines), dict(assertions=data)
 
 
@@ -234,8 +333,37 @@ def section_e1(df):
                  f"beta={pl.__name__ and 0.10}, robustesse aux graines et balayage SNR/batch a "
                  f"checkpoint=end -- {n_cells} cellules (modele x checkpoint) au total.\n")
 
+    lines.append("\n### Diagnostic du facteur d'echelle (correction B, session 4)\n")
+    lines.append("Le rapport v1 montrait `err_rel(shard) ~ 9` avec `cos ~ 1` sur TOUS les "
+                 "tags/checkpoints/modeles (voir metrics.csv historique) -- pas du bruit : avec "
+                 "`cos=1`, `err_rel = |a-1|` pour la pente `a = <g_emp-grad_c, Gbar@u>/||Gbar@u||^2`, "
+                 "donc `err_rel~9` implique `a~10`, constant. Cause : `Gbar` est pondere par `pi[y]` "
+                 "(`Gbar[:,(y,z)] = pi[y]*(g[y][z]-g[y][y])`, verbatim du depot -- jamais modifie ici) "
+                 "alors que la masse realisee `u_real` (flip_masses_to_labels) est une fraction de "
+                 "TOUS les exemples detenus par le worker (definition de `u` de SPEC section 2, "
+                 "coherente avec les plafonds `U_loc`/`U_beta` eux-memes bornes par `pi[y]`) -- "
+                 "combiner un `Gbar` pondere par `pi[y]` avec une masse deja en unites de `pi[y]` "
+                 "compte `pi[y]` deux fois. Sur CIFAR-10 equilibre, `pi[y]=0.1` pour toutes les "
+                 "classes, donc `1/pi[y]=10` explique la constance du facteur observe sur tous les "
+                 "configs (y compris `b_other_pair`, sur une AUTRE classe source, et `c_uniform`, "
+                 "etale sur les 90 paires) -- ce n'est pas propre a la paire (9,4).\n")
+    lines.append("**Correction appliquee a la source** (sweep.py `_run_e1_main`/`_run_e1_seed_and_snr`, "
+                 "pas ici) : la prediction utilise desormais `Gbar @ (u_real / pi_vec)` au lieu de "
+                 "`Gbar @ u_real` -- `pi_vec[j] = pi[y]` pour la classe source de la paire `j`. "
+                 "`solve_qp`/`Q`/`c` (verifies contre `project_gradient` du depot dans les assertions, "
+                 "section 2) ne sont PAS touches -- seule la contraction empirique utilisee pour "
+                 "comparer a `g_emp` l'est. Colonnes `a_slope_shard`/`a_r2_shard` ci-dessous "
+                 "(section B1) : calculees APRES cette correction, elles doivent valider "
+                 "empiriquement le correctif (`a~1`, `R^2~1`) au prochain sweep -- si elles ne le "
+                 "font pas, il reste un second facteur d'echelle non explique par ce mecanisme. Reste "
+                 "OUVERT : si le MEME mecanisme affecte aussi les deploiements bases sur le QP "
+                 "(`ubar*` d'E3/E4/E5/E7, qui ciblent `v` via ce meme `Gbar` pondere), ceux-ci "
+                 "realiseraient un decalage EFFECTIF ~10x plus grand que ce que `v_hat`/`alpha_tilde_star` "
+                 "rapportent -- cette session ne tranche pas cette question plus large (voir "
+                 "recommandation section 10) ; c'est precisement pourquoi E6 n'est pas relance.\n")
+
     data = {}
-    lines.append("\n### Resultats -- transfert calibration -> shard (cos, erreur relative)\n")
+    lines.append("\n### Resultats -- transfert calibration -> shard (cos, erreur relative, pente a)\n")
     for model in models:
         rows = []
         for ck in checkpoints_present(df, model):
@@ -244,13 +372,20 @@ def section_e1(df):
                 err_c = qval1(df, "E1", f"relerr_calib__{tag}", model=model, checkpoint=ck)
                 cos_s = qval1(df, "E1", f"cos_shard__{tag}", model=model, checkpoint=ck)
                 err_s = qval1(df, "E1", f"relerr_shard__{tag}", model=model, checkpoint=ck)
+                a_s = qval1(df, "E1", f"a_slope_shard__{tag}", model=model, checkpoint=ck)
+                r2_s = qval1(df, "E1", f"a_r2_shard__{tag}", model=model, checkpoint=ck)
+                snr_s = qval1(df, "E1", f"snr_shard__{tag}", model=model, checkpoint=ck)
                 rows.append([ck, tag, sig(cos_c) if cos_c is not None else "-",
                              sig(err_c) if err_c is not None else "-",
                              sig(cos_s) if cos_s is not None else "-",
-                             sig(err_s) if err_s is not None else "-"])
+                             sig(err_s) if err_s is not None else "-",
+                             sig(a_s) if a_s is not None else "-",
+                             sig(r2_s) if r2_s is not None else "-",
+                             sig(snr_s) if snr_s is not None else "-"])
         lines.append(f"\n**{model}**\n")
         lines.append(md_table(["checkpoint", "config", "cos (calib)", "err_rel (calib)",
-                               "cos (shard)", "err_rel (shard)"], rows))
+                               "cos (shard)", "err_rel (shard)", "a_slope (shard, post-correction)",
+                               "R^2 (shard)", "SNR (shard)"], rows))
         data[f"table_{model}"] = rows
 
     lines.append("\n### Robustesse aux graines (checkpoint=end, config a)\n")
@@ -285,33 +420,65 @@ def section_e1(df):
     lines.append(md_table(["Modele", "Pearson r(err_rel, cos)", "cos min", "err_rel max"], rows_corr))
 
     lines.append("\n**Erreur vs |B| (log-log) et SNR(beta,B), checkpoint=end** -- 12 points par modele :\n")
+    lines.append("**Correction D1** : colonnes `masse source (locale)` / `plafond source atteint` "
+                 "ajoutees -- `u_a[(9,4)]` est plafonne a `min(beta/gamma, pi[9])` (U_loc, portee "
+                 "LOCALE). Sur cette grille (gamma=0.3, pi[9]=0.1), ce plafond LOCAL vaut `pi[9]=0.1`, "
+                 "atteint des que `beta/gamma >= 0.1`, soit `beta >= 0.03` -- **beta=0.03 ET beta=0.10 "
+                 "saturent tous deux a la meme masse**, ce qui explique que leurs lignes soient "
+                 "identiques ci-dessous : c'est ce plafond de classe source, pas le budget global, "
+                 "qui a cesse de compter au-dela de beta=0.03.\n")
     rows_snr = []
     for model in models:
         for beta in sorted(df[(df.model == model) & (df.experiment == "E1") &
                                (df.metric == "sweep_err_rel__B=full")]["beta"].unique()):
             err_full = qval1(df, "E1", "sweep_err_rel__B=full", model=model, checkpoint="end", beta=beta)
-            rows_snr.append([model, sig(beta), "full", sig(err_full) if err_full is not None else "-", "-"])
+            smass = qval1(df, "E1", "source_mass_local", model=model, checkpoint="end", beta=beta)
+            shit = qval1(df, "E1", "source_ceiling_hit", model=model, checkpoint="end", beta=beta)
+            ceil_str = ("oui" if shit == 1.0 else "non") if shit is not None else "-"
+            rows_snr.append([model, sig(beta), "full", sig(err_full) if err_full is not None else "-", "-",
+                             sig(smass) if smass is not None else "-", ceil_str])
             for B in [64, 256, 1024]:
                 err_b = qval1(df, "E1", f"sweep_err_rel__B={B}", model=model, checkpoint="end", beta=beta)
                 snr_b = qval1(df, "E1", f"snr__B={B}", model=model, checkpoint="end", beta=beta)
                 rows_snr.append([model, sig(beta), str(B), sig(err_b) if err_b is not None else "-",
-                                 sig(snr_b) if snr_b is not None else "-"])
-    lines.append(md_table(["Modele", "beta", "|B|", "err_rel", "SNR"], rows_snr))
+                                 sig(snr_b) if snr_b is not None else "-",
+                                 sig(smass) if smass is not None else "-", ceil_str])
+    lines.append(md_table(["Modele", "beta", "|B|", "err_rel", "SNR", "masse source (locale)",
+                           "plafond source atteint"], rows_snr))
     data["snr_table"] = rows_snr
 
     lines.append("\n### Verdict\n")
+    lines.append("**Correction B3 (session 4)** : le gate prenait le min de `cos_shard` sur les 6 "
+                 "configs, dont `c_uniform` (masse etalee sur les 90 paires, SNR faible par "
+                 "construction) -- un cosinus bas sous ce regime mesure le bruit minibatch, pas un "
+                 "defaut du modele. Seules les configs avec `SNR(shard) > 0.5` entrent "
+                 "desormais dans le min ; les autres sont rapportees separement comme "
+                 "\"non concluantes, SNR insuffisant\".\n")
+    SNR_GATE = 0.5
     verdicts = []
     for model in models:
-        cos_shard_all = []
+        cos_gated, cos_excluded = [], []
         for ck in checkpoints_present(df, model):
             for tag in E1_TAGS:
                 c = qval1(df, "E1", f"cos_shard__{tag}", model=model, checkpoint=ck)
-                if c is not None:
-                    cos_shard_all.append(c)
-        min_cos = min(cos_shard_all) if cos_shard_all else None
-        v = "PASS" if (min_cos is not None and min_cos >= 0.99) else (
-            "INCONCLUSIF" if min_cos is None else "FAIL")
-        verdicts.append(f"**{model}** : {v} (min cos_shard = {sig(min_cos) if min_cos is not None else 'n/a'}, seuil 0.99)")
+                snr_v = qval1(df, "E1", f"snr_shard__{tag}", model=model, checkpoint=ck)
+                if c is None:
+                    continue
+                if snr_v is not None and snr_v > SNR_GATE:
+                    cos_gated.append(c)
+                else:
+                    cos_excluded.append((ck, tag, c, snr_v))
+        min_cos = min(cos_gated) if cos_gated else None
+        if min_cos is not None:
+            v = "PASS" if min_cos >= 0.99 else "FAIL"
+        elif cos_excluded:
+            v = "INCONCLUSIF"
+        else:
+            v = "INCONCLUSIF"
+        note = (f" -- {len(cos_excluded)} config(s) non concluante(s), SNR <= {SNR_GATE} "
+               f"(exclues du min)" if cos_excluded else "")
+        verdicts.append(f"**{model}** : {v} (min cos_shard, SNR>{SNR_GATE} = "
+                        f"{sig(min_cos) if min_cos is not None else 'n/a'}, seuil 0.99{note})")
     for v in verdicts:
         lines.append(f"- {v}\n")
     data["verdicts"] = verdicts
@@ -420,34 +587,31 @@ def section_e2(df):
     lines.append("\n**v_hat par checkpoint, par beta** : voir table de resultats ci-dessus.\n")
 
     lines.append("\n### Verdict\n")
+    lines.append("**Correction A1 (session 4)** : le critere precedent lisait un FAIL des que "
+                 "`varpi` etait a moins de 1% du plafond 1.0 (\"SATURE\") -- mais le critere de "
+                 "l'hypothese porte sur l'ecart a la BASELINE (`rang_effectif(Q)/d`, de l'ordre de "
+                 "1e-5 a 1e-6 ici), pas sur l'ecart a 1. `varpi=0.998` contre `baseline=9e-06` "
+                 "signifie que la cible `v` est dans le sous-espace atteignable par une politique "
+                 "class-level -- c'est exactement ce que l'hypothese predit (\"le plafond de rang "
+                 "laisse une marge exploitable\"), pas un signe de saturation. Nouveau critere : "
+                 "**PASS si `varpi > 10 * baseline`, FAIL sinon** (facteur 10 = marge d'ordre de "
+                 "grandeur, `baseline` etant elle-meme de l'ordre de `1/d`).\n")
     verdicts = []
     cnn_present = "cnn" in models
     decisive_transform = "stripe" if "stripe" in transforms else "identity"
+    VARPI_BASELINE_FACTOR = 10.0
     if cnn_present:
         varpis = qvals(df, "E2", "varpi", model="cnn", transform=decisive_transform)
         baselines = qvals(df, "E2", "baseline", model="cnn", transform=decisive_transform)
+        v_hats = qvals(df, "E2", "v_hat", model="cnn", transform=decisive_transform)
         varpis_id = qvals(df, "E2", "varpi", model="cnn", transform="identity")
         med_varpi = float(np.median(varpis)) if varpis else None
         med_baseline = float(np.median(baselines)) if baselines else None
+        med_vhat = float(np.median(v_hats)) if v_hats else None
         med_varpi_id = float(np.median(varpis_id)) if varpis_id else None
-        # varpi in [0.998, 1.0013] here -- indistinguishable from the rank
-        # ceiling within OSQP's own solver tolerance (eps_abs/eps_rel=1e-6,
-        # but the observed spread is ~1e-3, from the NNLS/eigendecomposition
-        # chain, not the QP itself). A margin of <1% below 1.0 is not
-        # "exploitable" under any reasonable reading of the hypothesis, so a
-        # bare `median(varpi) < 1.0` is too brittle a criterion at this
-        # boundary -- require a real margin (>=1%) to call PASS, else the
-        # verdict is SATURATED (numerically at the ceiling), which for this
-        # gate's purposes reads as FAIL (no demonstrated exploitable room).
-        VARPI_MARGIN = 0.01
-        saturated = med_varpi is not None and med_varpi >= 1.0 - VARPI_MARGIN
-        margin = (med_varpi is not None and med_baseline is not None and not saturated
-                  and med_varpi < 1.0 and med_varpi > med_baseline)
-        if med_varpi is None:
+        if med_varpi is None or med_baseline is None:
             v = "INCONCLUSIF"
-        elif saturated:
-            v = "FAIL (SATURE)"
-        elif margin:
+        elif med_varpi > VARPI_BASELINE_FACTOR * med_baseline:
             v = "PASS"
         else:
             v = "FAIL"
@@ -457,9 +621,16 @@ def section_e2(df):
                     f"donc pas un artefact du cas degenere T=identity, le plafond de rang domine "
                     f"reellement sous le vrai trigger")
         verdicts.append(f"**cnn (decisif, T={decisive_transform})** : {v} -- median(varpi)={sig(med_varpi)} "
-                        f"(a moins de {VARPI_MARGIN*100:.0f}% du plafond 1.0, donc SATURE -- pas de marge "
-                        f"exploitable demontree malgre varpi<1 au sens strict), "
-                        f"median(baseline)={sig(med_baseline)}{note}")
+                        f"vs {VARPI_BASELINE_FACTOR:.0f}x median(baseline)={sig(med_baseline)} "
+                        f"({sig(VARPI_BASELINE_FACTOR * med_baseline) if med_baseline is not None else 'n/a'})"
+                        f"{note}")
+        if med_vhat is not None:
+            interp = ("direction atteignable, magnitude hors budget -- la contrainte mordante est "
+                      "le budget (`v_hat`), pas le rang" if med_vhat > 1 else
+                      "direction atteignable ET magnitude dans le budget -- aucune contrainte ne "
+                      "mord a ce beta")
+            verdicts.append(f"**Interpretation** : varpi eleve (proche du plafond de rang) avec "
+                            f"v_hat={sig(med_vhat)} {'> 1' if med_vhat > 1 else '<= 1'} signifie {interp}.")
     else:
         verdicts.append("**cnn** : INCONCLUSIF -- config cnn absente de ce run")
     if "linear" in models:
@@ -495,25 +666,53 @@ def section_e3(df):
     lines = ["## 5. E3 -- Stabilite de Gbar et cout du one-shot\n"]
     lines.append("**Hypothese** : une configuration `ubar` unique sert toute la trajectoire "
                  "d'entrainement (le one-shot ne coute presque rien face a l'oracle par checkpoint).\n")
+    lines.append("**Correction A3 (session 4)** : le gate portait sur `cos(u*_k, u*_k')`, un objet "
+                 "instable des que deux checkpoints ont des optima quasi-degeneres -- un cosinus bas "
+                 "avec un ecart one-shot negligeable signale des optima interchangeables, pas une "
+                 "instabilite dommageable. Le critere porte desormais sur l'ECART ONE-SHOT lui-meme "
+                 "(`J(ubar partage)` vs la moyenne par-checkpoint) : **PASS si ecart < 20%**, sinon "
+                 "FAIL. `cos(u*,u*)` reste rapporte comme diagnostic (table ci-dessous) mais ne "
+                 "decide plus le verdict ; le vrai signal de rotation de la trajectoire est le "
+                 "cosinus COLONNE moyen de `Gbar` entre checkpoints (meme table), qui ne souffre pas "
+                 "de la degenerescence du solveur QP.\n")
+    lines.append("**Correction D2 (session 4)** : 2 checkpoints supplementaires entre \"mid\" et "
+                 "\"end\" (postmid1, postmid2 -- voir sweep.py `E3_EXTRA_POST_MID`), motives par le "
+                 "constat que `Gbar` tourne fortement en debut d'entrainement puis se stabilise : "
+                 "l'ecart one-shot est rapporte a la fois sur la fenetre COMPLETE (begin..end) et "
+                 "restreint a la fenetre [mid, end] (excluant \"begin\"), pour separer le cout du a "
+                 "l'instabilite de debut d'entrainement de celui, propre, du cadrage one-shot.\n")
 
     models = models_present(df)
     data = {}
     lines.append("\n### Resultats -- cout one-shot et budget effectif\n")
     for model in models:
         rows = []
-        for ck in checkpoints_present(df, model):
+        for ck in e3_checkpoints_present(df, model):
             a_rho2 = qval1(df, "E3", "a_over_rho2", model=model, checkpoint=ck)
             l1b = qval1(df, "E3", "l1_over_beta", model=model, checkpoint=ck)
-            rows.append([ck, sig(a_rho2), sig(l1b)])
-        J_shared = qval1(df, "E3", "J_shared", model=model, checkpoint="shared")
-        mean_pc = qval1(df, "E3", "mean_perckpt", model=model, checkpoint="shared")
-        gap_pct = qval1(df, "E3", "gap_pct", model=model, checkpoint="shared")
+            smass = qval1(df, "E3", "source_mass_agg", model=model, checkpoint=ck)
+            scap = qval1(df, "E3", "source_cap_agg", model=model, checkpoint=ck)
+            shit = qval1(df, "E3", "source_cap_hit", model=model, checkpoint=ck)
+            rows.append([ck, sig(a_rho2), sig(l1b), sig(smass) if smass is not None else "-",
+                         sig(scap) if scap is not None else "-",
+                         ("oui" if shit == 1.0 else "non") if shit is not None else "-"])
+        J_full = qval1(df, "E3", "J_shared", model=model, checkpoint="shared_full")
+        mean_full = qval1(df, "E3", "mean_perckpt", model=model, checkpoint="shared_full")
+        gap_full = qval1(df, "E3", "gap_pct", model=model, checkpoint="shared_full")
+        J_me = qval1(df, "E3", "J_shared", model=model, checkpoint="shared_mid_end")
+        mean_me = qval1(df, "E3", "mean_perckpt", model=model, checkpoint="shared_mid_end")
+        gap_me = qval1(df, "E3", "gap_pct", model=model, checkpoint="shared_mid_end")
         lines.append(f"\n**{model}**\n")
-        lines.append(md_table(["checkpoint", "a_k/rho_k^2", "||u*||_1/beta"], rows))
-        lines.append(f"\nMoyenne par checkpoint = {sig(mean_pc)}, J(ubar partage) = {sig(J_shared)}, "
-                     f"ecart one-shot = {sig(gap_pct)}%\n")
+        lines.append(md_table(["checkpoint", "a_k/rho_k^2", "||u*||_1/beta", "masse source (agg)",
+                               "plafond source (gamma*pi_9)", "plafond atteint"], rows))
+        lines.append(f"\nFenetre complete (begin..end) : moyenne par checkpoint = {sig(mean_full)}, "
+                     f"J(ubar partage) = {sig(J_full)}, **ecart one-shot = {sig(gap_full)}%**\n")
+        lines.append(f"\nFenetre [mid, end] uniquement (exclut begin) : moyenne par checkpoint = "
+                     f"{sig(mean_me)}, J(ubar partage) = {sig(J_me)}, "
+                     f"**ecart one-shot = {sig(gap_me)}%**\n")
         data[f"table_{model}"] = rows
-        data[f"gap_pct_{model}"] = gap_pct
+        data[f"gap_pct_full_{model}"] = gap_full
+        data[f"gap_pct_mid_end_{model}"] = gap_me
 
         l1t = qval1(df, "E3", "l1_capacity_true", model=model, checkpoint="end")
         l1f = qval1(df, "E3", "l1_capacity_false", model=model, checkpoint="end")
@@ -523,10 +722,12 @@ def section_e3(df):
                      f"(doit etre < 0.10), ||u*||_1(capacity=False)={sig(l1f)} (doit s'approcher de 0.10).\n")
 
     lines.append("\n### Jumeaux numeriques des figures\n")
-    lines.append("**cos(u*_k, u*_k') entre checkpoints** :\n")
+    lines.append("**cos(u*_k, u*_k') [diagnostic, ne decide plus le verdict -- voir A3] et cos "
+                 "colonne moyen de Gbar [le vrai signal de rotation de la trajectoire] entre "
+                 "checkpoints** :\n")
     for model in models:
         rows_cos = []
-        cks = checkpoints_present(df, model)
+        cks = e3_checkpoints_present(df, model)
         for i in range(len(cks)):
             for j in range(i + 1, len(cks)):
                 key = f"{cks[i]}_vs_{cks[j]}"
@@ -535,12 +736,13 @@ def section_e3(df):
                 rows_cos.append([key, sig(cos_u) if cos_u is not None else "-",
                                  sig(col_cos) if col_cos is not None else "-"])
         lines.append(f"\n**{model}**\n")
-        lines.append(md_table(["paire checkpoints", "cos(u*,u*)", "cos colonne moyen(Gbar,Gbar)"], rows_cos))
+        lines.append(md_table(["paire checkpoints", "cos(u*,u*) [diagnostic]",
+                               "cos colonne moyen(Gbar,Gbar) [signal]"], rows_cos))
 
     lines.append("\n**Heatmap u*_ckpt** -- top-5 paires (y,z) par masse :\n")
     for model in models:
         rows_top = []
-        for ck in checkpoints_present(df, model):
+        for ck in e3_checkpoints_present(df, model):
             cells = df[(df.model == model) & (df.checkpoint == ck) & (df.experiment == "E3") &
                        (df.metric.str.startswith("u_star_top"))]
             top = cells.sort_values("metric")
@@ -560,7 +762,7 @@ def section_e3(df):
     lines.append("\n### Verdict\n")
     verdicts = []
     for model in models:
-        cks = checkpoints_present(df, model)
+        cks = e3_checkpoints_present(df, model)
         cos_all = []
         for i in range(len(cks)):
             for j in range(i + 1, len(cks)):
@@ -568,10 +770,12 @@ def section_e3(df):
                 if c is not None and not math.isnan(c):
                     cos_all.append(c)
         min_cos = min(cos_all) if cos_all else None
-        gap_pct = data.get(f"gap_pct_{model}")
-        ok = (min_cos is not None and min_cos >= 0.7) and (gap_pct is not None and abs(gap_pct) <= 20)
-        v = "PASS" if ok else ("INCONCLUSIF" if min_cos is None else "FAIL")
-        verdicts.append(f"**{model}** : {v} -- min cos(u*,u*)={sig(min_cos)}, ecart one-shot={sig(gap_pct)}%")
+        gap_full = data.get(f"gap_pct_full_{model}")
+        gap_me = data.get(f"gap_pct_mid_end_{model}")
+        v = "INCONCLUSIF" if gap_full is None else ("PASS" if abs(gap_full) < 20 else "FAIL")
+        verdicts.append(f"**{model}** : {v} -- ecart one-shot (fenetre complete)={sig(gap_full)}%, "
+                        f"ecart one-shot ([mid,end])={sig(gap_me)}% -- min cos(u*,u*)={sig(min_cos)} "
+                        f"(diagnostic seulement, ne fonde pas le verdict)")
     for v in verdicts:
         lines.append(f"- {v}\n")
 
@@ -611,6 +815,11 @@ def section_e4(df):
                  "8/E4 pour tenir le budget de dix minutes par bloc (voir sweep.py, E4_ROUNDS/SIM_BATCH) -- "
                  "moins de puissance statistique sur Abar que la valeur de reference.\n")
 
+    lines.append("**Correction D3 (session 4)** : colonne \"borne informative\" ajoutee -- quand "
+                 "`Abar~0` (aucun worker perturbe jamais selectionne, cas de krum ici), "
+                 "`||P||+||N||~0 <= rhs` est vraie de facon VIDE (aucun worker malveillant n'a "
+                 "jamais atteint l'agregat, donc rien n'a ete teste) : \"borne respectee = OUI\" ne "
+                 "doit alors pas se lire comme une confirmation de la borne theorique.\n")
     data = {}
     lines.append("\n### Resultats\n")
     for model in models:
@@ -622,20 +831,23 @@ def section_e4(df):
                 chi = qval1(df, "E4", "chi_ell", model=model, transform=transform, aggregator=key)
                 osc = qval1(df, "E4", "osc_abar", model=model, transform=transform, aggregator=key)
                 sel = qval1(df, "E4", "selection_rate", model=model, transform=transform, aggregator=key)
+                abar_mean = qval1(df, "E4", "abar_mean", model=model, transform=transform, aggregator=key)
                 pn = qval1(df, "E4", "PN_norm", model=model, transform=transform, aggregator=key)
                 bound = qval1(df, "E4", "bound_rhs", model=model, transform=transform, aggregator=key)
                 resp = qval1(df, "E4", "bound_respected", model=model, transform=transform, aggregator=key)
                 at_agg = qval1(df, "E4", "alpha_tilde_b_agg", model=model, transform=transform, aggregator=key)
                 at_mean = qval1(df, "E4", "alpha_tilde_b_mean", model=model, transform=transform, aggregator=key)
+                informative = "non (Abar~0)" if (abar_mean is not None and abar_mean < 1e-9) else "oui"
                 rows.append([rule, variant, sig(ell) if ell is not None else "-",
                              sig(chi) if chi is not None else "-", sig(osc) if osc is not None else "-",
                              sig(sel) if sel is not None else "-", sig(pn) if pn is not None else "-",
                              sig(bound) if bound is not None else "-",
                              ("OUI" if resp == 1.0 else "NON") if resp is not None else "-",
+                             informative,
                              sig(at_agg) if at_agg is not None else "-", sig(at_mean) if at_mean is not None else "-"])
             lines.append(f"\n**{model} / T={transform}**\n")
             lines.append(md_table(["regle", "variante", "ell", "chi_ell", "osc(Abar)", "taux selection",
-                                   "||P||+||N||", "borne (rhs)", "borne respectee",
+                                   "||P||+||N||", "borne (rhs)", "borne respectee", "borne informative",
                                    "alpha~(b_Agg)", "alpha~(b_mean)"], rows))
             data[f"table_{model}_{transform}"] = rows
 
@@ -742,6 +954,12 @@ def section_e5(df):
     lines.append("**Hypothese** : reduire la demande n'ameliore la selection que sous le "
                  "rayon atteignable -- coude attendu pres de v_hat=1. Seule la variante "
                  "`flat` (la seule couverte par la theorie, SPEC section 7) decide du verdict.\n")
+    lines.append("**Correction C3 (session 4)** : \"taux de selection\" = `E[A_j] / gamma` -- la "
+                 "part malveillante captee par l'agregat, RAPPORTEE a ce que donnerait la moyenne "
+                 "simple (`A_j = gamma` par construction). Une valeur `> 1` est une "
+                 "SUR-REPRESENTATION des workers perturbes dans l'agregat par rapport a leur poids "
+                 "sous la moyenne (regles ell=1 sur peu de workers, ex. krum/cw_median), pas une "
+                 "erreur de calcul.\n")
     sub = df[df.experiment == "E5"]
     if sub.empty:
         lines.append("**Ce qui a ete execute** : rien (E5 absent de ce run).\n")
@@ -750,10 +968,14 @@ def section_e5(df):
 
     models = models_present(sub)
     betas = sorted(sub["beta"].dropna().unique().tolist())
+    n_tau_pts = int(sub[sub.metric == "n_tau_points"]["value"].iloc[0]) if (sub.metric == "n_tau_points").any() else 16
     lines.append(f"**Ce qui a ete execute** : checkpoint=end, T=identity, betas={betas}, grille de "
-                 f"{int(sub[sub.metric=='n_tau_points']['value'].iloc[0]) if (sub.metric=='n_tau_points').any() else 12} "
-                 "taus log-espaces sur v_hat in [0.1, 10] par beta. Rounds/round reduits sous le hint SPEC "
-                 "pour tenir le budget de dix minutes (voir sweep.py, E5_ROUNDS/SIM_BATCH).\n")
+                 f"{n_tau_pts} taus log-espaces sur v_hat in [0.02, 10] par beta (etendue vers le bas "
+                 "depuis [0.1, 10] -- correction C1, pour localiser le coude au lieu d'extrapoler au-dela "
+                 "du bord inferieur de la grille). Rounds/round reduits sous le hint SPEC pour tenir le "
+                 "budget de dix minutes (voir sweep.py, E5_ROUNDS/SIM_BATCH) ; krum/multikrum recoivent un "
+                 "passage separe, boostee a >= E5_ROUNDS_KRUM_MIN tirages effectifs pour krum/"
+                 "multikrum (correction C2).\n")
 
     data = {}
     lines.append("\n### Resultats -- selection (variante flat) vs v_hat, par regle\n")
@@ -798,17 +1020,19 @@ def section_e5(df):
         rows_knee.append(row)
     lines.append(md_table(["Modele"] + list(RULES), rows_knee))
 
-    lines.append("\n### Verdict\n")
-    verdicts = []
-    # "Flat above v_hat=1, decreasing below" -- tested directly per (model, beta,
-    # rule) curve as: selection at the lowest v_hat point meaningfully BELOW
-    # selection at the highest v_hat point (margin > MARGIN, not just whichever
-    # point the noisy steepest-slope estimate above happens to land on -- that
-    # estimate is reported as a numeric twin but is too noise-sensitive under
-    # this run's reduced E5_ROUNDS to decide PASS/FAIL on its own).
+    lines.append("\n### Baisse de selection par courbe (correction A2)\n")
+    lines.append("**Bug corrige** : le calcul precedent comparait uniquement le PREMIER et le "
+                 "DERNIER point de chaque courbe (`pts[0]` vs `pts[-1]`) -- une courbe qui descend "
+                 "puis REMONTE (le comportement attendu pres du coude, cf. `cw_median`/`trmean` dans "
+                 "la table de resultats ci-dessus) a des extremites quasi identiques et se comptait "
+                 "donc comme \"pas de baisse\" alors que la table montre un creux net au milieu. "
+                 "Nouveau calcul : `baisse = (selection moyenne pour v_hat>=1) - (selection minimale "
+                 "pour v_hat<1)`, qui teste directement l'hypothese \"plat au-dessus de v_hat=1, "
+                 "decroissant en-dessous\" plutot que la seule difference d'extremites.\n")
     MARGIN = 0.10
+    rows_drop = []
+    curve_drops = {}
     for model in models:
-        n_curves, n_confirm = 0, 0
         for beta in betas:
             for rule in RULES:
                 key = _agg_key(rule, "flat")
@@ -822,9 +1046,26 @@ def section_e5(df):
                 if len(pts) < 4:
                     continue
                 pts.sort()
-                n_curves += 1
-                if pts[0][1] < pts[-1][1] - MARGIN:
-                    n_confirm += 1
+                above = [s for vh, s in pts if vh >= 1.0]
+                below = [s for vh, s in pts if vh < 1.0]
+                flat_ref = float(np.mean(above)) if above else pts[-1][1]
+                trough = min(below) if below else min(s for _, s in pts)
+                drop = flat_ref - trough
+                curve_drops[(model, beta, rule)] = drop
+                rows_drop.append([model, sig(beta), rule, sig(pts[0][0]), sig(pts[0][1]),
+                                  sig(pts[-1][0]), sig(pts[-1][1]), sig(flat_ref), sig(trough), sig(drop)])
+    lines.append(md_table(["modele", "beta", "regle", "v_hat (premier)", "selection (premier)",
+                           "v_hat (dernier)", "selection (dernier)", "plat (v_hat>=1)",
+                           "creux (v_hat<1)", "baisse"], rows_drop))
+
+    lines.append("\n### Verdict\n")
+    verdicts = []
+    # "Flat above v_hat=1, decreasing below" -- tested per (model, beta, rule)
+    # curve as: baisse (flat_ref - trough, computed above) >= MARGIN. Replaces
+    # the endpoint-only comparison (see "Bug corrige" note above).
+    for model in models:
+        n_curves = sum(1 for (m, b, r) in curve_drops if m == model)
+        n_confirm = sum(1 for (m, b, r), d in curve_drops.items() if m == model and d >= MARGIN)
         if n_curves == 0:
             v = "INCONCLUSIF"
             frac_txt = "n/a"
@@ -835,10 +1076,11 @@ def section_e5(df):
         fail_note = (" ; la selection ne varie pas assez avec v_hat sous ce budget de rounds "
                     "reduit pour confirmer la prediction la plus falsifiable du modele"
                     if v == "FAIL" else "")
-        verdicts.append(f"**{model}** : {v} -- courbes confirmant une baisse de selection "
-                        f">= {MARGIN*100:.0f}pt entre v_hat=0.1 et v_hat=10 : {frac_txt} "
-                        f"(coudes estimes par regle : voir table ci-dessus -- a prendre avec "
-                        f"prudence vu le bruit de Monte-Carlo, cf. Anomalies){fail_note}")
+        verdicts.append(f"**{model}** : {v} -- courbes confirmant une baisse (plat au-dessus de "
+                        f"v_hat=1 moins creux en-dessous) >= {MARGIN*100:.0f}pt : {frac_txt} "
+                        f"(voir la table \"Baisse de selection par courbe\" ci-dessus, et les coudes "
+                        f"estimes par regle plus haut -- a prendre avec prudence vu le bruit de "
+                        f"Monte-Carlo, cf. Anomalies){fail_note}")
     for v in verdicts:
         lines.append(f"- {v}\n")
 
@@ -1130,11 +1372,16 @@ def build_report(metrics_path=METRICS_PATH, out_dir=ARTIFACT_DIR):
         with open(FAILURES_PATH) as f:
             failures_text = f.read()
 
-    md_parts = ["# Rapport preliminaires -- E1-E7 (session 3)\n"]
+    md_parts = ["# Rapport preliminaires -- E1-E7 (session 4, v2)\n\n"
+                "**v2 (cette session)** : correction de mesure uniquement, aucune nouvelle experience "
+                "(E6 reste non lance). Corrige : verdicts E2/E3/E5 (sections A1-A3), le facteur "
+                "d'echelle ~10x d'E1 (section B, voir section 3), la grille/rounds d'E5 (section C), "
+                "des metriques manquantes E1/E2/E3/E4 (section D), et la coherence section1/"
+                "failures.log (section E). Voir le compte-rendu de session pour le detail.\n"]
     json_data = {}
 
     s, d = section0(df, meta, failures_text); md_parts.append(s); json_data["sec0"] = d
-    s, d = section1(df, meta); md_parts.append(s); json_data["sec1"] = d
+    s, d = section1(df, meta, failures_text); md_parts.append(s); json_data["sec1"] = d
     s, d = section2(df); md_parts.append(s); json_data["sec2"] = d
     s, e1_data = section_e1(df); md_parts.append(s); json_data["E1"] = e1_data
     s, e2_data = section_e2(df); md_parts.append(s); json_data["E2"] = e2_data

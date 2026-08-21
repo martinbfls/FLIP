@@ -110,6 +110,15 @@ BATCH_SIZES_SNR = [64, 256, 1024]
 N_MB_DRAWS = 6
 GAMMA = N_P[0] / N_B
 
+# Session correction D2: E3 gets 2 extra checkpoints between "mid" and "end"
+# (5 total: begin, mid, postmid1, postmid2, end) to localize where Gbar
+# stabilizes -- E1/E2 stay on the 3-checkpoint CHECKPOINTS grid above
+# (unchanged budget/scope, per SPEC section 9). See
+# prelim_lib.train_clean_checkpoints's extra_post_mid.
+E3_EXTRA_POST_MID = 2
+E3_CHECKPOINTS = ["begin", "mid"] + [f"postmid{i}" for i in range(1, E3_EXTRA_POST_MID + 1)] + ["end"]
+E3_MID_END_WINDOW = ["mid"] + [f"postmid{i}" for i in range(1, E3_EXTRA_POST_MID + 1)] + ["end"]
+
 TRAIN_DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 EVAL_DEVICE = torch.device("cpu")
 
@@ -152,7 +161,7 @@ def _log_failure(model, seed, checkpoint, stage):
 # --------------------------------------------------------------------------#
 def _train_or_load(model_name, cfg, seed, resume):
     tag = model_name
-    paths = {k: os.path.join(CKPT_DIR, f"{tag}_{k}.pt") for k in ("begin", "mid", "end")}
+    paths = {k: os.path.join(CKPT_DIR, f"{tag}_{k}.pt") for k in E3_CHECKPOINTS}
     if resume and all(os.path.exists(p) for p in paths.values()):
         return paths
     torch.manual_seed(seed)
@@ -161,6 +170,7 @@ def _train_or_load(model_name, cfg, seed, resume):
         model_init, DATASET_FLAG, N_CLASSES, TRAIN_DEVICE,
         epochs=cfg["epochs"], batch_size=cfg["batch_size"],
         ckpt_dir=CKPT_DIR, tag=tag, test_pct=0.1, seed=seed, max_train=cfg["max_train"],
+        extra_post_mid=E3_EXTRA_POST_MID,
     )
 
 
@@ -270,15 +280,64 @@ def build_u_configs(pi, gamma, beta, y_source, y_target, pairs, Q, c_qp, seed):
     return configs
 
 
+def _slope_and_r2(diff, ref):
+    """
+    Session correction B1: a = <diff, ref> / ||ref||^2, the least-squares
+    scalar slope of `diff` against `ref` (diff ~= a*ref), plus the R^2 of
+    that one-parameter fit. Used by E1 to test whether (g_emp - grad_c) is a
+    clean multiple of the predicted shift: a far from 1 together with R^2
+    close to 1 is a multiplicative scale bug, not estimation noise (see
+    report section 3, "Diagnostic du facteur d'echelle").
+    """
+    ref_n2 = float(ref @ ref)
+    if ref_n2 <= 1e-20:
+        return float("nan"), float("nan")
+    a = float(diff @ ref) / ref_n2
+    resid = diff - a * ref
+    diff_n2 = float(diff @ diff)
+    r2 = 1.0 - float(resid @ resid) / diff_n2 if diff_n2 > 1e-20 else float("nan")
+    return a, r2
+
+
 # --------------------------------------------------------------------------#
 # E1 main table (6 configs x checkpoint, SEEDS[0])
 # --------------------------------------------------------------------------#
 def _run_e1_main(model_name, checkpoint, seed, raw_dataset, all_targets, entry, rows, done_pairs):
+    """
+    Session correction B2 (scale-factor bug, see report section 3): Gbar's
+    columns are pi[y]-weighted -- Gbar[:, (y,z)] = pi[y]*(g[y][z]-g[y][y]),
+    verbatim from modules.federated_optimizing_trigger.utils.
+    compute_expected_flip_gradients, never touched here. u_real, as realized
+    by flip_masses_to_labels, is a MASS FRACTION of the worker's own held
+    examples (SPEC section 2's own u definition, and the U_loc/U_beta
+    per-class caps, both pi[y]-bounded -- e.g. config "a" below caps at
+    exactly pi[y_source], meaning "every class-y_source example in the
+    shard", which only makes sense as a mass fraction). Combining a
+    pi[y]-weighted Gbar directly with a mass-fraction u double-counts
+    pi[y]: for a worker whose true class-y population matches pi[y] (iid
+    sharding), the exact empirical shift from flipping a u[y,z] mass
+    fraction is u[y,z]*(g[y][z]-g[y][y]) -- NO extra pi[y] factor -- so the
+    correct contraction is Gbar @ (u_real / pi_vec), not Gbar @ u_real.
+    Verified against the pre-fix numbers (report v1): err_rel(shard) ~ 9
+    with cos ~ 1 everywhere, for EVERY tag/checkpoint/model, which is
+    exactly |a-1| for a slope a = <g_emp-grad_c, Gbar@u_real>/||Gbar@u_real||^2
+    ~= 1/pi[y_source] = 1/0.1 = 10 on balanced CIFAR-10 -- constant because
+    every class has the same pi[y]=0.1, not a coincidence of any one config.
+    solve_qp's own Q/c (asserted against the repo's project_gradient
+    verbatim in the assertions section) are NOT touched by this fix -- only
+    the empirical-prediction contraction here and in
+    _run_e1_seed_and_snr. Whether the SAME mismatch also affects the
+    QP-solved attack deployments used by E3/E4/E5/E7 (which target v via
+    Gbar @ u* with the same pi-weighted Gbar) is a separate, larger question
+    this session does not resolve -- see the report's "Diagnostic du
+    facteur d'echelle" note.
+    """
     m = entry["model"]
     Gbar, grad_c, pi, pairs, Q = entry["Gbar"], entry["grad_c"], entry["pi"], entry["pairs"], entry["Q"]
     v = E1_BETA * (entry["grad_bd"]["identity"] - grad_c)
     c_qp = (Gbar.T @ v).numpy().astype(np.float64)
     configs = build_u_configs(pi, GAMMA, E1_BETA, Y_SOURCE, Y_TARGET, pairs, Q, c_qp, seed=seed)
+    pi_vec = torch.tensor([pi[y] for (y, z) in pairs], dtype=torch.float32)
 
     shard_idx_list = pl.shard_indices(raw_dataset, N_B, seed=seed)
     worker_shard = shard_idx_list[0]
@@ -295,38 +354,60 @@ def _run_e1_main(model_name, checkpoint, seed, raw_dataset, all_targets, entry, 
         shard_samples_raw[int(y)] = xs
     Gbar_s, grad_c_s, pi_s, pairs_s, col_s, Q_s = pl.class_conditional_shifts(
         m, shard_samples_raw, DATASET_FLAG, N_CLASSES, EVAL_DEVICE, loss_fn=pl.clf_loss, model_flag=None)
+    pi_vec_s = torch.tensor([pi_s[y] for (y, z) in pairs_s], dtype=torch.float32)
 
     for tag, u in configs.items():
         rng = np.random.RandomState(seed)
         poisoned_targets, u_real = pl.flip_masses_to_labels(shard_true_targets, u, pairs, rng)
         u_real_vec = torch.tensor([u_real[p] for p in pairs], dtype=torch.float32)
-        Gbar_u = Gbar @ u_real_vec
+        Gbar_u = Gbar @ (u_real_vec / pi_vec)
         pred = grad_c + Gbar_u
         g_emp = pl.worker_gradient(m, pl.clf_loss, raw_dataset, worker_shard, poisoned_targets,
                                     DATASET_FLAG, None, batch_size=1024, device=EVAL_DEVICE)
         err_rel = float((g_emp - pred).norm() / (Gbar_u.norm() + 1e-12))
         cos = float(torch.nn.functional.cosine_similarity(
             (g_emp - grad_c).unsqueeze(0), Gbar_u.unsqueeze(0)).item())
+        a_calib, r2_calib = _slope_and_r2(g_emp - grad_c, Gbar_u)
         _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"relerr_calib__{tag}", err_rel)
         _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"cos_calib__{tag}", cos)
+        _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"a_slope_calib__{tag}", a_calib)
+        _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"a_r2_calib__{tag}", r2_calib)
 
         u_real_vec_s = torch.tensor([u_real.get(p, 0.0) for p in pairs_s], dtype=torch.float32)
-        Gbar_u_s = Gbar_s @ u_real_vec_s
+        Gbar_u_s = Gbar_s @ (u_real_vec_s / pi_vec_s)
         pred_s = grad_c_s + Gbar_u_s
         err_rel_s = float((g_emp - pred_s).norm() / (Gbar_u_s.norm() + 1e-12))
         cos_s = float(torch.nn.functional.cosine_similarity(
             (g_emp - grad_c_s).unsqueeze(0), Gbar_u_s.unsqueeze(0)).item())
+        a_shard, r2_shard = _slope_and_r2(g_emp - grad_c_s, Gbar_u_s)
         _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"relerr_shard__{tag}", err_rel_s)
         _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"cos_shard__{tag}", cos_s)
+        _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"a_slope_shard__{tag}", a_shard)
+        _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"a_r2_shard__{tag}", r2_shard)
 
-        # Only pairs with >= 1 expected flip: below that, round() legitimately produces
-        # a 0-vs-nonzero mismatch with relative gap up to 100% by construction (see
-        # flip_masses_to_labels's docstring) -- that's the rounding effect E1 measures,
-        # not a defect, and including sub-1-flip requests would make this assertion
-        # meaningless (dominated by denominators near zero).
+        # Session correction B3: per-config SNR, so the E1 gate can exclude
+        # configs whose mass is too thin to be distinguishable from
+        # minibatch noise (c_uniform especially, spread over all 90 pairs --
+        # see report section 3) instead of letting them silently drag down
+        # the min-cos gate. One batch size (256) at N_MB_DRAWS draws, cheap
+        # relative to the full-shard worker_gradient call already paid above.
+        snr_samples = pl.minibatch_gradient_samples(
+            m, pl.clf_loss, raw_dataset, worker_shard, poisoned_targets,
+            batch_size=256, n_draws=N_MB_DRAWS, dataset_flag=DATASET_FLAG,
+            model_flag=None, device=EVAL_DEVICE, seed=seed)
+        snr_val = pl.snr(Gbar_u_s, snr_samples)
+        _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity", "E1", f"snr_shard__{tag}", snr_val)
+
+        # Session correction B4: only pairs with >= 10 expected flips (not >= 1)
+        # enter the realized-vs-requested mass gap -- below 10, round()'s
+        # integer-count noise dominates the relative gap by construction (the
+        # single-example rounding on a ~1-flip request alone can swing the
+        # ratio by ~100%), which is exactly what produced the earlier,
+        # misleading FAIL on this assertion (traced to c_uniform's ~90-way
+        # split leaving well under 10 expected flips per pair).
         n_shard = len(shard_true_targets)
         gaps = [abs(u_real.get(p, 0.0) - float(u.get(p, 0.0))) / float(u[p])
-                for p in pairs if float(u.get(p, 0.0)) * n_shard >= 1.0]
+                for p in pairs if float(u.get(p, 0.0)) * n_shard >= 10.0]
         if gaps:
             _record(rows, done_pairs, model_name, seed, checkpoint, E1_BETA, "identity",
                      "assertions", f"flip_mass_gap_rel_max__{tag}", max(gaps))
@@ -337,8 +418,11 @@ def _run_e1_main(model_name, checkpoint, seed, raw_dataset, all_targets, entry, 
 # (checkpoint=end, SEEDS[0], all BETAS x BATCH_SIZES_SNR)
 # --------------------------------------------------------------------------#
 def _run_e1_seed_and_snr(model_name, entry_end, raw_dataset, all_targets, seeds, betas, rows, done_pairs):
+    """See _run_e1_main's docstring for the B2 pi[y]-scale correction applied
+    to Gbar_u below (Gbar @ (u_real/pi_vec), not Gbar @ u_real)."""
     m = entry_end["model"]
     Gbar, grad_c, pairs, pi = entry_end["Gbar"], entry_end["grad_c"], entry_end["pairs"], entry_end["pi"]
+    pi_vec = torch.tensor([pi[y] for (y, z) in pairs], dtype=torch.float32)
 
     for seed in seeds:
         shards = pl.shard_indices(raw_dataset, N_B, seed=seed)
@@ -349,7 +433,7 @@ def _run_e1_seed_and_snr(model_name, entry_end, raw_dataset, all_targets, seeds,
         rng = np.random.RandomState(seed)
         poisoned_targets, u_real = pl.flip_masses_to_labels(shard_true_targets, u_a, pairs, rng)
         u_real_vec = torch.tensor([u_real[p] for p in pairs], dtype=torch.float32)
-        Gbar_u = Gbar @ u_real_vec
+        Gbar_u = Gbar @ (u_real_vec / pi_vec)
         pred = grad_c + Gbar_u
         g_emp = pl.worker_gradient(m, pl.clf_loss, raw_dataset, worker_shard, poisoned_targets,
                                     DATASET_FLAG, None, batch_size=1024, device=EVAL_DEVICE)
@@ -368,8 +452,24 @@ def _run_e1_seed_and_snr(model_name, entry_end, raw_dataset, all_targets, seeds,
         rng = np.random.RandomState(seeds[0])
         poisoned_targets, u_real = pl.flip_masses_to_labels(shard_true_targets, u_a, pairs, rng)
         u_real_vec = torch.tensor([u_real[p] for p in pairs], dtype=torch.float32)
-        Gbar_u = Gbar @ u_real_vec
+        Gbar_u = Gbar @ (u_real_vec / pi_vec)
         pred = grad_c + Gbar_u
+
+        # Session correction D1: this loop's u_a is capped at min(beta/gamma,
+        # pi[Y_SOURCE]) -- a LOCAL (per-worker) ceiling, hit whenever
+        # beta/gamma >= pi[Y_SOURCE], i.e. beta >= gamma*pi[Y_SOURCE]. On this
+        # session's grid (gamma=0.3, pi[Y_SOURCE]=0.1) that ceiling is
+        # gamma*pi[Y_SOURCE]=0.03, exactly beta=0.03 -- so beta=0.03 AND
+        # beta=0.10 both saturate u_a at pi[Y_SOURCE] and realize the SAME
+        # mass, which is why every downstream number in this beta's row is
+        # identical to beta=0.03's row below: it is the source-class ceiling,
+        # not the global budget, that stopped mattering above beta=0.03.
+        source_mass = float(u_real.get((Y_SOURCE, Y_TARGET), 0.0))
+        ceiling_hit = 1.0 if source_mass >= pi[Y_SOURCE] - 1e-9 else 0.0
+        _record(rows, done_pairs, model_name, seeds[0], "end", beta, "identity", "E1",
+                "source_mass_local", source_mass)
+        _record(rows, done_pairs, model_name, seeds[0], "end", beta, "identity", "E1",
+                "source_ceiling_hit", ceiling_hit)
 
         g_full = pl.worker_gradient(m, pl.clf_loss, raw_dataset, worker_shard, poisoned_targets,
                                      DATASET_FLAG, None, batch_size=2048, device=EVAL_DEVICE)
@@ -482,6 +582,20 @@ def _run_e3_per_checkpoint(model_name, checkpoint, entry, rows, done_pairs):
     _record(rows, done_pairs, model_name, None, checkpoint, E1_BETA, "identity", "E3", "l1_u_star", l1)
     _record(rows, done_pairs, model_name, None, checkpoint, E1_BETA, "identity", "E3", "l1_over_beta", l1 / E1_BETA)
 
+    # Session correction D1: mass the AGGREGATE solve allocates to the source
+    # class, sum_z u*[Y_SOURCE, z], against its own per-class ceiling
+    # gamma*pi[Y_SOURCE] (U_beta's cap, SPEC section 2) -- this ceiling, not
+    # the global budget beta, is what makes beta=0.03 and beta=0.10 solve to
+    # the identical mass in E1's SNR table once beta/gamma >= pi[Y_SOURCE].
+    source_mass_agg = float(sum(u_np[i] for i, (y, z) in enumerate(pairs) if y == Y_SOURCE))
+    source_cap_agg = GAMMA * pi[Y_SOURCE]
+    _record(rows, done_pairs, model_name, None, checkpoint, E1_BETA, "identity", "E3",
+            "source_mass_agg", source_mass_agg)
+    _record(rows, done_pairs, model_name, None, checkpoint, E1_BETA, "identity", "E3",
+            "source_cap_agg", source_cap_agg)
+    _record(rows, done_pairs, model_name, None, checkpoint, E1_BETA, "identity", "E3",
+            "source_cap_hit", 1.0 if source_mass_agg >= source_cap_agg - 1e-9 else 0.0)
+
     # Numeric twin of the u*_ckpt heatmap figure: top-5 (y,z) pairs by mass.
     top5 = sorted(zip(pairs, u_np), key=lambda t: -t[1])[:5]
     for rank, ((y, z), mass) in enumerate(top5, start=1):
@@ -497,7 +611,17 @@ def _run_e3_per_checkpoint(model_name, checkpoint, entry, rows, done_pairs):
         _record(rows, done_pairs, model_name, None, checkpoint, E1_BETA, "identity", "E3", "s_beta_check", s_beta_check)
 
 
-def _run_e3_shared(model_name, checkpoints, cache, rows, done_pairs):
+def _run_e3_shared(model_name, checkpoints, cache, rows, done_pairs, tag="shared"):
+    """
+    Fits one shared `ubar` over `checkpoints` and reports its one-shot cost.
+    Session correction D2: called twice by run_all -- once over the FULL
+    checkpoint window (tag="shared_full") and once restricted to
+    [mid, end] (tag="shared_mid_end", excluding "begin", where Gbar rotates
+    fastest and is least representative of the trained model this attack
+    would actually be deployed against) -- so the report can show whether
+    the one-shot gap is dominated by the early-training instability or is a
+    genuine cost of the single-configuration framing.
+    """
     mu, Q_sum, c_sum = {}, None, None
     for ck in checkpoints:
         entry = cache[ck]
@@ -523,9 +647,9 @@ def _run_e3_shared(model_name, checkpoints, cache, rows, done_pairs):
     mean_perckpt = float(np.mean([cache[ck]["a_over_rho2"] for ck in checkpoints]))
     gap = J_shared - mean_perckpt
     gap_pct = gap / mean_perckpt * 100 if mean_perckpt != 0 else float("nan")
-    _record(rows, done_pairs, model_name, None, "shared", E1_BETA, "identity", "E3", "J_shared", J_shared)
-    _record(rows, done_pairs, model_name, None, "shared", E1_BETA, "identity", "E3", "gap_pct", gap_pct)
-    _record(rows, done_pairs, model_name, None, "shared", E1_BETA, "identity", "E3", "mean_perckpt", mean_perckpt)
+    _record(rows, done_pairs, model_name, None, tag, E1_BETA, "identity", "E3", "J_shared", J_shared)
+    _record(rows, done_pairs, model_name, None, tag, E1_BETA, "identity", "E3", "gap_pct", gap_pct)
+    _record(rows, done_pairs, model_name, None, tag, E1_BETA, "identity", "E3", "mean_perckpt", mean_perckpt)
 
     for n1, n2 in itertools.combinations(checkpoints, 2):
         u1, u2 = cache[n1]["u_star"].numpy(), cache[n2]["u_star"].numpy()
@@ -639,7 +763,29 @@ E5_N_TAU = 12            # 12-point log grid on v_hat in [0.1, 10]
 # evidence rather than recomputed).
 E5_ROUNDS_REF = 50
 E5_SIM_BATCH_REF = 64
-E5_VHAT_RANGE = (0.1, 10.0)
+# Session correction C1: widened downward from (0.1, 10.0)/12 points -- the
+# earlier grid never sampled below v_hat=0.1, but the knee estimates it DID
+# produce (session report v1, section 7) cluster around v_hat~0.15-0.35, i.e.
+# close to the grid's own lower edge. 16 points on [0.02, 10] gives 4 more
+# points below the old floor to actually localize the knee instead of
+# extrapolating past the edge of the sampled range.
+E5_VHAT_RANGE = (0.02, 10.0)
+E5_N_TAU = 16            # 16-point log grid on v_hat in [0.02, 10]
+# Session correction C2: krum/multikrum are kind="global" selections (SPEC
+# section 7) -- one set for the WHOLE gradient vector per round, so a round
+# is the unit of effective statistical draws for A_j on these two rules
+# specifically (unlike cw_median/trmean, which get ~d correlated-but-
+# informative draws per round from their per-coordinate selection, and stay
+# on the base E5_ROUNDS(_REF) budget per this session's instructions). The
+# earlier report's 0.556 (=5/9) and 1.111 (=10/9) selection-rate fractions
+# are exactly what a single-digit effective-round count looks like. Boosted
+# to >= 200 draws for krum/multikrum ONLY, at SIM_BATCH (not the heavier
+# E5_SIM_BATCH_REF) to bound the added cost, and only at beta=E1_BETA (same
+# asymmetric pattern as E5_ROUNDS_REF above) -- see _run_e5. This is still a
+# real, possibly large, addition to E5's cnn runtime: check the printed
+# [run_all] timing on the first cluster run and lower E5_ROUNDS_KRUM_MIN if
+# it blows the ten-minutes/block budget of SPEC section 1.
+E5_ROUNDS_KRUM_MIN = 200
 N_P_E7 = [2, 3, 5]
 COORD_SUBSAMPLE = 20000  # coordinates kept for the coordinate-wise E5 statistics
 DECILES = list(range(0, 101, 10))
@@ -881,8 +1027,23 @@ def _run_e5(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_datas
     for vhat_target in targets:
         tau = float(vhat_target * rho / v_norm)
         plan = _deploy_plan(entry, beta, transform, n_p, seed, raw_dataset, all_targets, tau=tau)
+        base_rules = [r for r in AGGREGATORS if r not in ("krum", "multikrum")]
         sim = _simulate(m, plan, raw_dataset, blocks, n_rounds, batch_size, seed,
-                        AGGREGATORS, pl.AGG_VARIANTS)
+                        base_rules, pl.AGG_VARIANTS)
+        # Session correction C2: krum/multikrum get their own, separately
+        # boosted simulate() pass (>= E5_ROUNDS_KRUM_MIN effective rounds) --
+        # see E5_ROUNDS_KRUM_MIN's docstring above. `sim` and `sim_krum` are
+        # two independent Monte-Carlo draws (different round counts), each
+        # internally consistent (both carry their own g_std/mean_bar), so
+        # picking one or the other per rule below is safe.
+        krum_rounds = max(n_rounds, E5_ROUNDS_KRUM_MIN)
+        sim_krum = (
+            _simulate(m, plan, raw_dataset, blocks, krum_rounds, SIM_BATCH, seed,
+                      ["krum", "multikrum"], pl.AGG_VARIANTS)
+            if krum_rounds > n_rounds else
+            _simulate(m, plan, raw_dataset, blocks, n_rounds, batch_size, seed,
+                      ["krum", "multikrum"], pl.AGG_VARIANTS)
+        )
 
         # P_k(v): the reachable part of the demanded deviation at this tau, i.e.
         # the image of the QP solution. SPEC names ||P_k(v)|| without defining it;
@@ -922,9 +1083,10 @@ def _run_e5(model_name, checkpoint, seed, beta, transform, n_p, entry, raw_datas
             return out
 
         for rule in AGGREGATORS:
+            sim_for_rule = sim_krum if rule in ("krum", "multikrum") else sim
             for variant in pl.AGG_VARIANTS:
                 _record_deploy_metrics(rows, done_pairs, "E5", model_name, seed, checkpoint,
-                                       beta, transform, n_p, tau, plan, entry, sim,
+                                       beta, transform, n_p, tau, plan, entry, sim_for_rule,
                                        rule, variant, extra_coord=extra)
         _record(rows, done_pairs, model_name, seed, checkpoint, beta, transform, "E5",
                 "v_hat", float(vhat_target), n_p=n_p, tau=tau)
@@ -1268,14 +1430,49 @@ def run_all(models=None, seeds=None, checkpoints=None, betas=None, transforms=No
 
             _flush_csv(rows)
 
+        # Session correction D2: the postmid1/postmid2 checkpoints exist ONLY
+        # for E3's finer post-mid resolution (see E3_CHECKPOINTS above) --
+        # E1/E2 above stay on the original 3-checkpoint `checkpoints` grid.
+        # Loads each entry (Gbar/grad_c/grad_bd) and runs E3's own
+        # per-checkpoint solve, nothing else.
+        for checkpoint in E3_CHECKPOINTS:
+            if checkpoint in checkpoints:
+                continue  # already handled (or cached) by the loop above
+            cid_e3_extra = _cid(model_name, None, checkpoint, E1_BETA, "identity", "E3")
+            try:
+                entry = _get_entry(model_name, checkpoint, cfg, ckpt_paths, class_samples_raw, pi,
+                                    transforms, cache, cache_gbar, timing)
+            except Exception:
+                _log_failure(model_name, None, checkpoint, "entry load (E3 postmid)")
+                counts["failed"] += 1
+                failed_cells.append(dict(model=model_name, seed="*", checkpoint=checkpoint,
+                                          reason="entry load failed (E3 postmid) -- see failures.log"))
+                continue
+            if cid_e3_extra in done_cids:
+                counts["cached"] += 1
+                continue
+            try:
+                _run_e3_per_checkpoint(model_name, checkpoint, entry, rows, done_pairs)
+                counts["run"] += 1
+            except Exception:
+                _log_failure(model_name, None, checkpoint, "E3 postmid")
+                counts["failed"] += 1
+                failed_cells.append(dict(model=model_name, seed="*", checkpoint=checkpoint,
+                                          reason="E3 postmid failed -- see failures.log"))
+            _flush_csv(rows)
+
         try:
-            if all(ck in cache for ck in checkpoints):
-                cid_shared = _cid(model_name, None, "shared", E1_BETA, "identity", "E3")
-                if cid_shared not in done_cids:
-                    _run_e3_shared(model_name, checkpoints, cache, rows, done_pairs)
+            if all(ck in cache for ck in E3_CHECKPOINTS):
+                cid_shared_full = _cid(model_name, None, "shared_full", E1_BETA, "identity", "E3")
+                if cid_shared_full not in done_cids:
+                    _run_e3_shared(model_name, E3_CHECKPOINTS, cache, rows, done_pairs, tag="shared_full")
+                cid_shared_me = _cid(model_name, None, "shared_mid_end", E1_BETA, "identity", "E3")
+                if cid_shared_me not in done_cids:
+                    _run_e3_shared(model_name, E3_MID_END_WINDOW, cache, rows, done_pairs, tag="shared_mid_end")
             elif not resume:
                 raise RuntimeError("not all checkpoints available in-memory for E3-shared "
-                                    "(some were skipped via resume but E3-shared needs all 3)")
+                                    "(some were skipped via resume but E3-shared needs all of "
+                                    "E3_CHECKPOINTS)")
         except Exception:
             _log_failure(model_name, None, "shared", "E3 shared")
             counts["failed"] += 1

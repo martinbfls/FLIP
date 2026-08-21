@@ -671,9 +671,9 @@ def clean_accuracy(model, dataset_flag, device, model_flag=None):
 
 def train_clean_checkpoints(model, dataset_flag, n_classes, device, epochs,
                              batch_size, ckpt_dir, tag, test_pct=0.0, seed=0,
-                             max_train=None):
+                             max_train=None, extra_post_mid=0):
     """
-    Short clean training producing exactly 3 checkpoints (begin/mid/end),
+    Short clean training producing 3 checkpoints (begin/mid/end) by default,
     reusing modules.base_utils.util.mini_train_multi as-is (single "worker" =
     the whole clean training set, agg_method="mean", f=0 -- mini_train_multi
     degenerates to plain SGD in this configuration) rather than writing a new
@@ -689,6 +689,18 @@ def train_clean_checkpoints(model, dataset_flag, n_classes, device, epochs,
     max_train: if given, trains on a random max_train-sized Subset of the
     full clean training set (used for the "cnn" config, per this session's
     plan of 5000-10000 CIFAR-10 examples rather than the full 50000).
+
+    extra_post_mid: session correction D2 (E3 checkpoint density). 0 (default)
+    reproduces the original 3-checkpoint behavior exactly. If > 0, the
+    post-mid epoch budget (epochs - e_mid) is split into extra_post_mid + 1
+    equal-ish mini_train_multi segments instead of one, saving an additional
+    checkpoint after each of the first extra_post_mid segments --
+    {tag}_postmid1.pt, {tag}_postmid2.pt, ... -- before the final "end"
+    segment/save. E.g. extra_post_mid=2 yields 5 total checkpoints (begin,
+    mid, postmid1, postmid2, end), motivated by E3's own finding that Gbar
+    rotates fastest early in training and stabilizes later: begin/mid/end
+    alone cannot tell whether the single-configuration anchor k_0 should sit
+    after "begin" rather than at it.
     """
     os.makedirs(ckpt_dir, exist_ok=True)
     train_ds = get_clean_dataset(dataset_flag, train=True)
@@ -712,7 +724,7 @@ def train_clean_checkpoints(model, dataset_flag, n_classes, device, epochs,
     paths["begin"] = begin_path
 
     e_mid = max(1, epochs // 2)
-    e_end = max(1, epochs - e_mid)
+    e_end_total = max(1, epochs - e_mid)
 
     mini_train_multi(
         model=model, train_datasets=[train_ds], test_data=test_ds,
@@ -723,9 +735,30 @@ def train_clean_checkpoints(model, dataset_flag, n_classes, device, epochs,
     torch.save(model.state_dict(), mid_path)
     paths["mid"] = mid_path
 
+    e_end_remaining = e_end_total
+    if extra_post_mid > 0:
+        n_segments = extra_post_mid + 1
+        for i in range(extra_post_mid):
+            # Leave >= 1 epoch per remaining segment (including the final
+            # "end" one) so a short post-mid budget still produces distinct,
+            # non-empty segments rather than silently collapsing to fewer
+            # checkpoints than requested.
+            segments_left_after_this = n_segments - i
+            seg_epochs = max(1, min(e_end_remaining - (segments_left_after_this - 1),
+                                     -(-e_end_total // n_segments)))  # ceil(e_end_total / n_segments)
+            mini_train_multi(
+                model=model, train_datasets=[train_ds], test_data=test_ds,
+                batch_size=batch_size, opt=opt, scheduler=scheduler, epochs=seg_epochs,
+                agg_method="mean", f=0,
+            )
+            e_end_remaining -= seg_epochs
+            p = os.path.join(ckpt_dir, f"{tag}_postmid{i + 1}.pt")
+            torch.save(model.state_dict(), p)
+            paths[f"postmid{i + 1}"] = p
+
     mini_train_multi(
         model=model, train_datasets=[train_ds], test_data=test_ds,
-        batch_size=batch_size, opt=opt, scheduler=scheduler, epochs=e_end,
+        batch_size=batch_size, opt=opt, scheduler=scheduler, epochs=max(1, e_end_remaining),
         agg_method="mean", f=0,
     )
     end_path = os.path.join(ckpt_dir, f"{tag}_end.pt")
