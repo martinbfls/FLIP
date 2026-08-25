@@ -1,12 +1,27 @@
 import numpy as np
 
 
-def materialize_policy_flips(u, pairs, n_train, labels, n_classes, seed=0):
+def materialize_policy_flips(u, pairs, n_train, labels, n_classes, gamma, seed=0):
     '''
+    Theory: rem:units, "Label counts" -- the number of class-y samples relabelled to z across
+    all corrupted units is gamma*n*u^i_{y,z} in LOCAL units (u^i, this function's `u`), the
+    quantity this function realizes concretely below (n_yc = round(u_yc*gamma*n_train)); the
+    equivalent aggregate-units count would be n*ubar_{y,z} (not used here -- u is local, see
+    federated_optimizing_trigger_policy/run_module.py's header docstring).
+
     Turns the continuous attack policy u (one weight per ordered class pair (y, c), same
     `pairs` ordering as `compute_expected_flip_gradients`) into a concrete set of per-example
-    label flips: for each pair (y, c), n_{y,c} = round(u_{y,c} * n_train) examples of true
-    class y are drawn (without replacement, seeded) and reassigned to class c.
+    label flips: for each pair (y, c), n_{y,c} = round(u_{y,c} * gamma * n_train) examples of
+    true class y are drawn (without replacement, seeded) and reassigned to class c.
+
+    u is LOCAL (see federated_optimizing_trigger_policy.run_module's docstring and
+    prelim/SPEC.md's U_loc): u_{y,c} is the fraction of a SINGLE corrupted worker's own shard
+    flipped from y to c, u in {u>=0, sum(u)<=beta, sum_c u_{y,c}<=pi_y}. The corrupted workers
+    TOGETHER hold gamma*n_train examples (gamma = num_poisoned/(num_poisoned+num_honests)), so
+    materializing the SAME u once per corrupted worker realizes gamma*n_train*u_{y,c} total
+    flips for pair (y,c) -- NOT n_train*u_{y,c} (that would be the flip count for an AGGREGATE
+    policy spread over the WHOLE dataset, a different scope; using it here overproduces flips
+    by a factor of 1/gamma).
 
     Draws for different target classes c of the SAME source class y are taken from disjoint,
     pre-shuffled pools of that class's examples (one seeded shuffle per class, consumed via a
@@ -16,13 +31,13 @@ def materialize_policy_flips(u, pairs, n_train, labels, n_classes, seed=0):
     federated_optimizing_trigger.utils.get_poison_dataset's lambda_overflow="clip" behavior.
 
     Args:
-        u: (P,) array-like of policy weights, u_p >= 0, sum(u) <= beta.
+        u: (P,) array-like of LOCAL policy weights, u_p >= 0, sum(u) <= beta.
         pairs: list of P (y, c) int tuples, y != c -- same ordering as u.
-        n_train: total training-set size (u_{y,c} is a FRACTION OF THE WHOLE shard, not of
-            class y alone -- see federated_optimizing_trigger.utils's
-            `_build_global_budget_constraint` docstring).
+        n_train: total training-set size.
         labels: (n_train,) int array of true labels.
         n_classes: number of classes.
+        gamma: num_poisoned / (num_poisoned + num_honests) -- fraction of the federated
+            deployment's examples the corrupted workers hold together.
         seed: RNG seed for the per-class shuffles.
 
     Returns:
@@ -37,7 +52,7 @@ def materialize_policy_flips(u, pairs, n_train, labels, n_classes, seed=0):
 
     idx_chunks, target_chunks = [], []
     for (y, c), u_yc in zip(pairs, u):
-        n_yc = int(round(float(u_yc) * n_train))
+        n_yc = int(round(float(u_yc) * gamma * n_train))
         if n_yc <= 0:
             continue
 

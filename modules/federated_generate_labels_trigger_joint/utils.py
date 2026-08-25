@@ -1,0 +1,187 @@
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from modules.base_utils.datasets import MTTDataset
+from modules.federated_generate_labels.utils import DEFAULT_EXPERT_CONFIG
+
+
+class TriggerMTTDataset(MTTDataset):
+    '''
+    Thin wrapper around `MTTDataset` (modules/base_utils/datasets.py) that additionally
+    returns a boolean `is_poisoned` flag per example: True iff this draw's "train" branch
+    came from the appended poison segment (original i >= len(self.distill)), i.e. iff it is
+    one of the genuinely-triggered-and-relabeled examples, as opposed to a plain pass-through
+    clean example that happens to share the same ConcatDataset.
+
+    This is needed because MTTDataset's returned `idx` (the 5th tuple element) alone cannot
+    distinguish the two cases: for poisoned draws, idx is reassigned to
+    `poison_inds[i % len(distill)]`, but a *non*-reassigned i (from the clean segment) can
+    coincidentally also be a member of poison_inds (that source-class image, drawn
+    unpoisoned) -- checking `idx in poison_inds` from outside would give false positives.
+
+    Constructed by re-wrapping an existing MTTDataset's constituent objects (train, distill,
+    poison_inds, transform, n_classes) -- e.g. the one returned by
+    `modules.base_utils.datasets.get_matching_datasets` -- rather than duplicating its
+    dataset-construction logic.
+    '''
+
+    def __getitem__(self, i: int):
+        is_poisoned = i >= len(self.distill)
+        train_x, train_oh, distill_x, distill_oh, idx = super().__getitem__(i)
+        return train_x, train_oh, distill_x, distill_oh, idx, is_poisoned
+
+    @classmethod
+    def from_mtt_dataset(cls, mtt_dataset):
+        return cls(
+            mtt_dataset.train, mtt_dataset.distill, mtt_dataset.poison_inds,
+            mtt_dataset.transform, mtt_dataset.n_classes,
+        )
+
+
+def _sample_trajectory_index(n_traj, alpha_ckpt):
+    '''
+    Single draw from the SAME exponential-bias distribution
+    `federated_optimizing_trigger.utils.sample_checkpoints` uses (probability of index k
+    proportional to exp(-alpha_ckpt*k), k=0..n_traj-1 -- biased toward EARLY checkpoints for
+    the repo's convention alpha_ckpt>0), reimplemented here (not called) because
+    sample_checkpoints's "always include the last checkpoint" augmentation is specific to its
+    own use (picking a representative SUBSET alongside a guaranteed final one, once per outer
+    training step) and doesn't apply to a single per-(iteration,trajectory-length) draw.
+    '''
+    ks = torch.arange(0, n_traj, dtype=torch.float)
+    probs = torch.exp(-alpha_ckpt * ks)
+    probs = probs / probs.sum()
+    return int(torch.multinomial(probs, 1).item())
+
+
+def extract_experts_biased(expert_config, expert_path, iterations, alpha_ckpt, expert_opt_path=None):
+    '''
+    Like `federated_generate_labels.utils.extract_experts`, but draws the "how far into this
+    expert's own training run" trajectory index via the SAME exponentially-biased distribution
+    federated_optimizing_trigger_policy's `sample_checkpoints` uses (controlled by the SAME
+    `alpha_ckpt` parameter), instead of extract_experts's `np.random.randint(min, max)`
+    (uniform). This is what makes the joint module's checkpoint sampling comparable to the
+    policy module's -- see this module's run() docstring, "Comparability across the three
+    arms" (federated_generate_labels_trigger, unlike this module, still uses the uniform
+    `extract_experts` unchanged -- see its own corrected docstring for why that divergence
+    now needs to be accounted for whenever a direct/joint comparison is drawn against it).
+
+    Args, returns: identical to extract_experts.
+    '''
+    config = {**DEFAULT_EXPERT_CONFIG, **expert_config}
+    n_traj = config['max'] - config['min']
+    expert_starts, expert_opt_starts = [], []
+
+    for _ in range(iterations):
+        for s in config['trajectories']:
+            expert = np.random.randint(config['experts'])
+            trajectory = config['min'] + _sample_trajectory_index(n_traj, alpha_ckpt) + 1
+            expert_starts.append(expert_path.format(expert, trajectory, str(s)))
+            if expert_path:
+                expert_opt_starts.append(expert_opt_path.format(expert, trajectory, str(s)))
+    return expert_starts, expert_opt_starts
+
+
+# --------------------------------------------------------------------------- #
+# Anti-collapse regularizers (see run_module.py's run() docstring for the
+# failure mode these guard against: expert_asr -> 0 while the matching term
+# keeps improving, because a clean expert perfectly satisfies the alignment
+# objective). Distinct from federated_optimizing_trigger.utils's
+# trigger_penalty_hinge -- that is a STEALTH ceiling on
+# cos(delta, mu_target - mu_source); this is a FLOOR on cos(delta, mu_target)
+# alone, plus a floor on ||delta||_2 without which the directional floor is
+# vacuously satisfiable via delta -> 0 (see run_module.py's docstring).
+# --------------------------------------------------------------------------- #
+
+def cosine_to(delta, mu, eps=1e-8):
+    '''cos(delta, mu), flattened, mu treated as a fixed (detached) target direction.'''
+    return F.cosine_similarity(
+        delta.reshape(1, -1), mu.reshape(1, -1).detach(), eps=eps,
+    ).squeeze(0)
+
+
+def directional_floor_penalty(delta, mu_target, align_kappa, eps=1e-8):
+    '''
+    L_align = relu(align_kappa - cos(delta, mu_target)) -- a FLOOR: zero once
+    cos(delta, mu_target) >= align_kappa, active (and penalizing) below it. Do
+    NOT confuse with trigger_penalty_hinge's relu(cos - kappa), which is a
+    CEILING on a DIFFERENT vector pair (mu_target - mu_source).
+    '''
+    cos = cosine_to(delta, mu_target, eps=eps)
+    return F.relu(align_kappa - cos), cos
+
+
+def magnitude_floor_penalty(delta, delta_min):
+    '''
+    L_mag = relu(delta_min - ||delta||_2) -- prevents the directional floor
+    above from being satisfied vacuously by delta -> 0 (cos is scale-invariant,
+    so a vanishingly small delta can still have cos(delta, mu_target) == 1).
+    '''
+    norm = delta.norm()
+    return F.relu(delta_min - norm), norm
+
+
+def _project_onto_cone(delta, mu_target, align_kappa, eps=1e-8):
+    '''
+    Euclidean projection of delta onto the convex circular cone
+        K = { x : cos(x, mu_target) >= align_kappa },  half-angle alpha = arccos(align_kappa)
+    Closed form via the 2D reduction onto the (axis, perpendicular) plane spanned by delta and
+    u = mu_target/||mu_target||: decompose delta = h*u + perp (h = <delta,u>, perp orthogonal
+    to u, r = ||perp||). If already inside the cone (cos(phi) = h/||delta|| >= align_kappa),
+    return delta unchanged. Otherwise the nearest point is on the cone's boundary ray at angle
+    alpha from the axis: t = h*cos(alpha) + r*sin(alpha) is the (signed) distance along that
+    ray; if t <= 0 the nearest point is the origin (delta's angle from the axis exceeds
+    pi/2 + alpha), otherwise the projection is t*(cos(alpha)*u + sin(alpha)*perp_unit).
+    '''
+    u = mu_target / (mu_target.norm() + eps)
+    h = (delta * u).sum()
+    perp = delta - h * u
+    r = perp.norm()
+    delta_norm = delta.norm()
+    if delta_norm < eps:
+        return delta
+    cos_phi = h / delta_norm
+    if cos_phi.item() >= align_kappa:
+        return delta
+
+    alpha = torch.acos(
+        torch.clamp(torch.tensor(align_kappa, device=delta.device, dtype=delta.dtype), -1.0, 1.0)
+    )
+    cos_a, sin_a = torch.cos(alpha), torch.sin(alpha)
+    t = h * cos_a + r * sin_a
+    if t.item() <= 0:
+        return torch.zeros_like(delta)
+    perp_unit = perp / (r + eps)
+    return (t * cos_a) * u + (t * sin_a) * perp_unit
+
+
+def _project_onto_magnitude_floor(delta, delta_min, mu_target, eps=1e-8):
+    '''Pushes delta radially out to ||delta||_2 == delta_min if it fell short; a direction is
+    needed only in the (measure-zero) delta==0 case, for which mu_target's own direction is
+    used (already the cone's axis, so this keeps the point trivially inside the cone too).'''
+    n = delta.norm()
+    if n.item() >= delta_min:
+        return delta
+    if n.item() < eps:
+        return delta_min * mu_target / (mu_target.norm() + eps)
+    return delta * (delta_min / n)
+
+
+def project_trigger_constraints(delta, mu_target, epsilon, align_kappa, delta_min, n_iters=8, eps=1e-8):
+    '''
+    Alternating-projection heuristic (see run_module.py's run() docstring,
+    "trigger_constraint='projection'") onto
+        { ||delta||_inf <= epsilon }  inter  K_align_kappa(mu_target)  inter  { ||delta||_2 >= delta_min }
+    The third set is NOT convex (exterior of a ball), so this is not a provably-exact joint
+    projection -- but each individual step is exact for its own set, and normalizing scale-up
+    (the magnitude-floor step) never changes cos(delta, mu_target) (positive scaling preserves
+    angle), so only the Linf clamp and the cone projection can re-violate each other; a handful
+    of alternations settles this in practice. Returns delta unchanged if it is already feasible
+    for all three sets (each individual projection is itself a no-op in that case).
+    '''
+    for _ in range(n_iters):
+        delta = delta.clamp(-epsilon, epsilon)
+        delta = _project_onto_cone(delta, mu_target, align_kappa, eps=eps)
+        delta = _project_onto_magnitude_floor(delta, delta_min, mu_target, eps=eps)
+    return delta

@@ -7,21 +7,31 @@
 # partition_across_workers).
 #
 # u is not restricted to the (source_label, target_label) pair: it spans all ordered class
-# pairs (y, c), same as the feasible polytope W_beta federated_optimizing_trigger compares
-# against -- so materialization can flip any class pair the policy assigned weight to.
+# pairs (y, c) -- so materialization can flip any class pair the policy assigned weight to.
+#
+# u is LOCAL (fraction of a single corrupted worker's own shard -- see
+# federated_optimizing_trigger_policy's docstring); materialize_policy_flips therefore needs
+# gamma = num_poisoned/(num_poisoned+num_honests) to convert u into a flip count
+# (round(u*gamma*n_train), NOT round(u*n_train)). num_honests/num_poisoned here MUST match
+# the values used for the federated_optimizing_trigger_policy run that produced this policy
+# -- a mismatch silently changes gamma and hence the realized flip count.
+#
+# Dataset train size must exactly match the policy's own n_train (raises otherwise -- a
+# silent mismatch would compute round(u*gamma*n_train) against the wrong n_train).
 #
 # Outputs the same layout as federated_select_flips: true.npy, {budget}_idx_flipped.npy,
 # {budget}_idx_clean.npy, worker{w}/{budget}_labels.npy, worker{w}/{budget}_indices.npy
-# (budget = the actually-realized number of flips). This lets federated_train_user be reused
-# UNCHANGED to train and evaluate the victim.
+# (budget = the actually-realized number of flips, asserted to match beta's own flip_budget
+# to within rounding). This lets federated_train_user be reused UNCHANGED to train and
+# evaluate the victim.
 ###
 
 [federated_policy_to_flips]
 policy_path = "string. Path to the policy .npz produced by federated_optimizing_trigger_policy (slurm compatible)."
 dataset = "string: {cifar, cifar_100, tiny_imagenet, svhn}. Dataset the policy was optimized against."
 output_dir = "string. Path to output directory (slurm compatible)."
-num_honests = "int: {0,1,...,infty}. Num of honest workers."
-num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers."
+num_honests = "int: {0,1,...,infty}. Num of honest workers. MUST match the federated_optimizing_trigger_policy run that produced this policy -- used to derive gamma."
+num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers. MUST match the federated_optimizing_trigger_policy run that produced this policy -- used to derive gamma."
 
 [OPTIONAL]
 one_hot_temp = "float: (0, +infty). Logit value assigned to a flipped example's new (target) class -- softmax(one_hot_temp) approximates a hard label; unflipped examples keep value 1.0 (true.npy's convention). Defaults to DEFAULT_ATTACK_CONFIG['one_hot_temp'] (5.0), matching federated_generate_labels' synthetic-label initialization scale."

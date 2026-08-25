@@ -1,20 +1,36 @@
 ###
 # federated_optimizing_trigger_policy schema
 # Threat model "expert" (P^mean): jointly optimizes a backdoor trigger (delta) AND an
-# explicit label-flipping attack policy (u) under mean aggregation, in place of
+# explicit LOCAL label-flipping attack policy (u) under mean aggregation, in place of
 # federated_optimizing_trigger's QP-projected w*:
 #
-#   min_{|delta|_inf<=epsilon, u in U_beta}
-#       E_k[ ||Gbar(theta_bar_k) u - v_k(delta)||^2 / rho_k^2 ]
+#   min_{|delta|_inf<=epsilon, u in U_loc}
+#       E_k[ ||gamma * H(theta_bar_k) u - v_k(delta)||^2 / rho_k^2 ]
 #       + lambda_bd * E_k[ E_X[ loss_c(f_theta_bar_k(T_delta(X)), y_target) ] ]
 #   s.t.  theta_bar_{k+1} = theta_bar_k - eta_k grad(theta_bar_k),  lambda = beta
 #
-# Gbar(theta_bar_k) is the same pi_y-weighted expected label-flip gradient direction
-# federated_optimizing_trigger's B2 term already uses (compute_expected_flip_gradients);
-# u replaces its implicit QP optimum with a policy parameter, jointly trained with delta.
-# lambda=beta is enforced exactly as in federated_optimizing_trigger (lambda_poison
-# resolves to beta by default, coupling the objective's poisoning rate AND the expert's
-# actual retraining poison rate).
+# u is LOCAL: u_{y,c} is the fraction of a SINGLE corrupted worker's own shard flipped from y
+# to c, u in U_loc = {u>=0, sum(u)<=beta, sum_c u_{y,c}<=pi_y} -- beta is that worker's own
+# budget, NOT a global fraction of the whole federated dataset. gamma =
+# num_poisoned/(num_poisoned+num_honests): num_honests/num_poisoned are therefore NOT
+# logging-only here (unlike in federated_optimizing_trigger) -- gamma enters the objective
+# directly, and the same gamma is required again downstream by federated_policy_to_flips to
+# materialize u into concrete flips. H(theta_bar_k)[:,(y,c)] = g_{y,c}-g_{y,y} is
+# `compute_expected_flip_gradients`'s G with its pi_y factor divided back out (G's convention
+# makes its column a per-POPULATION rate, appropriate for federated_optimizing_trigger's
+# aggregate w*, not for this module's local u). u replaces the QP's implicit optimum with a
+# policy parameter, jointly trained with delta (co-descent, not resolved-then-detached --
+# see optimize_trigger_policy_step's docstring for the resulting Danskin-gap caveat, and
+# `diag_every` below for its diagnostic).
+# A1 correction (docs/policy_module_audit_report.md Section 2.6): lambda_poison="beta" (the
+# default) now resolves to beta_global = gamma*beta (def:budget's GLOBAL beta), not the
+# LOCAL beta this module's own `beta` parameter names -- theory's eq:P constraint lambda=beta
+# refers to the global one. An explicit numeric lambda_poison is used verbatim, unscaled, and
+# is the recommended way to decouple lambda from beta once s_beta > 1 (see below) -- the
+# lambda=beta coupling is only theoretically justified in the UNSATURATED regime
+# (beta<=gamma*min_y(pi_y), prop:budget-match; rem:saturated lists prop:budget-match among
+# the results lost once this fails). s_beta = beta_global/(gamma*min_y(pi_y)) is printed at
+# startup with an explicit warning when s_beta > 1.
 #
 # Outputs the optimized trigger as a .pt file (same naming convention as
 # federated_optimizing_trigger) and the optimized policy (u, the (y,c) pairs it is indexed
@@ -63,15 +79,15 @@ epochs = "int: {1,...,+infty}. Epochs of model retraining per outer step. Defaul
 checkpoint_backward = "bool. Backward + free the per-checkpoint graph immediately instead of accumulating all num_chckpt graphs before one backward call. Defaults to true."
 
 ###
-# Poisoning budget -- same resolution as federated_optimizing_trigger
-# (resolve_beta_and_lambda_poison): beta is the primary parameter, the fraction of the
-# attacker's OWN data shard it can flip; U_beta = {u>=0, sum(u)<=beta} is exactly this
-# same budget applied to the policy u.
+# Poisoning budget -- same beta resolution as federated_optimizing_trigger
+# (resolve_beta_and_lambda_poison): beta is the primary parameter, the fraction of a SINGLE
+# corrupted worker's OWN data shard it can flip; U_loc = {u>=0, sum(u)<=beta,
+# sum_c u_{y,c}<=pi_y} is exactly this same local budget applied to the policy u.
 ###
-beta = "float: (0, 1). Primary parameter. Fraction of the attacker's own data shard it can afford to flip; also the budget bounding u."
-num_honests = "int. Assumed number of honest workers under ONE particular deployment size, used only to convert beta into flip_budget for human-readable logging/run naming. Not read by the objective."
-num_poisoned = "int. Assumed number of poisoned workers under that same assumed deployment size, same logging-only role as num_honests."
-lambda_poison = "float or 'beta': (0,1]. Target fraction of each batch's source-class examples that get triggered + relabeled (in the objective) AND, via lambda_target, the fraction of the expert's poisoned train dataset that is poisoned. 'beta' (the default) resolves to beta directly -- this is what guarantees lambda=beta."
+beta = "float: (0, 1). Primary parameter. Fraction of a single corrupted worker's own data shard it can afford to flip; also the LOCAL budget bounding u (sum(u)<=beta)."
+num_honests = "int. Number of honest workers in the deployment. UNLIKE federated_optimizing_trigger, this is NOT logging-only: gamma = num_poisoned/(num_poisoned+num_honests) enters the (P^mean) objective directly, and the SAME num_honests must be passed to federated_policy_to_flips to materialize u consistently."
+num_poisoned = "int. Number of poisoned workers in the deployment. Same non-logging-only role as num_honests -- see above."
+lambda_poison = "float or 'beta': (0,1]. Target fraction of each batch's source-class examples that get triggered + relabeled (in the objective) AND, via lambda_target, the fraction of the expert's poisoned train dataset that is poisoned. 'beta' (the default) resolves to beta_global = gamma*beta (A1 correction -- eq:P's lambda=beta names the GLOBAL beta of def:budget, not this module's own LOCAL beta), which is only theoretically justified when s_beta<=1 (unsaturated regime, prop:budget-match; see run() startup log). Pass a numeric value instead to sweep lambda independently of beta -- used verbatim, unscaled. A3 (docs/policy_module_audit_report.md): raises ValueError at startup if the resolved lambda_poison > pi_source (empirical frequency of source_label) -- the per-batch objective mask cannot realize a rate above pi_source (it never duplicates rows, unlike get_poison_dataset), so theta_bar_k's retraining and v_k's per-batch rate would otherwise silently diverge."
 lambda_overflow = "string: {clip, duplicate}. What to do when lambda_poison implies more poisoned examples than the source class has available. See federated_optimizing_trigger."
 
 ###
@@ -93,7 +109,10 @@ restart = "bool. Restart optimization from existing checkpoint."
 batch_size_trigger = "int: {1,...,+infty}. Batch size for the trigger+policy-optimization data loader. Defaults to 256."
 flip_gradient_samples_per_class = "int: {1,...,+infty}. Number of training samples per class used to estimate Gbar. Defaults to 64."
 source_duplication = "bool. See federated_optimizing_trigger. Defaults to false."
-metrics_log_path = "string. If set, path (slurm compatible) to a JSON file where per-step metrics (B2, L_bd, lambda_effective, beta_used=sum(u), clean_acc, poison_acc) are recorded across the n_steps optimization loop."
+metrics_log_path = "string. If set, path (slurm compatible) to a JSON file where per-step metrics (B2, L_bd, lambda_effective, lambda_effective_ratio=lambda_effective/lambda_poison (A3 -- 1.0 means uncapped, <1.0 means the batch's source-class supply fell short), beta_used=sum(u), B2_rho, B2_v, B2_qp, B2_qp_relaxed, pg_iters, pg_obj_decrement, clean_acc, poison_acc) are recorded across the n_steps optimization loop."
 policy_optim_kwargs = "dict. Optional extra keyword arguments for the policy's Adam optimizer."
 output_dir_policy = "string. Path to output directory for the optimized policy .npz (slurm compatible). Defaults to 'optimized_policy'."
+normalization = "string: {rho, v}. B2's denominator: 'rho' (default) normalizes by rho_k^2 = (beta_global*varsigma_k)^2 (eq:rho -- A2), a delta-independent, non-saturating radius of the reachable set. 'v' is the legacy ||v||^2+eps normalization, kept for comparison -- it saturates at 1 once v leaves the reachable set and its gradient signal to delta decays as delta moves further out of reach. Both are always computed and logged (B2_rho, B2_v in metrics_log_path) regardless of this choice."
+diag_every = "int: {1,...,+infty}. Every diag_every batches, solves for w* on U_loc itself (A1 correction -- via project_gradient_descent_local, projected gradient descent with the exact project_policy_budget projection, warm-started from the current u) and logs the result as B2_qp alongside the co-descended policy's B2, to gauge the co-descent (u, delta) gap against the theoretical resolved-and-detached u* (Danskin). pg_iters/pg_obj_decrement log the iteration count and objective decrease, to gauge convergence. B2_qp_relaxed keeps the PRE-A4 diagnostic (global budget only, via the shared federated_optimizing_trigger.utils.project_gradient -- a strictly larger polytope than U_loc) for one transition period, to compare the two on the same run. Defaults to 50."
+expert_budget = "int. The `budget` value (see schemas/train_expert.toml) used for the train_expert run that produced the checkpoints loaded via expert_path/expert_config, for logging ONLY -- not threaded into pi/n_train/beta (pi_y intentionally describes the attacker's own shard, not the expert's training population). If set, prints lambda_expert_realise = expert_budget / (n_train + expert_budget) alongside lambda_poison, since get_matching_datasets ADDS poisoned examples rather than replacing clean ones, so the two rates differ (by ~9% at typical CIFAR-10 budgets)."
 flip_budget = "[legacy] int: {0,...,+infty). Number of label flips per round; if given (and beta is not), derives beta. Mutually exclusive with beta -- kept for backward compatibility, prefer beta."

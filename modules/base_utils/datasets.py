@@ -650,52 +650,111 @@ def get_matching_datasets(
     label,
     seed=1,
     train_pct=1.0,
+    budget=None,
     big=False,
-    clean=False
+    clean=False,
 ):
-    train_transform = TRANSFORM_TRAIN_XY[dataset_flag + ('_big' if big else '')]
-    test_transform = TRANSFORM_TEST_XY[dataset_flag + ('_big' if big else '')]
+    train_transform = TRANSFORM_TRAIN_XY[dataset_flag + ("_big" if big else "")]
+    test_transform = TRANSFORM_TEST_XY[dataset_flag + ("_big" if big else "")]
 
     train_data = load_dataset(dataset_flag, train=True)
     test_data = load_dataset(dataset_flag, train=False)
 
     n_classes = get_n_classes(dataset_flag)
-    train_labels = np.array([y for _, y in train_data])
 
-    train_labels = train_labels[:int(len(train_labels) * train_pct)]
+    # Restrict the training set according to train_pct.
+    n_train = int(len(train_data) * train_pct)
+    train_dataset = Subset(train_data, np.arange(n_train))
+    train_labels = np.array([y for _, y in train_data])[:n_train]
 
-    n_poisons_train = int((len(train_data) // n_classes) * train_pct)
+    # By default, preserve the original poisoning budget.
+    if budget is None:
+        n_poisons_train = int((len(train_data) // n_classes) * train_pct)
+    else:
+        # budget = number of labels the attacker is allowed to invert.
+        n_poisons_train = int(budget)
+
     n_poisons_test = len(test_data) // n_classes
-    if dataset_flag == 'svhn':
+    if dataset_flag == "svhn":
         n_poisons_test = 1500
 
+    # Select the examples whose labels will be inverted.
     if label == -1:
-        poison_inds = np.where(train_labels != poisoner.target_label)[0][-n_poisons_train:]
+        candidate_inds = np.where(train_labels != poisoner.target_label)[0]
     else:
-        poison_inds = np.where(train_labels == label)[0][-n_poisons_train:]
+        candidate_inds = np.where(train_labels == label)[0]
 
-    mtt_distill_dataset = distill_dataset = Subset(train_data, np.arange(len(train_data)))
-    poison_dataset = MappedDataset(Subset(train_data, poison_inds),
-                                   poisoner,
-                                   seed=seed)
+    if n_poisons_train > len(candidate_inds):
+        raise ValueError(
+            f"Budget requires {n_poisons_train} poisoned samples, "
+            f"but only {len(candidate_inds)} eligible samples are available."
+        )
 
-    train_dataset = Subset(train_data, np.arange(int(len(train_data) * train_pct)))
+    poison_inds = candidate_inds[-n_poisons_train:]
+
+    # Dataset used for distillation.
+    distill_dataset = Subset(
+        train_data,
+        np.arange(len(train_data)),
+    )
+    mtt_distill_dataset = distill_dataset
+
+    # Apply the poisoning transformation to the selected examples.
+    poison_dataset = MappedDataset(
+        Subset(train_data, poison_inds),
+        poisoner,
+        seed=seed,
+    )
+
+    # Training dataset = clean dataset + poisoned examples.
     dataset_list = [train_dataset, poison_dataset]
-    if dataset_flag == 'tiny_imagenet':   # Oversample poisons for expert training
+
+    if dataset_flag == "tiny_imagenet":
+        # Preserve the original oversampling behaviour.
         dataset_list.extend([poison_dataset] * 9)
+
     poisoned_train_dataset = ConcatDataset(dataset_list)
 
     if train_pct < 1.0:
-        mtt_distill_dataset = Subset(distill_dataset, np.arange(int(len(distill_dataset) * train_pct)))
+        mtt_distill_dataset = Subset(
+            distill_dataset,
+            np.arange(n_train),
+        )
 
-    poisoned_mtt_dataset = MTTDataset(poisoned_train_dataset, mtt_distill_dataset, poison_inds,
-                             train_transform, n_classes)
-    clean_mtt_dataset = MTTDataset(train_dataset, mtt_distill_dataset,        poison_inds, train_transform, n_classes)
+    poisoned_mtt_dataset = MTTDataset(
+        poisoned_train_dataset,
+        mtt_distill_dataset,
+        poison_inds,
+        train_transform,
+        n_classes,
+    )
 
-    distill_dataset = MappedDataset(distill_dataset, train_transform)
-    poisoned_train_dataset = MappedDataset(poisoned_train_dataset, train_transform)
-    clean_train_dataset = MappedDataset(train_dataset, train_transform)
-    test_dataset = MappedDataset(test_data, test_transform)
+    clean_mtt_dataset = MTTDataset(
+        train_dataset,
+        mtt_distill_dataset,
+        poison_inds,
+        train_transform,
+        n_classes,
+    )
+
+    # Apply the corresponding transforms.
+    distill_dataset = MappedDataset(
+        distill_dataset,
+        train_transform,
+    )
+    poisoned_train_dataset = MappedDataset(
+        poisoned_train_dataset,
+        train_transform,
+    )
+    clean_train_dataset = MappedDataset(
+        train_dataset,
+        train_transform,
+    )
+    test_dataset = MappedDataset(
+        test_data,
+        test_transform,
+    )
+
     poison_test_dataset = PoisonedDataset(
         test_data,
         poisoner,
@@ -703,10 +762,23 @@ def get_matching_datasets(
         label=label if label != -1 else None,
         transform=test_transform,
     )
+
     if clean:
-        return clean_train_dataset, distill_dataset, test_dataset, poison_test_dataset, clean_mtt_dataset
-    else:
-        return poisoned_train_dataset, distill_dataset, test_dataset, poison_test_dataset, poisoned_mtt_dataset
+        return (
+            clean_train_dataset,
+            distill_dataset,
+            test_dataset,
+            poison_test_dataset,
+            clean_mtt_dataset,
+        )
+
+    return (
+        poisoned_train_dataset,
+        distill_dataset,
+        test_dataset,
+        poison_test_dataset,
+        poisoned_mtt_dataset,
+    )
 
 def shard_dataset_indices(n_samples, num_workers, seed=0, iid=True, labels=None, n_classes=None):
     rng = np.random.RandomState(seed)

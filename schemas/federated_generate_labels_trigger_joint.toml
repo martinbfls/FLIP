@@ -1,0 +1,76 @@
+###
+# federated_generate_labels_trigger_joint schema
+# Threat model "direct", REAL coupling: extends federated_generate_labels to jointly optimize
+# continuous poisoned logit labels (labels_syn) AND a backdoor trigger (delta), via federated
+# trajectory matching -- like federated_generate_labels_trigger, but with delta's gradient
+# ALSO flowing through the MTT trajectory-alignment term (param_loss), not just through the
+# isolated backdoor-efficacy term L_bd. See modules/federated_generate_labels_trigger_joint/
+# run_module.py's run() docstring for the full derivation ("E2 implementation").
+#
+# A separate module from federated_generate_labels_trigger (which keeps the INDIRECT
+# coupling, unmodified) -- the three modules (federated_generate_labels,
+# federated_generate_labels_trigger, this one) are meant to coexist and be compared, not
+# to replace one another.
+#
+# Outputs the same labels.npy/true.npy/losses.npy as federated_generate_labels (consumed
+# unchanged by federated_select_flips), plus the optimized trigger as a .pt file (same naming
+# convention as federated_optimizing_trigger/federated_optimizing_trigger_policy).
+###
+
+[federated_generate_labels_trigger_joint]
+input_pths = "string. Format string path to model checkpoint .pth files with three '{}'s."
+opt_pths = "string. Format string path to optimizer checkpoint .pth files with three '{}'s."
+output_dir = "string. Path to output directory (slurm compatible)."
+output_dir_trigger = "string. Path to output directory for the optimized trigger .pt (slurm compatible)."
+expert_model = "string: {r32p, r18, r18_tin, vgg, vgg_pretrain, vit_pretrain}. For ResNets, VGG-19s, and ViTs. Also used as the trigger's model_flag (needs_big_ims / preprocessing)."
+dataset = "string: {cifar, cifar_100, tiny_imagenet, svhn}. For CIFAR-10, CIFAR-100, Tiny Imagenet and SVHN datasets."
+source_label = "int: {-1,0,...,9}. Specifies label to mimic. -1 indicates all labels."
+target_label = "int: {0,1,...,9}. Specifies label to attack."
+
+###
+# Trigger hyperparameters -- same names as federated_optimizing_trigger_policy /
+# federated_generate_labels_trigger.
+###
+epsilon = "float: (0, +infty). L_infinity bound on trigger delta."
+lr_delta = "float: (0, +infty). Learning rate for trigger optimization (Adam)."
+
+###
+# Loss weights: grand_loss (MTT alignment against the DIFFERENTIABLE expert_next, see
+# run_module.py + lam*L1 reg) is further extended, via an isolated backward pass restricted to
+# delta, with lambda_bd*L_bd (kappa in the P^mean/P^direct formulas: weight of the backdoor
+# loss on triggered examples -- an ADDITIONAL contribution to delta.grad now that param_loss
+# also contributes one, not a duplicate), and, added directly into grand_loss:
+# lambda_penalty*L_pen + lambda_delta*||delta|| + lambda_tv*L_tv (optional trigger
+# regularizers, reused unchanged from federated_optimizing_trigger, default 0). Sweep
+# lambda_bd over >= 3 values and watch expert_asr (metrics_log_path) alongside the matching
+# term for the matching-collapses-the-backdoor failure mode (see run() docstring).
+###
+lambda_bd = "float: [0, +infty). Weight for L_bd (kappa in the P^mean/P^direct formulas). Defaults to 1.0."
+
+[OPTIONAL]
+batch_size = "int: {0,1,...,infty}. Specifies batch size. Set to default for trainer if omitted."
+epochs = "int: {0,1,...,infty}. Specifies number of epochs. Set to default for trainer if omitted."
+train_pct = "float: [0, 1]. Specifies percentage of dataset available to attacker. Set to 1 by default."
+lambda = "float: [0, infty]. Specifies label L1-regularization parameter. Set to 0 by default."
+expert_config = "dict. Specifies expert checkpoints. Set to default if omitted."
+attack_config = "dict. Specifies algorithm parameters. Set to default if omitted."
+num_honests = "int: {0,1,...,infty}. Num of honest workers."
+num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers."
+clean_trajectory = "bool. Train expert on clean or poisoned data."
+agg_method = "str: aggregation method for the (differentiable) student gradient aggregation. Must be 'mean' (default) to stay comparable with federated_optimizing_trigger_policy's (P^mean) objective -- a WARNING is printed otherwise."
+attack = "str: attack performed."
+gamma_stealth = "float: [0, 1]. Scalar stealth/backdoor loss weight multiplying grand_loss. UNRELATED to federated_optimizing_trigger_policy's gamma = num_poisoned/(num_poisoned+num_honests) -- disjoint concept, same name previously (see docs/threat_models_audit.md). Defaults to 1.0."
+gamma = "[DEPRECATED] float: [0, 1]. Old name for gamma_stealth -- still accepted (with a DeprecationWarning) so existing configs keep working. Mutually exclusive with gamma_stealth. Prefer gamma_stealth."
+init = "str. Trigger initialization. Defaults to 'stripe' (sinusoidal)."
+lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu. Defaults to 0.0."
+lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta. Defaults to 0.0."
+lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta. Defaults to 0.0."
+kappa = "float: [0, +infty). Hinge margin for the (optional) trigger penalty -- NOT the P^mean/P^direct formulas' kappa (see lambda_bd). Defaults to 0.0."
+alpha_ckpt = "float: (0, 1]. Controls bias toward early expert-trajectory checkpoints when drawing each (iteration, trajectory-length) expert start, when checkpoint_sampling='biased' -- SAME distribution/parameter federated_optimizing_trigger_policy's sample_checkpoints uses, for checkpoint-sampling comparability between the two threat models. Defaults to 0.01. Unused when checkpoint_sampling='uniform'."
+checkpoint_sampling = "string: {uniform, biased}. Which distribution draws each (iteration, trajectory-length) expert-trajectory checkpoint index: 'uniform' (extract_experts, np.random.randint) or 'biased' (extract_experts_biased, exponential bias via alpha_ckpt -- same family federated_optimizing_trigger_policy's sample_checkpoints uses). Defaults to 'biased' in THIS module (its behavior before this parameter existed) -- federated_generate_labels_trigger defaults to 'uniform' (its own prior behavior) instead. Set both modules to the SAME value to remove checkpoint sampling as a factor when comparing them."
+metrics_log_path = "string. If set, path (slurm compatible) to a JSON file where per-batch metrics (grand_loss, matching_term, L_bd_mean, expert_asr, delta_l2, delta_linf, cos_target, cos_source, L_align, L_mag, align_active_rate, mag_active_rate, reg_term) are recorded across training -- mandatory instrumentation for any lambda_bd/lambda_align/align_kappa sweep or anti-collapse monitoring (see run() docstring)."
+trigger_constraint = "string: {penalty, projection}. How the anti-collapse directional/magnitude floors on delta are enforced: 'penalty' (default) adds lambda_align*L_align + lambda_mag*L_mag as soft terms to grand_loss (project_trigger_constraints is NOT called; the plain epsilon clamp_ still runs). 'projection' instead enforces {||delta||_inf<=epsilon} inter {cos(delta,mu_target)>=align_kappa} inter {||delta||_2>=delta_min} as hard constraints via alternating projection after every optimizer_delta.step() (project_trigger_constraints, joint/utils.py) -- lambda_align/lambda_mag are then unused (not added to grand_loss, to avoid double-enforcing)."
+align_kappa = "float: [-1, 1]. Floor threshold for cos(delta, mu_target): L_align = relu(align_kappa - cos(delta, mu_target)) is zero once the cosine reaches align_kappa, active below it (a FLOOR -- do not confuse with the unrelated kappa above, trigger_penalty_hinge's STEALTH ceiling on cos(delta, mu_target-mu_source)). Also the cone half-angle (arccos(align_kappa)) under trigger_constraint='projection'. Defaults to 0.6."
+lambda_align = "float: [0, +infty). Weight for L_align (the directional floor) when trigger_constraint='penalty'. Defaults to 1.0. Unused under 'projection'."
+lambda_mag = "float: [0, +infty). Weight for L_mag = relu(delta_min - ||delta||_2) (the magnitude floor, without which L_align is vacuously satisfiable via delta -> 0) when trigger_constraint='penalty'. Defaults to 1.0. Unused under 'projection'."
+delta_min_frac = "float: (0, +infty). Magnitude floor delta_min = delta_min_frac * ||delta_init||_2, computed once at startup from the actual init trigger's own norm (logged) rather than hardcoded. Defaults to 0.5."

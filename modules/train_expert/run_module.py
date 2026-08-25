@@ -6,9 +6,20 @@ from pathlib import Path
 import sys
 
 from modules.train_expert.utils import checkpoint_callback
-from modules.base_utils.datasets import get_matching_datasets, get_n_classes, pick_poisoner
-from modules.base_utils.util import extract_toml, load_model, clf_eval, mini_train,\
-                                    get_train_info, needs_big_ims, slurmify_path
+from modules.base_utils.datasets import (
+    get_matching_datasets,
+    get_n_classes,
+    pick_poisoner,
+)
+from modules.base_utils.util import (
+    extract_toml,
+    load_model,
+    clf_eval,
+    mini_train,
+    get_train_info,
+    needs_big_ims,
+    slurmify_path,
+)
 
 
 def run(experiment_name, module_name, **kwargs):
@@ -20,7 +31,7 @@ def run(experiment_name, module_name, **kwargs):
     :param kwargs: Additional arguments (such as slurm id).
     """
 
-    slurm_id = kwargs.get('slurm_id', None)
+    slurm_id = kwargs.get("slurm_id", None)
     args = extract_toml(experiment_name, module_name)
 
     model_flag = args["model"]
@@ -37,6 +48,7 @@ def run(experiment_name, module_name, **kwargs):
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
     output_dir = slurmify_path(args["output_dir"], slurm_id)
+    budget = args.get("budget", None)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -46,12 +58,15 @@ def run(experiment_name, module_name, **kwargs):
     # Build datasets
     print("Building datasets...")
     big_ims = needs_big_ims(model_flag)
-    poisoner = pick_poisoner(poisoner_flag,
-                             dataset_flag,
-                             target_label,
-                             delta=delta)
-    poison_train, _, test, poison_test, _ =\
-        get_matching_datasets(dataset_flag, poisoner, clean_label, train_pct=train_pct, big=big_ims)
+    poisoner = pick_poisoner(poisoner_flag, dataset_flag, target_label, delta=delta)
+    poison_train, _, test, poison_test, _ = get_matching_datasets(
+        dataset_flag,
+        poisoner,
+        clean_label,
+        train_pct=train_pct,
+        big=big_ims,
+        budget=budget,
+    )
 
     # Train expert model
     print("Training expert model...")
@@ -63,7 +78,7 @@ def run(experiment_name, module_name, **kwargs):
         batch_size=batch_size,
         epochs=epochs,
         optim_kwargs=optim_kwargs,
-        scheduler_kwargs=scheduler_kwargs
+        scheduler_kwargs=scheduler_kwargs,
     )
 
     mini_train(
@@ -74,7 +89,9 @@ def run(experiment_name, module_name, **kwargs):
         opt=opt,
         scheduler=lr_scheduler,
         epochs=epochs,
-        callback=lambda m, o, e, i: checkpoint_callback(m, o, e, i, ckpt_iters, output_dir)
+        callback=lambda m, o, e, i: checkpoint_callback(
+            m, o, e, i, ckpt_iters, output_dir
+        ),
     )
 
     # Evaluate
@@ -83,6 +100,7 @@ def run(experiment_name, module_name, **kwargs):
     poison_test_acc = clf_eval(model, poison_test.poison_dataset)[0]
     print(f"{clean_test_acc=}")
     print(f"{poison_test_acc=}")
+
 
 if __name__ == "__main__":
     experiment_name, module_name = sys.argv[1], sys.argv[2]

@@ -1,12 +1,30 @@
 """
-Threat model "direct" (P^direct): jointly optimizes continuous poisoned logit labels
-(labels_syn) AND a backdoor trigger (delta) via federated trajectory matching, extending
-federated_generate_labels.py (which optimizes labels_syn alone, against a trigger fixed and
-baked into the dataset ahead of time).
+Threat model "direct" (P^direct), INDIRECT coupling: optimizes continuous poisoned logit
+labels (labels_syn) alongside a backdoor trigger (delta), via federated trajectory matching,
+extending federated_generate_labels.py (which optimizes labels_syn alone, against a trigger
+fixed and baked into the dataset ahead of time). "Jointly" here means delta and labels_syn are
+both trainable parameters in the SAME loop, NOT that both receive gradient from the same loss
+term -- see `run()`'s docstring: delta's ONLY gradient path is the isolated backdoor-efficacy
+term L_bd; the MTT trajectory-alignment term (param_loss, the bulk of grand_loss) never
+backpropagates into delta, because x_t_adv is `.detach()`-ed before it. For the version where
+delta is ALSO coupled through param_loss, see federated_generate_labels_trigger_joint.
+
+Expert-side federated aggregation (corrected, see docs/threat_models_audit.md): the expert
+model's optimizer step is now driven by `agg(expert_params, expert_grad_buf, agg_method,
+f=num_poisoned)` over ALL clients (honest + poisoned), symmetric to how the student side has
+always been aggregated via `agg(student_params, student_grad_buf, ...)`. Previously
+`expert_grad_buf` was populated by every client but never consumed -- `expert_model.
+zero_grad()` before each client's turn meant only the LAST client's raw `.grad` reached
+`optimizer_expert.step()`, a single-client (non-federated) expert update. The published
+baseline (federated_generate_labels) has this same bug -- with an abandoned, commented-out
+attempt at the identical fix already present in its code -- but is deliberately left
+unmodified; see docs/threat_models_audit.md for the full analysis and the arbitration that
+scoped this fix to this module and federated_generate_labels_trigger_joint only.
 """
 
 from pathlib import Path
 import sys
+import warnings
 import torch
 import numpy as np
 
@@ -20,12 +38,13 @@ from modules.federated_optimizing_trigger.utils import (
     get_mu, init_delta, raw_to_trigger_preprocess, get_raw_clean_dataset,
     trigger_penalty_hinge, tv_loss,
 )
-from modules.federated_generate_labels_trigger.utils import TriggerMTTDataset
+from modules.federated_generate_labels_trigger.utils import TriggerMTTDataset, extract_experts_biased
 
 
 def run(experiment_name, module_name, **kwargs):
     """
-    Jointly optimizes labels_syn (ell-tilde) and delta -- problem (P^direct):
+    Optimizes labels_syn (ell-tilde) and delta side by side -- problem (P^direct), INDIRECT
+    coupling:
 
         min_ell-tilde  E_t,{(x_i,y_i)}[ L_lambda(ell-tilde, theta_t, {(x_i,y_i)}) ]
         s.t. theta_T in argmin_theta E_(x^adv,y^adv)~D_poisoned[ L(f_theta(x^adv), y^adv) ]
@@ -41,6 +60,25 @@ def run(experiment_name, module_name, **kwargs):
       - the trigger's own constraint/regularizers: |delta|_inf <= epsilon (enforced via
         clamp_ after every step) and the optional lambda_penalty/lambda_delta/lambda_tv
         regularizers, reused UNCHANGED from federated_optimizing_trigger.utils.
+
+    IMPORTANT -- delta's gradient path (E1, corrected): despite the "min_ell-tilde" objective
+    above being written as if L_lambda depended on delta too, `grand_loss` (== L_lambda in
+    code) does NOT actually backpropagate into delta. In the poisoned-client branch below,
+    `x_t_adv[is_poisoned_dev] = x_trig.detach()` detaches the trigger-rebuilt images before
+    they enter `loss_e`/`loss_s` -- the entire MTT trajectory-alignment term (param_loss,
+    which is what `grand_loss` mostly consists of) is therefore constant w.r.t. delta. delta's
+    ONLY gradient comes from the separate, isolated `L_bd_cid` term (a plain classification
+    loss on the current expert's triggered predictions, backpropagated through its OWN
+    `torch.autograd.grad(lambda_bd*L_bd_cid, [delta], ...)` call, never touching `grand_loss`
+    or `expert_params.grad`). So: labels_syn is optimized against the full MTT alignment loss,
+    delta is optimized against backdoor efficacy alone, and the coupling between the two is
+    INDIRECT -- it only happens through the shared, re-retrained expert trajectory that both
+    influence in their own way, not through a shared differentiable loss term. This is a
+    deliberate simplification kept for stability/cost reasons, not a bug -- for the version
+    where delta ALSO receives gradient through param_loss (x_t_adv left undetached, the expert
+    step itself made differentiable), see the separate
+    `federated_generate_labels_trigger_joint` module: a new module, not a modification of this
+    one, since the two threat models are meant to coexist and be compared.
 
     Architecture note: federated_generate_labels' poisoned-client "adversarial" branch (x_t)
     is baked in at the PIL level by a FIXED poisoner before any training happens -- not
@@ -83,8 +121,36 @@ def run(experiment_name, module_name, **kwargs):
     output_dir = slurmify_path(args["output_dir"], slurm_id)
     attack = args.get("attack", "backdoor")
     clean_trajectory = args.get("clean_trajectory", False)
-    gamma = args.get("gamma", 1.0)
+    # gamma_stealth: a scalar stealth/backdoor loss weight (multiplies grand_loss below) --
+    # UNRELATED to federated_optimizing_trigger_policy's gamma = num_poisoned/(num_poisoned+
+    # num_honests), a federated-aggregation fraction. Same name, disjoint concepts (see
+    # docs/threat_models_audit.md §1/§7) -- renamed here to remove the collision. 'gamma' is
+    # still accepted (deprecated) so existing configs keep working.
+    if "gamma_stealth" in args:
+        gamma_stealth = args["gamma_stealth"]
+        if "gamma" in args:
+            raise ValueError(
+                "Pass exactly one of gamma_stealth or gamma (deprecated alias), not both."
+            )
+    elif "gamma" in args:
+        warnings.warn(
+            "'gamma' is deprecated in federated_generate_labels_trigger -- this is a "
+            "stealth/backdoor loss weight, unrelated to federated_optimizing_trigger_policy's "
+            "gamma = num_poisoned/(num_poisoned+num_honests). Use 'gamma_stealth' instead.",
+            DeprecationWarning, stacklevel=2,
+        )
+        gamma_stealth = args["gamma"]
+    else:
+        gamma_stealth = 1.0
     agg_method = args.get("agg_method", "mean")
+    if agg_method != "mean":
+        print(
+            f"WARNING: agg_method={agg_method!r} != 'mean' -- federated_optimizing_trigger_"
+            "policy's (P^mean) objective has no agg_method parameter and always assumes mean "
+            "aggregation. Comparing this run against a federated_optimizing_trigger_policy "
+            "run is no longer a single-factor (direct-vs-policy formulation) comparison: the "
+            "aggregator is a second, confounded factor."
+        )
 
     # Trigger hyperparameters -- same names as federated_optimizing_trigger_policy for direct
     # comparability between the two threat models.
@@ -99,6 +165,13 @@ def run(experiment_name, module_name, **kwargs):
     output_dir_trigger = slurmify_path(
         args.get("output_dir_trigger", "optimized_trigger"), slurm_id,
     )
+
+    # Checkpoint-sampling comparability (correction F): 'uniform' is THIS module's own prior
+    # behavior (extract_experts, np.random.randint) -- default kept as-is, no regression.
+    # federated_generate_labels_trigger_joint defaults to 'biased' instead (its own prior
+    # behavior). Set both to the same value to remove checkpoint sampling as a comparison factor.
+    checkpoint_sampling = args.get("checkpoint_sampling", "uniform")
+    alpha_ckpt = args.get("alpha_ckpt", 0.01)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -128,12 +201,17 @@ def run(experiment_name, module_name, **kwargs):
 
     # Load expert trajectories
     print("Loading expert trajectories...")
-    expert_starts, expert_opt_starts = extract_experts(
-        expert_config,
-        input_pths,
-        config['iterations'],
-        expert_opt_path=opt_pths
-    )
+    if checkpoint_sampling == "biased":
+        expert_starts, expert_opt_starts = extract_experts_biased(
+            expert_config, input_pths, config['iterations'], alpha_ckpt, expert_opt_path=opt_pths,
+        )
+    else:
+        expert_starts, expert_opt_starts = extract_experts(
+            expert_config,
+            input_pths,
+            config['iterations'],
+            expert_opt_path=opt_pths
+        )
 
     # Optimize labels and trigger jointly
     print("Training...")
@@ -280,6 +358,25 @@ def run(experiment_name, module_name, **kwargs):
                         for i, g in enumerate(grads_s):
                             student_grad_buf[i].append(g)
 
+                # Aggregate expert gradients across ALL clients (honest + poisoned) before the
+                # real optimizer step -- FIX (see docs/threat_models_audit.md): previously
+                # `expert_grad_buf` was populated by every client but never consumed;
+                # `expert_model.zero_grad()` ran before EACH client's turn, so only the LAST
+                # client's raw `.grad` survived to feed `optimizer_expert.step()` below --
+                # effectively a single-client (non-federated) expert update, while the student
+                # side was already properly aggregated via `agg()`. `agg()` sets `p.grad = g`
+                # for each param as a side effect, which is exactly what `optimizer_expert.
+                # step()` reads. This mirrors the SAME aggregation already applied to the
+                # student side two lines below -- same `agg_method`/`f=num_poisoned`. The
+                # published baseline (federated_generate_labels) has this identical bug (with
+                # the fix even attempted and then commented out there) but is intentionally
+                # NOT touched here -- see docs/threat_models_audit.md.
+                agg(
+                    expert_params,
+                    expert_grad_buf,
+                    agg_method,
+                    f=num_poisoned
+                )
                 optimizer_expert.step()
                 expert_model.eval()
 
@@ -317,7 +414,7 @@ def run(experiment_name, module_name, **kwargs):
                         param_dist += total_mse_distance(init_p, expert)
 
                     grand_loss = (param_loss / param_dist) + reg_term
-                    grand_loss = gamma * grand_loss
+                    grand_loss = gamma_stealth * grand_loss
 
                 # Trigger regularizers (optional, default 0) -- same terms/names as
                 # federated_optimizing_trigger_policy, reused unchanged.

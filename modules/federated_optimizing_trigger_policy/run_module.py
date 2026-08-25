@@ -1,3 +1,44 @@
+"""
+Theory: sec:attacker-problem (eq:P) -- (P^mean), the mean-aggregation attacker's problem:
+
+    min_{||delta||_inf<=eps, (u^i) in U_beta(fraktur)}
+        E_k[ ||Gbar(theta_bar_k) ubar - v_k(delta)||^2 / rho_k^2 ]
+        + kappa * E_k[ E_X[ loss_c(f_theta_bar_k(T_delta(X)), y_target)] ]
+    s.t. theta_bar_{k+1} = theta_bar_k - eta_k grad(theta_bar_k),  lambda = beta
+
+This module jointly optimizes the trigger `delta` and an explicit LOCAL label-flipping policy
+`u` (see rem:units -- u in U_loc, NOT the aggregate ubar in U_beta) against this objective,
+under `rem:solver`'s solver (b) (simultaneous descent on delta and u, not solver (a)'s exact
+inner QP + Danskin step -- see `optimize_trigger_policy_step`'s docstring for why, and the
+`B2_qp` diagnostic that quantifies the gap to solver (a)).
+
+Scope conventions adopted throughout this module (see docs/policy_module_audit_report.md
+Section 2.2 for the full derivation):
+  - `beta` (the module's own parameter) is the theory's LOCAL corruption rate -- the fraction
+    of a SINGLE corrupted worker's own shard that worker may flip -- NOT the theory's global
+    `beta := N_flip/n` (def:budget). Concretely `beta` (code) == `beta_theory / gamma`.
+  - `u` is correspondingly LOCAL: `u in U_loc = {u>=0, sum(u)<=beta, sum_c u_{y,c}<=pi_y}`
+    (eq:Uloc, `project_policy_budget`), one shared policy vector deployed identically by every
+    corrupted worker (the homogeneous configuration of lem:hom-wlog).
+  - A1 correction (docs/policy_module_audit_report.md Section 2.6): `lambda_poison="beta"`
+    (the default) resolves to `beta_global := gamma*beta` (== `beta_theory`, def:budget) as
+    `eq:P`'s constraint `lambda=beta` requires -- NOT the LOCAL `beta` directly (the pre-A1
+    behavior). This coupling is only theoretically justified when `s_beta :=
+    beta_global/(gamma*min_y(pi_y)) <= 1` (prop:budget-match's unsaturated-regime hypothesis;
+    `rem:saturated` lists `prop:budget-match` among the results lost once it fails) -- a
+    warning is printed at startup when `s_beta > 1`, and an explicit numeric `lambda_poison`
+    (used verbatim, unscaled) is the way to sweep lambda independently of beta in that regime.
+    See `optimize_trigger_policy`'s docstring.
+
+Chain position: consumes expert/trigger checkpoints (`expert_config`/`expert_path`, real
+weights, no theory correspondence of their own) and a raw dataset (for pi_y, the shift
+gradients G, and mu/mu_source). Produces (a) an optimized trigger `delta` (.pt, same naming
+convention as the sibling federated_optimizing_trigger module) and (b) an optimized LOCAL
+policy `u` alongside its metadata (pairs, beta, n_train, num_honests/num_poisoned/gamma --
+.npz). Both are consumed downstream by `federated_policy_to_flips`, which materializes `u` into
+concrete per-worker label flips for the (unmodified) `federated_train_user` victim-training
+pipeline.
+"""
 from modules.base_utils.datasets import get_n_classes
 from modules.base_utils.util import (
     get_train_info,
@@ -26,9 +67,12 @@ from modules.federated_optimizing_trigger.utils import (
     raw_to_trigger_preprocess,
     get_raw_clean_dataset,
     resolve_beta_and_lambda_poison,
+    project_gradient,
 )
 from modules.federated_optimizing_trigger.run_module import build_loader
-from modules.federated_optimizing_trigger_policy.utils import init_policy, project_policy_budget
+from modules.federated_optimizing_trigger_policy.utils import (
+    init_policy, project_policy_budget, project_gradient_descent_local,
+)
 from modules.train_expert.utils import checkpoint_callback
 import torch
 from torch.utils.data import ConcatDataset, Subset
@@ -59,31 +103,62 @@ def _compute_step_policy(
     flip_grad_cache,
     class_samples_raw,
     pi,
+    gamma,
+    beta,
+    beta_global,
+    pairs,
+    normalization,
     checkpoint_backward,
     lambda_bd,
+    run_diag,
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
 
-        v = mu_p - g_c                                     poisoning-induced gradient shift
-                                                             (identical to `_compute_step` in
-                                                             federated_optimizing_trigger)
-        Gu = Gbar_k @ u                                     policy-reachable gradient shift,
-                                                             Gbar_k = compute_expected_flip_
-                                                             gradients' G (already the mean-
-                                                             aggregation-consistent, pi_y-
-                                                             weighted expected direction a
-                                                             label-flipping policy induces)
+        v = mu_p - g_c  poisoning-induced gradient shift (identical to `_compute_step` in federated_optimizing_trigger)
+        Gu = G_obj_k @ u policy-reachable gradient shift
+        under MEAN aggregation, u being a LOCAL policy (fraction of a SINGLE
+        corrupted worker's own shard -- same scope as `beta` and
+        `project_policy_budget`, see prelim/SPEC.md's U_loc). G_obj_k is
+        built from `compute_expected_flip_ gradients`' G_k (columns
+        pi_y*(g_{y,c}-g_{y,y})) by two per-column rescalings, done ONCE
+        when the cache is filled below:
+             (i)  divide by pi_y -- G_k's pi_y factor makes u AN
+              AGGREGATE/population rate (materialize_policy_flips
+              computes round(u*n_train), i.e. treats u as exactly
+              that); undo it to get H[:,(y,c)] = g_{y,c}-g_{y,y}
+            for a LOCAL, per-worker u.
+            (ii) multiply by gamma = num_poisoned / (num_poisoned + num_honests) -- n_p corrupted workers, EACH deploying the same local u, contribute a gamma*H@u shift to the MEAN-aggregated
+             gradient (n_p/n_b of them carry the shift, the rest
+            contribute ~0), not H@u.
 
-        B2_k = ||Gu - v||^2 / (||v||^2 + eps)               alignment between what the trigger
-                                                             does and what the learned policy u
-                                                             can reproduce -- same structure as
-                                                             federated_optimizing_trigger's B2
-                                                             (compute_v_polytope_distance), but
-                                                             u is a jointly-learned parameter
-                                                             instead of the QP optimum w*.
-        L_bd_k = CE(f_theta_k(T_delta(x)), y_target)        backdoor loss on triggered examples
+        Net: G_obj_k = (gamma/pi_y) * G_k column-wise. `u` itself is
+        projected onto its LOCAL feasible set {u>=0, sum(u)<=beta,
+        sum_c u_{y,c}<=pi_y} by `project_policy_budget` in the
+        caller -- NOT gamma*pi_y: a single worker's own capacity has nothing
+        to do with how many other corrupted workers exist.
 
-    Both are averaged over sampled_k, matching `_compute_step`'s convention (same keys: B2,
+        rho_k = beta_global * varsigma_k       (eq:rho, A2) radius of the reachable set under
+        the GLOBAL beta (def:budget) -- varsigma_k = max_{y,c}||G_k[:,(y,c)]/pi_y|| (eq:varsigma,
+        named explicitly, not fused into this formula -- A2). beta_global = gamma*beta (this
+        module's own, LOCAL `beta` -- see the module header docstring's scope section and A1);
+        NOT `beta` directly, unlike before A1's correction. Depends only on the checkpoint and
+        beta_global, so cached alongside G_obj_k/Q_obj_k.
+
+        B2_k = ||Gu - v||^2 / rho_k^2   ("rho", default)   alignment between what the trigger  or ||Gu - v||^2 / (||v||^2+eps)  ("v")        does and what the learned policy u can reproduce. Both variants are always computed and logged (see `normalization`); "rho" is a delta-independent, non-saturating denominator (unlike "v", which saturates at exactly 1 whenever u=0 is outside the reachable set, and whose gradient signal to delta decays as delta moves further out of reach).
+
+        L_bd_k = CE(f_theta_k(T_delta(x)), y_target) backdoor loss on triggered examples
+
+    If `run_diag` (see `diag_every` in the caller), also solves for w*_k on U_loc ITSELF (A4:
+    via `project_gradient_descent_local`, projected gradient descent with the exact
+    `project_policy_budget` projection, warm-started from the current `u` -- NOT the shared
+    `federated_optimizing_trigger.utils.project_gradient`, which enforces only the global
+    sum(w)<=beta constraint and would solve over a strictly LARGER polytope than u's own U_loc)
+    and reports B2(w*_k) as `B2_qp` alongside B2(u) under the SAME normalization -- the
+    Danskin-gap diagnostic (see optimize_trigger_policy_step's docstring): if u is tracking
+    delta well, B2_qp should sit close to B2. The PRE-A4 (global-budget-only) diagnostic value
+    is kept under `B2_qp_relaxed` for one transition period.
+
+    All terms are averaged over sampled_k, matching the original convention (same keys: B2,
     L_bd, lambda_effective) so the two threat models' per-step metrics stay directly
     comparable.
     '''
@@ -94,6 +169,14 @@ def _compute_step_policy(
     n_b = x_raw.shape[0]
     x_clean = raw_to_preprocess(x_raw, dataset_flag=dataset_flag, model_flag=model_flag)
 
+    # A3 (docs/policy_module_audit_report.md): the mask below can select AT MOST
+    # idx_source.numel() rows -- the source-class examples actually present in THIS batch
+    # (~pi_source*n_b on average) -- regardless of how large lambda_poison is. Unlike
+    # get_poison_dataset (ADD-based, used for theta_bar_k's retraining), this per-batch mask
+    # never duplicates rows to reach target_count, so lambda_effective is capped near
+    # pi_source whenever lambda_poison > pi_source. See lambda_effective_ratio below and the
+    # startup guard in optimize_trigger_policy (raises if lambda_poison > pi_source, since the
+    # cap is then structurally guaranteed, not just possible on an unlucky batch).
     mask = y == source_label
     y_poison = y.clone()
     has_poison = bool(mask.sum().item() > 0)
@@ -107,8 +190,13 @@ def _compute_step_policy(
         y_poison[mask] = target_label
 
     lambda_effective = mask.sum().item() / n_b if n_b > 0 else 0.0
+    # A3: ratio of what was actually realized to what was requested -- 1.0 means uncapped this
+    # batch, < 1.0 means the source-class supply in this batch fell short of target_count.
+    lambda_effective_ratio = lambda_effective / lambda_poison if lambda_poison > 0 else 0.0
 
     B2_sum, bd_loss_sum = None, None
+    B2_rho_sum, B2_v_sum, B2_qp_sum = None, None, None
+    B2_qp_relaxed_sum, pg_iters_sum, pg_obj_decrement_sum = None, None, None
     n_valid = 0
 
     for k in sampled_k:
@@ -133,44 +221,181 @@ def _compute_step_policy(
         )
         mu_p = torch.cat([g.reshape(-1) for g in grads_p])
 
+        # Theory: sec:trigger-vk (eq:vk-delta) -- v_k(delta) = grad_Lp[delta](theta_k) -
+        # grad_Lc(theta_k), the trigger-induced gradient shift (mu_p, g_c standing in for the
+        # two gradients under the batch's poisoned/clean labels respectively).
         v = mu_p - g_c
 
         if k in flip_grad_cache:
-            G_k, _, _ = flip_grad_cache[k]
+            G_obj, Q_obj, pairs_k, rho_k = flip_grad_cache[k]
         else:
+            # Theory: def:shifts (eq:shift) -- Gbar_{y,c} = g_{y,c} - g_{y,y}, WITH NO pi_y
+            # factor (rem:no-pi). The shared compute_expected_flip_gradients still returns the
+            # PRE-rem:no-pi convention (G_k[:,(y,c)] = pi_y*(g_{y,c}-g_{y,y}), an earlier draft's
+            # definition -- see federated_optimizing_trigger/utils.py's own docstring) and is
+            # not modified here (shared, read-only): the two-factor rescaling below is where
+            # this module corrects it back to the def:shifts convention. PIEGE 1 (pi_y
+            # convention): do not double-correct -- compute_expected_flip_gradients' OWN
+            # docstring calls its pi_y factor deliberate for ITS internal budget-constraint
+            # convention (a DIFFERENT, simpler scheme used elsewhere); it is this module's job,
+            # not that shared function's, to strip it back out for eq:P's Gbar.
             G_k, Q_k, pairs_k = compute_expected_flip_gradients(
                 M, loss_fn, class_samples_raw, n_classes, pi,
                 dataset_flag=dataset_flag, model_flag=model_flag, params=params,
             )
-            flip_grad_cache[k] = (G_k, Q_k, pairs_k)
+            # See this function's docstring: G_k's columns are pi_y*(g_{y,c}-g_{y,y})
+            # (aggregate-rate convention); u is local, so rescale by gamma/pi_y once here and
+            # cache the result instead of G_k -- never rescaled again per-batch.
+            #   (i)  /pi_y : undoes compute_expected_flip_gradients' pi_y factor -> Gbar itself
+            #        (def:shifts, rem:no-pi).
+            #   (ii) *gamma: theory's LOCAL reading of eq:P (the paragraph right after the
+            #        lambda=beta constraint) -- b_k = gamma*Gbar(theta_bar_k)*u^i
+            #        (eq:local-scope) when the decision variable is the per-worker u^i rather
+            #        than the aggregate ubar. PIEGE 2 (local/aggregate scope): these are TWO
+            #        SEPARATE corrections that compose multiplicatively (gamma/pi_y), not one --
+            #        see docs/policy_module_audit_report.md Section 2.1/2.2.
+            scale = torch.tensor(
+                [gamma / pi[y] for (y, c) in pairs_k], device=G_k.device, dtype=G_k.dtype,
+            )
+            G_obj = G_k * scale
+            scale_np = scale.detach().cpu().numpy().astype(np.float64)
+            Q_obj = np.outer(scale_np, scale_np) * Q_k
 
-        Gu = G_k @ u.to(dtype=G_k.dtype)
-        den = v.detach().norm() ** 2 + eps_den
-        B2_k = ((Gu - v) ** 2).sum() / den
+            # A2 (docs/policy_module_audit_report.md Section "rayon de shift"): varsigma_k
+            # exposed as its OWN named variable -- Theory: eq:varsigma, varsigma_k =
+            # max_{y,c}||Gbar_{y,c}||, Gbar_{y,c} = G_k[:,(y,c)]/pi_y (the pi_y factor stripped
+            # back out, def:shifts/rem:no-pi -- PIEGE 1) -- rather than folded into a single
+            # fused norm call, so `rho_k = beta_global * varsigma_k` (eq:rho) can be read off
+            # directly without re-deriving it from G_obj's own gamma/pi_y scaling.
+            pi_col = torch.tensor(
+                [pi[y] for (y, c) in pairs_k], device=G_k.device, dtype=G_k.dtype,
+            )
+            varsigma_k = (G_k.detach() / pi_col).norm(dim=0).max().item()
+            rho_k = beta_global * varsigma_k
 
-        # L_bd: CE restricted to the actually-triggered examples only (see
-        # federated_optimizing_trigger's `_compute_step` docstring).
+            # A2 self-check (run once, first checkpoint cached this call): rho_k above must
+            # equal beta_local * max_col_norm(G_obj) exactly, since G_obj's own gamma factor
+            # (PIEGE 2) cancels against beta_local's local scope (beta_local*gamma ==
+            # beta_global by construction, A1) -- NOT a coincidence, but fragile: this assertion
+            # catches a future change that drops G_obj's gamma factor or switches beta to
+            # global scope without updating rho_k to match.
+            if len(flip_grad_cache) == 0:
+                rho_k_check = beta * G_obj.detach().norm(dim=0).max().item()
+                # rtol=1e-2 (not float32 machine precision): the two paths take DIFFERENT
+                # float32 multiply/reduction orders over a D~10^5-10^6 parameter vector (D =
+                # number of model params), so a ~1e-4 RELATIVE gap is normal accumulation
+                # noise, empirically observed (~1.4e-4 on r32p/CIFAR -- see
+                # prelim/verify_A1_A2_A5.py), not a sign of an algebraic error. A REAL
+                # regression (dropped gamma factor, wrong beta scope) would be off by a
+                # constant factor like gamma or 1/gamma -- orders of magnitude past this
+                # tolerance, not a rounding-sized gap.
+                assert abs(rho_k_check - rho_k) < 1e-2 * max(abs(rho_k), 1e-8), (
+                    f"A2 self-check failed: rho_k={rho_k:.6f} (beta_global*varsigma_k) vs "
+                    f"rho_k_check={rho_k_check:.6f} (beta_local*max_col_norm(G_obj)) -- these "
+                    "should match to within float32 rounding (beta_local*gamma == "
+                    "beta_global by construction). A mismatch this large means the gamma/pi_y "
+                    "scaling changed inconsistently -- see docs/theory/threat_model.tex eq:rho "
+                    "and this module's header docstring."
+                )
+
+            flip_grad_cache[k] = (G_obj, Q_obj, pairs_k, rho_k)
+
+        # Theory: eq:P's first term (local reading, the paragraph right after the lambda=beta
+        # constraint) -- ||gamma*Gbar(theta_bar_k)*u^i - v_k(delta)||^2 / rho_k^2. G_obj already
+        # carries the gamma factor (see above), so Gu below IS gamma*Gbar@u^i directly.
+        Gu = G_obj @ u.to(dtype=G_obj.dtype)
+        sq_err = ((Gu - v) ** 2).sum()
+        den_v = v.detach().norm() ** 2 + eps_den
+        den_rho = rho_k ** 2 + eps_den
+        B2_v_k = sq_err / den_v
+        B2_rho_k = sq_err / den_rho
+        B2_k = B2_rho_k if normalization == "rho" else B2_v_k
+
+        # Theory: eq:P's second term, kappa*E_k[E_X[loss_c(f(T_delta(X)), y_target)]] -- this
+        # module names the weight `lambda_bd` (kept distinct from `kappa`, which here names
+        # trigger_penalty_hinge's STEALTH margin instead, see that function). L_bd: CE
+        # restricted to the actually-triggered examples only (see federated_optimizing_trigger's
+        # `_compute_step` docstring).
         L_bd_k = (
             loss_fn(logits_p[mask], y_poison[mask])
             if mask.sum() > 0 else torch.tensor(0.0, device=device)
         )
 
+        # A4 (docs/policy_module_audit_report.md Section 2.5/A4) -- Theory: rem:solver's
+        # diagnostic, now solving on U_loc ITSELF (eq:Uloc, the same feasible set u is
+        # actually optimized over) via projected gradient descent
+        # (`project_gradient_descent_local`, warm-started from the current u), replacing the
+        # old QP over a strictly LARGER polytope (global sum(w)<=beta only, via the shared
+        # project_gradient -- no per-class pi_y caps). Reported as `B2_qp` (the corrected
+        # value); the OLD (relaxed-polytope) value is kept under `B2_qp_relaxed` for one
+        # transition period so the two can be compared on the same run.
+        B2_qp_k, B2_qp_relaxed_k = None, None
+        pg_iters_k, pg_obj_decrement_k = None, None
+        if run_diag:
+            c_np = (G_obj.T @ v).detach().cpu().numpy().astype(np.float64)
+            den_qp = den_rho if normalization == "rho" else den_v
+
+            w_pg, pg_iters_k, pg_obj_decrement_k = project_gradient_descent_local(
+                Q_obj, c_np, u.detach(), beta, pairs_k, pi,
+            )
+            w_pg = w_pg.to(device=v.device, dtype=v.dtype)
+            sq_err_pg = ((G_obj @ w_pg - v.detach()) ** 2).sum()
+            B2_qp_k = (sq_err_pg / den_qp).detach()
+
+            # B2_qp_relaxed: the PRE-A4 diagnostic (global budget only, strict superset of
+            # U_loc) -- see the docstring note above.
+            w_star = project_gradient(Q_obj, c_np, beta, pairs_k)
+            w_star = w_star.to(device=v.device, dtype=v.dtype)
+            sq_err_qp = ((G_obj @ w_star - v.detach()) ** 2).sum()
+            B2_qp_relaxed_k = (sq_err_qp / den_qp).detach()
+
         if checkpoint_backward:
             step_loss = (B2_k + lambda_bd * L_bd_k) / n_exp
             step_loss.backward()
             B2_k, L_bd_k = B2_k.detach(), L_bd_k.detach()
+            B2_rho_k, B2_v_k = B2_rho_k.detach(), B2_v_k.detach()
 
         if B2_sum is None:
             B2_sum, bd_loss_sum = B2_k, L_bd_k
+            B2_rho_sum, B2_v_sum = B2_rho_k, B2_v_k
         else:
             B2_sum = B2_sum + B2_k
             bd_loss_sum = bd_loss_sum + L_bd_k
+            B2_rho_sum = B2_rho_sum + B2_rho_k
+            B2_v_sum = B2_v_sum + B2_v_k
+        if B2_qp_k is not None:
+            B2_qp_sum = B2_qp_k if B2_qp_sum is None else B2_qp_sum + B2_qp_k
+            B2_qp_relaxed_sum = (
+                B2_qp_relaxed_k if B2_qp_relaxed_sum is None
+                else B2_qp_relaxed_sum + B2_qp_relaxed_k
+            )
+            pg_iters_sum = pg_iters_k if pg_iters_sum is None else pg_iters_sum + pg_iters_k
+            pg_obj_decrement_sum = (
+                pg_obj_decrement_k if pg_obj_decrement_sum is None
+                else pg_obj_decrement_sum + pg_obj_decrement_k
+            )
         n_valid += 1
 
     B2 = B2_sum / n_valid
     L_bd = bd_loss_sum / n_valid
+    B2_rho = (B2_rho_sum / n_valid).item()
+    B2_v = (B2_v_sum / n_valid).item()
+    B2_qp = (B2_qp_sum / n_valid).item() if B2_qp_sum is not None else None
+    B2_qp_relaxed = (
+        (B2_qp_relaxed_sum / n_valid).item() if B2_qp_relaxed_sum is not None else None
+    )
+    pg_iters = (pg_iters_sum / n_valid) if pg_iters_sum is not None else None
+    pg_obj_decrement = (
+        (pg_obj_decrement_sum / n_valid) if pg_obj_decrement_sum is not None else None
+    )
 
-    return {"B2": B2, "L_bd": L_bd, "lambda_effective": lambda_effective}
+    return {
+        "B2": B2, "L_bd": L_bd, "lambda_effective": lambda_effective,
+        "lambda_effective_ratio": lambda_effective_ratio,
+        "B2_rho": B2_rho, "B2_v": B2_v, "B2_qp": B2_qp,
+        "B2_qp_relaxed": B2_qp_relaxed, "pg_iters": pg_iters,
+        "pg_obj_decrement": pg_obj_decrement,
+    }
 
 
 def optimize_trigger_policy_step(
@@ -194,24 +419,50 @@ def optimize_trigger_policy_step(
     num_chckpt,
     epsilon,
     beta,
+    beta_global,
     lambda_poison,
     n_classes,
     class_samples_raw,
     pi,
+    gamma,
+    pairs,
     run_tag,
     device="cuda",
     dataset_flag="cifar",
     init="stripe",
     model_flag="r32p",
     checkpoint_backward=True,
+    normalization="rho",
+    diag_every=50,
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
     Mirrors federated_optimizing_trigger.run_module.optimize_trigger_step, but replaces its
     QP-projected w* (compute_v_polytope_distance) with the jointly-learned policy u, stepped
-    by its own Adam optimizer and projected onto U_beta = {u>=0, sum(u)<=beta} after every
-    batch: the discrete/QP label-flip feasibility check becomes an explicit, differentiable
-    attack policy, co-trained with delta instead of solved in closed form at each step.
+    by its own Adam optimizer and projected onto u's LOCAL feasible set
+    {u>=0, sum(u)<=beta, sum_c u_{y,c}<=pi_y} (`project_policy_budget`) after every batch: the
+    discrete/QP label-flip feasibility check becomes an explicit, differentiable attack
+    policy, co-trained with delta instead of solved in closed form at each step.
+
+    Theory: prop:structure(iii) states min_delta min_u == min_{(delta,u)} -- a genuinely joint
+    problem, not a decoupling; rem:solver then admits TWO solvers consistent with that: (a)
+    exact inner QP solve for u*(delta) each outer step, detached, plus a Danskin
+    projected-gradient step on delta (prop:danskin) -- the reported objective is then EXACTLY
+    E_k[a_k/rho_k^2] and the delta-gradient is the true hypergradient; (b) simultaneous descent
+    on delta AND u together, projecting u after each step -- cheaper, still a valid descent
+    method on the joint objective, but u LAGS delta.
+
+    PIEGE 3 (which solver, and what it costs): this function implements solver (b) -- u is
+    co-descended with delta (two Adam optimizers, `optimizer_delta`/`optimizer_policy`, each
+    stepped once per batch after a SINGLE shared `.backward()` -- see `_compute_step_policy`'s
+    B2_k/L_bd_k, neither ever detaches u), NOT solver (a)'s resolved-and-detached optimum. Per
+    rem:solver this has two consequences that must stay visible rather than being silently
+    absorbed into "B2": the reported `B2` (B2_rho/B2_v) OVERSTATES `E_k[a_k/rho_k^2]` by
+    whatever amount u lags delta, and prop:danskin does NOT apply -- delta's gradient here is
+    NOT the hypergradient of V(delta):=min_u J(delta,u). `diag_every` controls the periodic
+    diagnostic rem:solver itself prescribes as the reconciliation: solve the QP optimum on the
+    SAME v_k (see `_compute_step_policy`) and report it (`B2_qp`) alongside the co-descended
+    `B2`, so the gap -- the quantity to monitor -- is measured rather than assumed small.
     '''
     sampled_k = sample_checkpoints(
         len(expert_models), num_chckpt, alpha=alpha_ckpt, device=device,
@@ -231,16 +482,23 @@ def optimize_trigger_policy_step(
     )
 
     hinge_window = []
-    metrics_history = {"B2": [], "L_bd": [], "lambda_effective": [], "beta_used": []}
+    metrics_history = {
+        "B2": [], "L_bd": [], "lambda_effective": [], "lambda_effective_ratio": [],
+        "beta_used": [],
+        "B2_rho": [], "B2_v": [], "B2_qp": [],
+        "B2_qp_relaxed": [], "pg_iters": [], "pg_obj_decrement": [],
+    }
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         optimizer_delta.zero_grad()
         optimizer_policy.zero_grad()
 
+        run_diag = (batch_idx % diag_every == 0)
         result = _compute_step_policy(
             batch, expert_models, sampled_k, source_label, target_label, loss_fn, delta, u,
             device, dataset_flag, model_flag, lambda_poison, n_classes,
-            flip_grad_cache, class_samples_raw, pi, checkpoint_backward, lambda_bd,
+            flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global, pairs,
+            normalization, checkpoint_backward, lambda_bd, run_diag,
         )
         B2, L_bd = result["B2"], result["L_bd"]
 
@@ -269,7 +527,7 @@ def optimize_trigger_policy_step(
 
         with torch.no_grad():
             delta.clamp_(-epsilon, epsilon)
-            u.copy_(project_policy_budget(u, beta))
+            u.copy_(project_policy_budget(u, beta, pairs, pi))
 
         hinge_window.append(L_pen.item() > 0)
         if len(hinge_window) > WINDOW_SIZE:
@@ -279,17 +537,33 @@ def optimize_trigger_policy_step(
         metrics_history["B2"].append(B2.item())
         metrics_history["L_bd"].append(L_bd.item())
         metrics_history["lambda_effective"].append(result["lambda_effective"])
+        metrics_history["lambda_effective_ratio"].append(result["lambda_effective_ratio"])
         metrics_history["beta_used"].append(beta_used)
+        metrics_history["B2_rho"].append(result["B2_rho"])
+        metrics_history["B2_v"].append(result["B2_v"])
+        if result["B2_qp"] is not None:
+            metrics_history["B2_qp"].append(result["B2_qp"])
+            metrics_history["B2_qp_relaxed"].append(result["B2_qp_relaxed"])
+            metrics_history["pg_iters"].append(result["pg_iters"])
+            metrics_history["pg_obj_decrement"].append(result["pg_obj_decrement"])
 
-        pbar.set_postfix({
+        postfix = {
             "B2": f"{B2.item():.6f}",
             "L_bd": f"{L_bd.item():.4f}",
             "lambda_eff": f"{result['lambda_effective']:.4f}",
+            "lambda_eff_ratio": f"{result['lambda_effective_ratio']:.3f}",
             "L_pen": f"{L_pen.item():.4f}",
             "hinge_rate": f"{sum(hinge_window) / len(hinge_window):.2f}",
             "||delta||": f"{delta.norm().item():.4f}",
             "beta_used": f"{beta_used:.4f}",
-        })
+        }
+        if result["B2_qp"] is not None:
+            # A4: B2_qp is now the U_loc-correct projected-gradient value; B2_qp_relaxed is
+            # the old, looser-polytope QP value, kept for transition-period comparison.
+            postfix["B2_qp"] = f"{result['B2_qp']:.6f}"
+            postfix["B2_qp_relaxed"] = f"{result['B2_qp_relaxed']:.6f}"
+            postfix["pg_decr"] = f"{result['pg_obj_decrement']:.3e}"
+        pbar.set_postfix(postfix)
 
     delta_img = delta.detach().cpu().numpy().transpose(1, 2, 0)
     delta_img = (delta_img - delta_img.min()) / (
@@ -357,6 +631,9 @@ def optimize_trigger_policy(
     batch_size_trigger=256,
     flip_gradient_samples_per_class=64,
     metrics_log_path=None,
+    normalization="rho",
+    diag_every=50,
+    expert_budget=None,
 ):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
@@ -380,16 +657,104 @@ def optimize_trigger_policy(
     n_train = len(raw_train_dataset)
     n_classes = get_n_classes(dataset_flag)
 
-    # beta / lambda_poison resolution, shared with federated_optimizing_trigger so that
-    # lambda == beta (the (P^mean) constraint) is enforced identically in both pipelines.
+    # beta / lambda_poison resolution -- shared with federated_optimizing_trigger (unmodified,
+    # see federated_optimizing_trigger/utils.py:resolve_beta_and_lambda_poison).
+    # NOTE: unlike in federated_optimizing_trigger (where resolve_beta_and_lambda_poison's
+    # docstring is accurate), num_honests/num_poisoned are NOT logging-only here: gamma =
+    # num_poisoned / (num_poisoned + num_honests), derived from them below, enters the
+    # (P^mean) objective directly (see `_compute_step_policy`) and the flip materialization
+    # downstream (federated_policy_to_flips). beta remains the LOCAL rate (fraction of a
+    # single corrupted worker's own shard) exactly as resolve_beta_and_lambda_poison computes
+    # it -- resolve_beta_and_lambda_poison's own flip_budget formula
+    # (beta * num_poisoned * n_train / n_w) already assumes this scope.
+    lambda_poison_requested = lambda_poison  # A1: captured BEFORE resolution, see below
     beta, flip_budget, lambda_poison = resolve_beta_and_lambda_poison(
         beta, flip_budget, lambda_poison, num_poisoned, num_honests, n_train,
     )
+    gamma = num_poisoned / (num_poisoned + num_honests)
 
     # pi (class frequencies) depends only on the dataset -- computed once, reused below and
-    # for the B2-analog objective.
+    # for the B2-analog objective. Deliberately decoupled from train_expert's own `budget`
+    # (which, if set, grows that module's OWN training set by an ADDED, not substituted,
+    # poisoned segment -- see modules/base_utils/datasets.get_matching_datasets): pi_y here
+    # describes the composition of the attacker's shard (what u operates on), not the
+    # population the expert checkpoints were pretrained on. If `expert_budget` is given (the
+    # `budget` value used for the train_expert run that produced these checkpoints, purely for
+    # this log line -- NOT threaded into pi/n_train/beta), report how far the expert's actual
+    # realized poison rate drifts from lambda_poison because of that addition-not-replacement:
+    # lambda_expert_realise = expert_budget / (n_train + expert_budget) is typically a few
+    # percentage points below lambda_poison for the same nominal budget.
     pi = compute_class_frequencies(dataset_flag, n_classes)
     pi_source = pi[source_label]
+
+    # A1 correction (docs/policy_module_audit_report.md Section 2.6): resolve_beta_and_
+    # lambda_poison (shared) resolves lambda_poison="beta" to `beta` itself -- mechanically
+    # true, but `beta` above is the LOCAL rate (beta_theory/gamma), while eq:P's constraint
+    # `lambda=beta` (sec:attacker-problem) names the GLOBAL beta of def:budget. Only the
+    # "beta"-coupled case is corrected here: an EXPLICIT numeric lambda_poison in the config
+    # (lambda_poison_requested is a float, not the string "beta") is used VERBATIM, unscaled --
+    # that is the whole point of exposing it (see the s_beta warning below): it lets a campaign
+    # sweep lambda independently of beta when the coupling isn't theoretically justified.
+    beta_global = gamma * beta  # = beta_theory (def:budget) -- rem:units' aggregate-units beta
+    if lambda_poison_requested == "beta":
+        lambda_poison = beta_global
+    print(
+        f"beta_local={beta:.6f} (this module's own scope) -> beta_global={beta_global:.6f} "
+        f"(= gamma*beta_local, def:budget) -- lambda_poison resolved to "
+        f"{lambda_poison:.6f} ({'beta_global, A1-corrected' if lambda_poison_requested == 'beta' else 'explicit numeric override, unscaled'})."
+    )
+
+    # rem:saturated / prop:budget-match: eq:P's `lambda=beta` constraint (and the budget-
+    # matching argument behind it, prop:budget-match) is only derived under
+    # beta<=gamma*min_y(pi_y) (the UNSATURATED regime); prop:budget-match is explicitly listed
+    # among the results "genuinely lost" once capacities bind (rem:saturated). s_beta > 1 means
+    # this run's beta exceeds that threshold -- the lambda=beta coupling is not theoretically
+    # justified here, and lambda should be swept explicitly rather than locked to beta.
+    pi_min = min(pi.values())
+    s_beta = beta_global / (gamma * pi_min)
+    if s_beta > 1:
+        print(
+            f"WARNING: s_beta={s_beta:.4f} > 1 (beta_global={beta_global:.6f}, gamma={gamma:.4f}, "
+            f"min_y(pi_y)={pi_min:.6f}) -- SATURATED regime (rem:saturated): "
+            "prop:budget-match's hypothesis beta<=gamma*min_y(pi_y) does not hold, so eq:P's "
+            "lambda=beta constraint is not theoretically justified for this configuration. "
+            "Consider passing an explicit numeric lambda_poison (rather than the default "
+            "\"beta\") and sweeping it independently."
+        )
+    else:
+        print(f"s_beta={s_beta:.4f} <= 1 -- unsaturated regime, lambda=beta is justified (prop:budget-match).")
+
+    # A3 (docs/policy_module_audit_report.md, option (ii)): _compute_step_policy's per-batch
+    # mask can select at most idx_source.numel() rows (~pi_source*n_b), so lambda_effective is
+    # structurally capped near pi_source whenever lambda_poison exceeds it -- this is
+    # detectable a priori, not just observable on an unlucky batch, so it is a startup error
+    # rather than a per-batch warning. theta_bar_k's retraining (get_poison_dataset, ADD-based,
+    # below) does NOT have this cap -- it reaches lambda_poison exactly (mod overflow, already
+    # logged) -- so leaving this uncaught would train theta_bar_k and compute v_k at two
+    # DIFFERENT, silently-diverging rates. Chosen over lifting the cap via duplication (the
+    # other option presented for arbitration): duplicating rows in the objective's own batch
+    # would change what v_k measures, which is undesirable while A1 has just changed
+    # lambda_poison's own scale -- see docs/policy_module_audit_report.md for the two options.
+    if lambda_poison > pi_source:
+        raise ValueError(
+            f"A3: lambda_poison={lambda_poison:.6f} > pi_source={pi_source:.6f} -- "
+            "_compute_step_policy's per-batch mask cannot realize this rate (it selects from "
+            "the source-class rows actually present in a batch, ~pi_source*n_b, never "
+            "duplicating), so lambda_effective would be structurally capped near pi_source "
+            "while theta_bar_k's retraining (get_poison_dataset, ADD-based) reaches "
+            "lambda_poison exactly -- the two would silently diverge. Lower beta (hence "
+            "lambda_poison, if lambda_poison=\"beta\") or pass an explicit numeric "
+            "lambda_poison already <= pi_source."
+        )
+
+    if expert_budget is not None:
+        lambda_expert_realise = expert_budget / (n_train + expert_budget)
+        print(
+            f"lambda_poison={lambda_poison:.6f} (objective/expert-retraining target rate) vs "
+            f"lambda_expert_realise={lambda_expert_realise:.6f} (train_expert's actual "
+            f"realized rate with expert_budget={expert_budget}, n_train={n_train} -- "
+            "get_matching_datasets ADDS poisoned examples rather than replacing clean ones)."
+        )
 
     trigger_opt_dataset = raw_train_dataset
     if source_duplication and lambda_poison > pi_source:
@@ -509,16 +874,21 @@ def optimize_trigger_policy(
             num_chckpt=num_chckpt,
             epsilon=epsilon,
             beta=beta,
+            beta_global=beta_global,
             lambda_poison=lambda_poison,
             n_classes=n_classes,
             class_samples_raw=class_samples_raw,
             pi=pi,
+            gamma=gamma,
+            pairs=pairs,
             run_tag=run_tag,
             device=device,
             dataset_flag=dataset_flag,
             init=init,
             model_flag=model_flag,
             checkpoint_backward=checkpoint_backward,
+            normalization=normalization,
+            diag_every=diag_every,
         )
 
         del expert_models
@@ -542,31 +912,52 @@ def optimize_trigger_policy(
 
 def run(experiment_name, module_name, **kwargs):
     """
-    Jointly optimizes a backdoor trigger (delta) and an explicit label-flipping attack
-    policy (u), under mean aggregation -- problem (P^mean):
+    Theory: sec:attacker-problem (eq:P) -- jointly optimizes a backdoor trigger (delta) and an
+    explicit label-flipping attack policy (u), under mean aggregation -- problem (P^mean):
 
-        min_{|delta|_inf<=eps, u in U_beta}
-            E_k[ ||Gbar(theta_bar_k) u - v_k(delta)||^2 / rho_k^2 ]
+        min_{|delta|_inf<=eps, u in U_loc}
+            E_k[ ||gamma * H(theta_bar_k) u - v_k(delta)||^2 / rho_k^2 ]
             + kappa * E_k[ E_X[ loss_c(f_theta_bar_k(T_delta(X)), y_target) ] ]
         s.t.  theta_bar_{k+1} = theta_bar_k - eta_k grad(theta_bar_k),  lambda = beta
 
-    Gbar(theta_bar_k) is `compute_expected_flip_gradients`'s G: the pi_y-weighted expected
-    per-class-pair gradient direction reachable by a label-flipping policy on the attacker's
-    own shard -- exactly the mean-aggregation-consistent reachable set already used by
-    federated_optimizing_trigger's B2 term, except here u is a learned policy rather than an
-    implicit QP optimum. v_k(delta) is the poisoning-induced gradient shift mu_p - g_c. The
-    kappa*L_bd term is the config's `lambda_bd` (kept distinct from `kappa`, which -- as in
-    federated_optimizing_trigger -- names the *hinge margin* of the (optional) trigger-vs-mu
-    penalty, not this loss weight).
+    This is eq:P's LOCAL reading (the note right after its `lambda=beta` constraint): the
+    decision variable here is the per-worker u^i (named `u`), not the aggregate ubar, so the
+    first term is ||gamma*Gbar(theta_bar_k)*u^i - v_k(delta)||^2/rho_k^2 rather than
+    ||Gbar(theta_bar_k)*ubar - v_k(delta)||^2/rho_k^2.
 
-    lambda=beta is enforced exactly as in federated_optimizing_trigger: lambda_poison
-    resolves to beta by default (`resolve_beta_and_lambda_poison`), and couples both the
-    per-batch poisoning rate in the objective AND the expert's actual retraining poison rate
-    (get_poison_dataset's lambda_target).
+    u is LOCAL (rem:units): u_{y,c} is the fraction of a SINGLE corrupted worker's own shard
+    flipped from y to c, u in U_loc = {u>=0, sum(u)<=beta, sum_c u_{y,c}<=pi_y} (eq:Uloc,
+    `project_policy_budget`); beta is that same worker's own flip budget (its fraction of ITS
+    shard, NOT a global fraction of the whole federated dataset -- NOT the `beta` of def:budget
+    directly, see the A1 note below and `optimize_trigger_policy`'s docstring).
+    H(theta_bar_k)[:,(y,c)] = g_{y,c}-g_{y,y} (def:shifts' Gbar, `compute_expected_flip_
+    gradients`'s G with its pi_y factor divided back out per rem:no-pi -- PIEGE 1, see
+    `_compute_step_policy`) is what ONE corrupted worker deploying u contributes to its own
+    gradient message; under mean aggregation, gamma = num_poisoned/(num_poisoned+num_honests)
+    corrupted workers (all deploying the SAME u, the homogeneous configuration of
+    lem:hom-wlog -- PIEGE 2) contribute gamma*H(theta_bar_k)@u to the aggregated shift -- see
+    `_compute_step_policy`'s docstring for the full derivation. v_k(delta) is the
+    poisoning-induced gradient shift mu_p - g_c (eq:vk-delta). The kappa*L_bd term is the
+    config's `lambda_bd` (kept distinct from `kappa`, which -- as in federated_optimizing_trigger
+    -- names the *hinge margin* of the (optional) trigger-vs-mu penalty, not this loss weight).
+
+    A1 (docs/policy_module_audit_report.md Section 2.6 -- CORRECTED): `lambda_poison="beta"`
+    (the default) now resolves to `beta_global := gamma*beta` (== `beta_theory`, def:budget) as
+    eq:P's constraint `lambda=beta` requires -- NOT this module's own LOCAL `beta` directly, as
+    it did before this correction (which silently over-poisoned by `1/gamma`, gamma<=1). This
+    coupling is only theoretically justified when `s_beta := beta_global/(gamma*min_y(pi_y))
+    <= 1` (prop:budget-match's unsaturated-regime hypothesis; `rem:saturated` lists
+    `prop:budget-match` among the results lost once it fails) -- a warning prints at startup
+    when `s_beta > 1`. An explicit numeric `lambda_poison` (used verbatim, unscaled) is the way
+    to sweep lambda independently of beta in that regime. See `optimize_trigger_policy`'s
+    docstring for the full derivation.
 
     Threat model: same as federated_optimizing_trigger (see its `run` docstring) -- the
     attacker needs only the model architecture, a sample from the training distribution, its
-    own budget beta, and (y_source, y_target). num_honests/num_poisoned are logging-only.
+    own budget beta, and (y_source, y_target). UNLIKE federated_optimizing_trigger,
+    num_honests/num_poisoned are NOT logging-only here: gamma, derived from them, enters the
+    (P^mean) objective and (via `federated_policy_to_flips`) the flip materialization -- see
+    `optimize_trigger_policy`'s docstring.
 
     Outputs: the optimized trigger (.pt, same naming convention as
     federated_optimizing_trigger) and the optimized policy (u, pairs, beta, n_train -- .npz),
@@ -617,6 +1008,9 @@ def run(experiment_name, module_name, **kwargs):
     metrics_log_path = args.get("metrics_log_path", None)
     if metrics_log_path is not None:
         metrics_log_path = slurmify_path(metrics_log_path, slurm_id)
+    normalization = args.get("normalization", "rho")
+    diag_every = args.get("diag_every", 50)
+    expert_budget = args.get("expert_budget", None)
 
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
@@ -693,6 +1087,9 @@ def run(experiment_name, module_name, **kwargs):
         batch_size_trigger=batch_size_trigger,
         flip_gradient_samples_per_class=flip_gradient_samples_per_class,
         metrics_log_path=metrics_log_path,
+        normalization=normalization,
+        diag_every=diag_every,
+        expert_budget=expert_budget,
     )
 
     print("Optimized trigger and policy obtained.")
@@ -723,6 +1120,10 @@ def run(experiment_name, module_name, **kwargs):
         / f"policy_{init}_{model_flag}_{dataset_flag}_{run_tag}.npz"
     )
     pairs_arr = np.array(pairs, dtype=np.int64)  # (P, 2): columns [y, c]
+    # num_honests/num_poisoned/gamma: saved so federated_policy_to_flips can cross-check its
+    # OWN config against what this policy was actually optimized against, instead of each
+    # module silently recomputing gamma from its own (possibly divergent) num_honests/
+    # num_poisoned -- see federated_policy_to_flips/run_module.py's cross-check.
     np.savez(
         policy_path,
         u=u.detach().cpu().numpy(),
@@ -732,6 +1133,9 @@ def run(experiment_name, module_name, **kwargs):
         n_train=np.array(n_train, dtype=np.int64),
         source_label=np.array(y_source, dtype=np.int64),
         target_label=np.array(y_target, dtype=np.int64),
+        num_honests=np.array(num_honests, dtype=np.int64),
+        num_poisoned=np.array(num_poisoned, dtype=np.int64),
+        gamma=np.array(num_poisoned / (num_poisoned + num_honests), dtype=np.float64),
     )
     print(f"Saved trigger to {trig_path}")
     print(f"Saved policy to {policy_path}")

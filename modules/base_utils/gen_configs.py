@@ -98,7 +98,7 @@ delta = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP/optimized_trigger/{mod
 epochs = 20
 checkpoint_iters = 50
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
-schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
+scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 
 # Module to generate attack labels from the expert trajectories.
 [federated_generate_labels]

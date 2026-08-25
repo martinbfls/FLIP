@@ -1,0 +1,779 @@
+% =====================================================================
+%  Label-flipping attack surface: the reachable deviation set
+%  Self-contained section, unified with the existing framework.
+%  No new \newcommand: only existing macros are used.
+%
+%  STRUCTURE
+%    Part 0  Setup: surface, shifts, budget, kernels, federated GGUs,
+%            the three admissible sets, one-shot poisoning
+%    Part A  Mean aggregation: closed-form reachable set, geometry,
+%            feasibility, AND the attacker's problem
+%    Part B  Robust aggregation: coordinate-wise selection framework,
+%            exact decomposition of Agg - Mean, surrogate optimality,
+%            stealth and selection
+%    Part C  Validation TODO
+% =====================================================================
+
+% ---------------------------------------------------------------------
+% NOTATION RECONCILIATION
+%   1. \delta is the trigger; the gradient gap is \norm{v_k}
+%      (\delta(\thk) is retired from lem:bdagger-kappa and
+%       prop:feasibility-kappa, where it is a local shorthand).
+%   2. \mathcal{C}_k is the event \{\Npk\le f\}; the flip polytope is
+%      \mathcal{F}(\thk).
+%   3. The budget fraction is \beta; the label count is N_{flip}
+%      (b_k is the induced bias, \mathcal{B}_k the bias map).
+%   4. The selection size of an aggregation rule is \ell.
+%   5. Class indices are (y,z); generic vectors of \R^d are g, e, p.
+%   6. \varpi_k is the RANK ratio (\pi_y is a class probability).
+%   7. THE SHIFT VECTORS CARRY NO \pi_y FACTOR: see def:shifts and
+%      rem:no-pi. This corrects an earlier draft in which
+%      \bar G_{y,z} was defined as \pi_y(g_{y,z}-g_{y,y}), which is
+%      inconsistent with u_{y,z} being a joint proportion.
+%   Adopted unchanged: b_k, \mathcal{E}_k, v_k, a_k.
+% ---------------------------------------------------------------------
+
+
+\subsection{Setting}
+\label{sec:setting}
+
+The defender solves
+\begin{equation}
+\min_{\theta\in\Th}\ \Lc(\theta):=\mathbb{E}_{(x,y)\sim\Dc}\big[\ell_c(f_\theta(x),y)\big],
+\end{equation}
+where $\Dc$ is a distribution over $\mathcal X\times\mathcal Y$, $\Th\subset\R^d$ and $\ell_c:\mathcal X\times\mathcal Y\to\R$. The attacker solves
+\begin{equation}
+\min_{\theta\in\Th}\ \Lp(\theta):=\mathbb{E}_{(x,y)\sim\Dp}\big[\ell_c(f_\theta(x),y)\big],
+\end{equation}
+with $\Dp$ chosen according to the attacker's goal, as in \cref{ex:backdoor}.
+
+\begin{example}[Backdoor attack]
+\label{ex:backdoor}
+Let $T:\mathcal X\to\mathcal X$ be a measurable \emph{trigger} map and $y_{\mathrm{source}}\neq y_{\mathrm{target}}\in\mathcal Y$ a source/target pair. The associated \emph{backdoor operator} is
+\[
+\Phi:\mathcal X\times\mathcal Y\to\mathcal X\times\mathcal Y,
+\qquad
+\Phi(x,y)=
+\begin{cases}
+\big(T(x),y_{\mathrm{target}}\big), & y=y_{\mathrm{source}},\\
+(x,y), & \text{otherwise.}
+\end{cases}
+\]
+Assuming $p_s:=\mathbb{P}_{\Dc}(Y=y_{\mathrm{source}})>0$, write $\mathcal D_s:=\Dc(\cdot\mid Y=y_{\mathrm{source}})$. Since $\mathcal D_s$ is concentrated on $\mathcal X\times\{y_{\mathrm{source}}\}$, the pushforward $\Phi_\#\mathcal D_s$ is the law of $(T(X),y_{\mathrm{target}})$ with $(X,Y)\sim\mathcal D_s$. The attacker targets the mixture
+\begin{equation}\label{eq:bd-Dp}
+\Dp=(1-\lambda)\,\Dc+\lambda\,\Phi_\#\mathcal D_s,\qquad\lambda\in(0,1),
+\end{equation}
+so that
+\begin{equation}\label{eq:bd-Lp-split}
+\Lp(\theta)=(1-\lambda)\,\Lc(\theta)+\lambda\,\mathbb{E}_{(X,Y)\sim\mathcal D_s}\Big[\ell_c\big(f_\theta(T(X)),y_{\mathrm{target}}\big)\Big].
+\end{equation}
+\end{example}
+
+
+% =====================================================================
+\subsection*{Part 0 --- Setup}
+% =====================================================================
+
+\subsection{The label-flipping attack surface}
+\label{sec:flip-surface}
+
+We consider an attacker able to invert a constrained budget of labels but unable to alter inputs.
+
+\begin{definition}[Label-flipping attack surface]
+\label{def:flip-surface}
+\begin{equation}
+\attsuf{\thk}
+=\Big\{g\in\R^d\;\Big|\;\exists\,(x,y)\in\operatorname{supp}\Dc,\ \exists\,c\in\mathcal{Y},\
+g=\nabla_{\thk}\ell_c\big(f_{\thk}(x),c\big)\Big\}.
+\end{equation}
+\end{definition}
+
+\begin{definition}[Class-conditional gradients, shifts, shift radius]
+\label{def:shifts}
+For $y\neq z$ in $\mathcal Y$, with $C:=|\mathcal{Y}|$ and $\pi_y:=\mathbb{P}_{\Dc}(Y=y)$,
+\begin{equation}
+g_{y,z}(\thk):=\nabla_\theta\,\mathbb{E}_{X\mid Y=y}\big[\ell_c(f_{\thk}(X),z)\big],
+\qquad
+\bar G_{y,z}(\thk):=g_{y,z}(\thk)-g_{y,y}(\thk),
+\label{eq:shift}
+\end{equation}
+and $\bar G(\thk)\in\R^{d\times C(C-1)}$ collects the \emph{shift vectors} $\bar G_{y,z}$ as
+columns. We write
+\begin{equation}
+\varsigma_k:=\max_{z\neq y}\norm{\bar G_{y,z}(\thk)}
+\label{eq:varsigma}
+\end{equation}
+for the \emph{shift radius} at round $k$. Note $\gradc(\thk)=\sum_y\pi_yg_{y,y}(\thk)$.
+\end{definition}
+
+\begin{definition}[Flip polytope]
+\label{def:Fpoly}
+$\mathcal{F}(\thk):=\mathrm{conv}\big(\{0\}\cup\{\bar G_{y,z}(\thk)\}_{z\neq y}\big)\subset\R^d$.
+\end{definition}
+
+$\mathcal{F}(\thk)$ is the convex hull of at most $C(C-1)+1$ points, hence a compact convex
+polytope independent of $\beta$ and of the trigger. Geometrically $\bar G_{y,z}(\thk)$ is the
+deviation produced by relabeling a \emph{unit mass} of class-$y$ samples into $z$;
+$\mathcal{F}(\thk)$ collects the deviations obtainable by mixing such relabelings, with $0$
+available as ``do nothing''.
+
+
+\subsection{Write access: budget, allocation, corruption rates}
+\label{sec:budget}
+
+\begin{definition}[Budget, allocation, corruption rates]
+\label{def:budget}
+Let $\mathcal{M}\subseteq[n_b]$, $|\mathcal{M}|=n_p$, be the malicious units. Shards are of equal size $n/n_b$, and $N_{\mathrm{flip}}\in\N$ is the number of labels the adversary may \emph{alter} (a sample selected for poisoning but relabeled to its own class does not count).
+\begin{itemize}[noitemsep,leftmargin=*]
+\item \textbf{Global budget.} $\beta:=N_{\mathrm{flip}}/n\in(0,1)$, the fraction of \emph{all} training labels altered. This is the primitive constraint.
+\item \textbf{Allocation.} Unit $i$ receives $N^i_{\mathrm{flip}}$ alterations, $N^i_{\mathrm{flip}}=0$ for $i\notin\mathcal{M}$ and $\sum_{i\in\mathcal{M}}N^i_{\mathrm{flip}}=N_{\mathrm{flip}}$.
+\item \textbf{Local corruption rate.} $\beta^i:=N^i_{\mathrm{flip}}\big/(n/n_b)$, the fraction of unit $i$'s \emph{own} shard altered; admissibility requires $\beta^i\le1$.
+\item \textbf{Average corruption rate.} $\bar\beta:=\tfrac1{n_b}\sum_i\beta^i$.
+\end{itemize}
+\end{definition}
+
+\begin{lemma}[The average corruption rate is the global budget]
+\label{lem:beta-bar}
+For every admissible allocation $\bar\beta=\beta$, and $\beta^i\le1$ for all $i$ forces
+\begin{equation}
+\beta\ \le\ \gamma:=\frac{n_p}{n_b}.
+\label{eq:beta-feasible}
+\end{equation}
+\end{lemma}
+\begin{proof}
+$\bar\beta=\tfrac1{n_b}\sum_{i\in\mathcal{M}}N^i_{\mathrm{flip}}\tfrac{n_b}{n}=N_{\mathrm{flip}}/n=\beta$; and $N_{\mathrm{flip}}\le n_p\,n/n_b$ gives \cref{eq:beta-feasible}.
+\end{proof}
+
+We write $\gamma=n_p/n_b$ throughout. Uniform allocation gives $\beta^i=\beta/\gamma$ on
+$\mathcal{M}$ and $0$ elsewhere, and \cref{eq:beta-feasible} is exactly the condition that this
+be $\le1$. Since $\beta^i=0$ off $\mathcal{M}$, at most $n_p$ units hold altered labels;
+\cref{def:ggu-fed} fixes the convention by which $\Npk$ counts them.
+
+
+\subsection{Heterogeneous flipping kernels}
+\label{sec:kernels}
+
+The modelled attack produces a poisoned dataset \emph{before} the victim's training begins, so
+the attack policy of each worker must be parameterized independently of the current round
+$k\in\N$. We therefore parameterize the attack policy of each malicious worker $i$ by a single
+vector $u^i$, fixed once and for all.
+
+\begin{definition}[Flipping kernel, selection rates, flip masses]
+\label{def:kernel}
+Unit $i$ applies a \emph{flipping kernel} $w^i$, with $w^i_{y,z}\ge0$ the probability that a class-$y$ sample \emph{selected for poisoning} is presented with label $z$ and $\sum_zw^i_{y,z}=1$; and \emph{class-dependent selection rates} $\beta^i_y\in[0,1]$, the fraction of unit $i$'s class-$y$ samples selected. The induced \emph{flip masses} are
+\begin{equation}
+u^i_{y,z}:=\pi_y\,\beta^i_y\,w^i_{y,z}\quad(z\neq y),
+\qquad u^i:=(u^i_{y,z})_{z\neq y}\in\R^{C(C-1)},
+\end{equation}
+with $u^i=0$ for $i\notin\mathcal{M}$. The associated policy $\ga^i(\thk)$ is the law of $\nabla_{\thk}\ell_c(f_{\thk}(X),Z)$ under this relabeling.
+\end{definition}
+
+\begin{remark}[Reading $u^i$]
+\label{rem:reading-u}
+The vector $u^i$ reads as follows.
+\begin{itemize}
+\item \emph{Coordinates.} $u^i_{y,z}$ is a \emph{joint} proportion: among the samples held by unit $i$, the fraction truly of class $y$ \emph{and} carrying label $z$ after poisoning. Nonnegative as a product of a probability, a rate and a kernel entry.
+\item \emph{Total mass.} $\|u^i\|_1=\sum_y\pi_y\beta^i_y(1-w^i_{y,y})=\beta^i$, consistently with \cref{def:budget}: only \emph{altered} labels are counted.
+\item \emph{Per-class mass.} $\sum_{z\neq y}u^i_{y,z}\le\pi_y$: one cannot relabel more class-$y$ samples than the shard contains. This \emph{capacity} constraint is the only structural restriction.
+\item \emph{Wasted budget.} A diagonal entry $w^i_{y,y}>0$ means a sample was selected but kept its label; it consumes selection without producing a gradient shift, whence only off-diagonal indices appear.
+\end{itemize}
+\end{remark}
+
+\begin{lemma}[Expected message]
+\label{lem:message}
+Under \cref{def:kernel}, for every unit $i$ and every $k$,
+\[
+\Ethk{g_i(\thk)}=\gradc(\thk)+\bar G(\thk)u^i.
+\]
+\end{lemma}
+\begin{proof}
+The expected gradient emitted by unit $i$ is
+$\sum_y\pi_y[(1-\beta^i_y)g_{y,y}+\beta^i_y\sum_zw^i_{y,z}g_{y,z}]$. Subtract
+$\gradc(\thk)=\sum_y\pi_yg_{y,y}$ and use $\sum_zw^i_{y,z}=1$ to obtain
+$\sum_y\sum_{z\neq y}\pi_y\beta^i_yw^i_{y,z}(g_{y,z}-g_{y,y})
+=\sum_y\sum_{z\neq y}u^i_{y,z}\,\bar G_{y,z}(\thk)=\bar G(\thk)u^i$,
+the middle equality being \cref{def:kernel} together with \cref{eq:shift}.
+\end{proof}
+
+\begin{remark}[Why the shift vectors carry no $\pi_y$]
+\label{rem:no-pi}
+The proof of \cref{lem:message} is what fixes the convention. Since $u^i_{y,z}$ already contains
+the factor $\pi_y$ --- it is a proportion of the \emph{whole} shard, not of class $y$ alone
+(\cref{rem:reading-u}) --- the columns of $\bar G$ must be the bare differences
+$g_{y,z}-g_{y,y}$. Defining $\bar G_{y,z}:=\pi_y(g_{y,z}-g_{y,y})$ instead, as an earlier draft
+did, double-counts $\pi_y$ and understates every induced deviation by that factor: on a balanced
+$C$-class problem, by a factor $C$. The capacity constraint $\sum_{z\neq y}u_{y,z}\le\pi_y$ and
+the identity $\|u^i\|_1=\beta^i$ are the two invariants that must be preserved; both are
+consistent with \cref{eq:shift} and with it alone. Note the practical consequences: $\varsigma_k$,
+$\varrho_k$ and the certificates of \cref{prop:certificates-mean} all scale by $1/\pi_y$ relative
+to that earlier draft, so the normalized residual $\norm{v_k}/\varrho_k$ shrinks accordingly.
+\end{remark}
+
+\begin{definition}[Gradient generation units in the federated setting]
+\label{def:ggu-fed}
+In the federated instantiation of \cref{def:ggu} used throughout, a GGU is a \emph{worker}
+$i\in[n_b]$ owning a shard $\mathcal{S}_i$ of size $n/n_b$. Before training the adversary fixes,
+for every $i\in\mathcal{M}$, selection rates and a flipping kernel as in \cref{def:kernel}, hence
+flip masses $u^i$; this produces once and for all a poisoned shard $\tilde{\mathcal{S}}_i$
+(with $u^i=0$ and $\tilde{\mathcal{S}}_i=\mathcal{S}_i$ for honest units). At round $k$, unit $i$
+draws a minibatch $B^i_k\subseteq\tilde{\mathcal{S}}_i$ and emits
+\begin{equation}
+g_i(\thk)=\frac{1}{|B^i_k|}\sum_{(x,\tilde y)\in B^i_k}\nabla_{\thk}\ell_c\big(f_{\thk}(x),\tilde y\big),
+\label{eq:ggu-fed}
+\end{equation}
+$\tilde y$ denoting the (possibly altered) label carried by the sample. Equivalently, by
+\cref{lem:message},
+\begin{equation}
+g_i(\thk)=\gradc(\thk)+\bar G(\thk)u^i+\xi_i,
+\qquad \Ethk{\xi_i}=0,
+\qquad \Ethk{\normsq{\xi_i}}=:\sigma_i^2(\thk),
+\label{eq:ggu-fed-split}
+\end{equation}
+$\sigma_i^2(\thk)$ being the minibatch variance over $\tilde{\mathcal{S}}_i$.
+\textbf{Convention.} $\Npk$ counts the \emph{corrupted units}, i.e.\ $\Npk:=|\mathcal{M}|=n_p$
+for every $k$ --- not the number of altered labels drawn in the round, which is random and may
+be zero for a corrupted unit. Under this convention the event $\mathcal{C}_k=\{\Npk\le f\}$ of
+\cref{def:counts} is deterministic, holding for every $k$ as soon as $n_p\le f$.
+\end{definition}
+
+\begin{remark}[Two consequences]
+\label{rem:ggu-fed}
+\emph{(i)} A corrupted unit emits a \emph{partially} poisoned message at every round, rather than
+an arbitrary vector at a random subset of rounds; the batch composition is fixed and only the
+minibatch noise is random.
+\emph{(ii)} The deviation of a corrupted message from the honest mean is proportional to the local
+corruption rate, $\norm{\bar G(\thk)u^i}\le\varsigma_k\|u^i\|_1=\beta^i\varsigma_k$ with
+$\varsigma_k$ as in \cref{eq:varsigma}: a small budget makes a corrupted unit \emph{permanently
+stealthy} rather than rarely visible, which is what makes \cref{sec:stealth-selection} meaningful.
+Part~0 and Part~A use only the first moment \cref{lem:message}; Part~B, whose rules select
+\emph{realized} messages, uses \cref{eq:ggu-fed-split} and~(ii).
+\end{remark}
+
+\subsection{The three admissible sets}
+\label{sec:three-sets}
+
+Three distinct objects appear below; all are defined from the write access alone and \textbf{none presupposes any aggregation rule}.
+
+\begin{definition}[Configurations, per-unit masses, aggregate masses]
+\label{def:config}
+\begin{align}
+\mathfrak{U}_\beta&:=\Big\{(u^i)_{i=1}^{n_b}:u^i\ge0,\ \textstyle\sum_{z\neq y}u^i_{y,z}\le\pi_y\ \forall y,\ u^i=0\ \forall i\notin\mathcal{M},\ \tfrac1{n_b}\sum_i\|u^i\|_1\le\beta\Big\},
+\label{eq:Ufrak}\\
+\mathcal{U}^{\mathrm{loc}}&:=\Big\{u\ge0:\textstyle\sum_{z\neq y}u_{y,z}\le\pi_y\ \forall y,\ \|u\|_1\le\beta/\gamma\Big\},
+\label{eq:Uloc}\\
+\mathcal{U}_\beta&:=\Big\{u\ge0:\ \|u\|_1\le\beta,\ \textstyle\sum_{z\neq y}u_{y,z}\le\gamma\,\pi_y\ \forall y\Big\}.
+\label{eq:Ubeta}
+\end{align}
+\end{definition}
+
+\begin{remark}[What each set is for]
+\label{rem:three-sets}
+\begin{itemize}[noitemsep,leftmargin=*]
+\item $\mathfrak{U}_\beta\subset(\R^{C(C-1)})^{n_b}$ is the set of \emph{whole configurations}: one flip-mass vector per unit, jointly constrained by the global budget. It is the adversary's genuine decision variable.
+\item $\mathcal{U}^{\mathrm{loc}}\subset\R^{C(C-1)}$ is the set of \emph{single-unit} flip masses when the budget is split equally; it is nonempty because $\beta/\gamma\le1$ by \cref{lem:beta-bar}. It is the natural parameter when the aggregation rule sees individual messages (Part~B), and the one an implementation naturally exposes when the budget is stated per corrupted worker (\cref{rem:units}).
+\item $\mathcal{U}_\beta\subset\R^{C(C-1)}$ is the set of \emph{aggregate} flip masses $\bar u:=\tfrac1{n_b}\sum_iu^i$. \cref{lem:hom-wlog} shows it is exactly the image of $\mathfrak{U}_\beta$ under averaging. \textbf{This is a statement about the budget, not about $\Agg$}: the aggregation rule enters only in \cref{prop:Ek-mean}, which identifies $\bar u$ with the induced bias when $\Agg$ is the mean.
+\end{itemize}
+\end{remark}
+
+The three spaces are related as follows.
+
+\begin{lemma}[Exact range of $\bar u$; homogeneity is without loss]
+\label{lem:hom-wlog}
+$\{\bar u:(u^i)\in\mathfrak{U}_\beta\}=\mathcal{U}_\beta$, and every $\bar u\in\mathcal{U}_\beta$ is attained by the homogeneous configuration $u^i=\bar u/\gamma$ for $i\in\mathcal{M}$, $u^i=0$ otherwise. In particular $\mathcal{U}_\beta=\gamma\,\mathcal{U}^{\mathrm{loc}}$.
+\end{lemma}
+\begin{proof}
+($\subseteq$) $\|\bar u\|_1\le\tfrac1{n_b}\sum_i\|u^i\|_1\le\beta$ and $\sum_{z\neq y}\bar u_{y,z}=\tfrac1{n_b}\sum_{i\in\mathcal{M}}\sum_{z\neq y}u^i_{y,z}\le\gamma\pi_y$.
+($\supseteq$) Put $u^i:=\bar u/\gamma$ on $\mathcal{M}$. Then $u^i\ge0$; capacity holds since $\sum_{z\neq y}u^i_{y,z}=\tfrac1\gamma\sum_{z\neq y}\bar u_{y,z}\le\pi_y$; the budget holds since $\tfrac1{n_b}\sum_i\|u^i\|_1=\|\bar u\|_1\le\beta$; and $\beta^i=\|u^i\|_1\le\beta/\gamma\le1$ by \cref{lem:beta-bar}. Comparing \cref{eq:Uloc,eq:Ubeta} coordinatewise gives $\mathcal{U}_\beta=\gamma\,\mathcal{U}^{\mathrm{loc}}$.
+\end{proof}
+
+\begin{remark}[Units: aggregate, local, and label counts]
+\label{rem:units}
+Three quantities are easily confused, and an implementation must keep them apart.
+\begin{itemize}[noitemsep,leftmargin=*]
+\item \emph{Aggregate.} $\bar u\in\mathcal{U}_\beta$ with $\|\bar u\|_1\le\beta$. This is the
+variable of \cref{prop:Ek-mean}: $b_k=\bar G(\thk)\bar u$, with \textbf{no} extra factor.
+\item \emph{Local.} $u^i\in\mathcal{U}^{\mathrm{loc}}$ with $\|u^i\|_1\le\beta/\gamma$. Under the
+homogeneous deployment of \cref{lem:hom-wlog}, $\bar u=\gamma u^i$, hence
+\begin{equation}
+b_k=\gamma\,\bar G(\thk)\,u^i .
+\label{eq:local-scope}
+\end{equation}
+A formulation whose decision variable is the per-worker $u^i$ --- the natural one when the
+budget is stated as a fraction of a corrupted worker's own shard --- must therefore carry the
+factor $\gamma$ explicitly. Omitting it compares a worker-level deviation with an
+aggregate-level target and overstates the reachable set by $1/\gamma$.
+\item \emph{Label counts.} The number of class-$y$ samples relabelled to $z$ across all corrupted
+units is $n\,\bar u_{y,z}$ in aggregate units, equivalently $\gamma\,n\,u^i_{y,z}$ in local
+units, and $\sum_{y,z}n\,\bar u_{y,z}=N_{\mathrm{flip}}\le\beta n$ recovers \cref{def:budget}.
+\end{itemize}
+\end{remark}
+
+\begin{lemma}[Capacity redundancy]
+\label{lem:Ubeta}
+If $\beta\le\gamma\min_y\pi_y$ the capacity constraints in \cref{eq:Ubeta} are inactive and $\mathcal{U}_\beta=\beta\bar\Delta$, where $\bar\Delta:=\{u\ge0:\|u\|_1\le1\}=\mathrm{conv}(\{0\}\cup\{e_{y,z}\}_{z\neq y})$ is the \emph{corner simplex} and $e_{y,z}$ the canonical basis of $\R^{C(C-1)}$.
+\end{lemma}
+\begin{proof}
+For admissible $u$ and any $y$, $\sum_{z\neq y}u_{y,z}\le\|u\|_1\le\beta\le\gamma\pi_y$. For the identification, $u\ge0$ with $\|u\|_1\le1$ writes $\sum_{z\neq y}u_{y,z}e_{y,z}+(1-\|u\|_1)\cdot0$, a convex combination of $\{0\}\cup\{e_{y,z}\}$; conversely every such combination is nonnegative with $\ell_1$ norm at most $1$.
+\end{proof}
+
+For balanced classes and small budgets the hypothesis holds: $C=10$, $n_b=10$, $n_p=3$,
+$\gamma=0.3$ and $\pi_y=1/10$ give the threshold $\beta^{\mathrm{cap}}:=\gamma\min_y\pi_y=3\%$.
+The vertex $0$ encodes unused budget, which is what makes $\bar\Delta$ a corner rather than a
+standard simplex. Beyond that threshold the capacity constraints bind, $\mathcal{U}_\beta
+\subsetneq\beta\bar\Delta$, and $\beta\mathcal{F}(\thk)$ is only an outer relaxation of the
+reachable set; we write $s_\beta:=\beta/\beta^{\mathrm{cap}}$ for the \emph{saturation index} and
+record in \cref{lem:knapsack,rem:saturated} exactly what this changes.
+
+\begin{lemma}[Support function of $\mathcal{U}_\beta$: fractional knapsack]
+\label{lem:knapsack}
+For $c\in\R^{C(C-1)}$ set $\psi_y(c):=\max\{0,\max_{z\neq y}c_{y,z}\}$ and order the classes so
+that $\psi_{(1)}\ge\cdots\ge\psi_{(C)}$. Then
+\begin{equation}
+\max_{u\in\mathcal{U}_\beta}\langle c,u\rangle=\sum_{y=1}^{C}\psi_{(y)}\,m^\star_{(y)},
+\qquad
+m^\star_{(y)}=\min\Big\{\gamma\pi_{(y)},\ \big(\beta-\textstyle\sum_{y'<y}m^\star_{(y')}\big)_+\Big\},
+\label{eq:knapsack}
+\end{equation}
+i.e.\ the budget is poured greedily into the classes of highest gain, up to their capacities.
+If $\beta\le\gamma\min_y\pi_y$ this reduces to $\beta\,\psi_{(1)}(c)$.
+\end{lemma}
+\begin{proof}
+For $u\in\mathcal{U}_\beta$ put $m_y:=\sum_{z\neq y}u_{y,z}$; then $\langle c,u\rangle\le
+\sum_ym_y\psi_y(c)$, and $m$ satisfies $0\le m_y\le\gamma\pi_y$, $\sum_ym_y\le\beta$. Conversely
+any such $m$ is realized by $u_{y,z^\star_y}=m_y$ with $z^\star_y\in\argmax_{z\neq y}c_{y,z}$,
+taking $m_y=0$ on the classes with $\psi_y(c)=0$. The relaxed problem
+$\max\{\sum_ym_y\psi_y:0\le m_y\le\gamma\pi_y,\ \sum_ym_y\le\beta\}$ is a continuous knapsack: if a
+feasible $m$ puts mass on a class $y$ while a class $y'$ with $\psi_{y'}>\psi_y$ is unsaturated,
+transferring mass from $y$ to $y'$ is feasible and does not decrease the objective; iterating gives
+\cref{eq:knapsack}. The last claim is the case where the first class absorbs the whole budget.
+\end{proof}
+
+\subsection{One-shot poisoning}
+\label{sec:oneshot}
+
+Based on this formalism, we can define the policy family which would be followed during the
+label-poisoned training.
+
+\begin{definition}[Per-round label-flipping family]
+\label{def:qk-flip}
+Writing $\ga^{(u)}(\thk)=(\ga^{i}(\thk))_{i\in\mathcal{M}}$ for the joint policy induced by a
+configuration through \cref{def:kernel}, the \emph{per-round label-flipping family} is
+\begin{equation}
+\qk^{\mathrm{flip}}:=\big\{\ga^{(u)}(\thk):(u^i)\in\mathfrak{U}_\beta\big\}\ \subseteq\ \qk .
+\label{eq:qk-flip}
+\end{equation}
+\end{definition}
+
+\begin{definition}[Induced policy family; one-shot restriction]
+\label{def:induced}
+The adversary selects once, before training, a configuration $(u^i)\in\mathfrak{U}_\beta$ and a
+trigger $\delta$, which fix the poisoned dataset. For each round $k$ the policy $\ga^i(\thk)$ is
+then \emph{induced}: it is the law of the gradient of the fixed poisoned shard evaluated at
+$\thk$. At the level of \emph{sequences} of policies,
+\begin{equation}
+\mathcal{Q}^{\mathrm{os}}:=\big\{\big(\ga^{(u)}(\thk)\big)_{k}:(u^i)\in\mathfrak{U}_\beta\big\}
+\ \subsetneq\
+\mathcal{Q}^{\mathrm{ad}}:=\prod_k\qk^{\mathrm{flip}} ,
+\end{equation}
+the one-shot family being the \emph{diagonal} of the adaptive one.
+\end{definition}
+
+$\qk$ permits a fresh policy at each round; one-shot poisoning does not. The restriction has
+\textbf{no content at a fixed round} --- the projection of $\mathcal{Q}^{\mathrm{os}}$ onto round
+$k$ is all of $\qk^{\mathrm{flip}}$ --- and bites only across rounds, since $(\ga^i(\thk))_k$ is
+then a deterministic function of a single configuration; \cref{prop:oneshot-gap} records the
+cost.
+
+\begin{remark}[Parameterization of $\qk$ by the write access]
+\label{rem:qk-param}
+Label flipping restricts the admissible policies of \cref{def:ggu} to the image of the
+configuration space, and the three sets of \cref{def:config} are exactly the three levels at
+which \cref{eq:qk-flip} is indexed: \emph{(i)} $\mathfrak{U}_\beta$ parameterizes it in full;
+\emph{(ii)} restricted to homogeneous configurations, $\mathcal{U}^{\mathrm{loc}}$ parameterizes
+the policy of a \emph{single} corrupted unit, which is the level seen by an aggregation rule
+(Part~B); \emph{(iii)} $\mathcal{U}_\beta$ parameterizes the induced bias under the mean,
+$b_k=\bar G(\thk)\bar u$ (\cref{prop:Ek-mean}), and \cref{lem:hom-wlog} states that (ii) and
+(iii) lose nothing. \cref{rem:units} gives the conversion factors between the three.
+\end{remark}
+
+
+\subsection*{Part A --- Mean aggregation}
+
+The goal of this part is to derive an objective the attacker aims to optimize in order to find
+the optimal trigger and attack policy, given their poisoning budget, target architecture and
+learning setup (assuming the defender uses the Mean aggregation rule).
+
+\subsection{Exact description of $\mathcal{E}_k$ under the mean}
+\label{sec:Ek-mean}
+
+\begin{proposition}[Exact description under the mean]
+\label{prop:Ek-mean}
+\textbf{Assume $\Agg$ is the mean.} Then, conditionally on $\thk$,
+\begin{equation}
+b_k:= \Ethk{h_k} - \gradc(\thk) = \bar G(\thk)\,\bar u\ \text{ with }\bar u\in\mathcal{U}_\beta,
+\qquad
+\mathcal{E}_k^{\mathrm{mean}}=\bar G(\thk)\,\mathcal{U}_\beta ,
+\end{equation}
+and if moreover $\beta\le\gamma\min_y\pi_y$, then $\mathcal{E}_k^{\mathrm{mean}}=\beta\,\mathcal{F}(\thk)$.
+\end{proposition}
+
+\begin{proof}
+Linearity of the mean and \cref{lem:message} give $\Ethk{h_k}=\tfrac1{n_b}\sum_i\Ethk{g_i(\thk)}=\gradc(\thk)+\bar G(\thk)\bar u$, so $b_k=\bar G(\thk)\bar u$ by \cref{def:hk-decomposition}. Taking images as $(u^i)$ ranges over $\mathfrak{U}_\beta$ and using \cref{lem:hom-wlog} yields $\mathcal{E}_k^{\mathrm{mean}}=\bar G(\thk)\mathcal{U}_\beta$. Under the extra hypothesis \cref{lem:Ubeta} gives $\mathcal{U}_\beta=\beta\bar\Delta$, and since a linear map commutes with scaling and convex hulls, $\bar G(\beta\,\mathrm{conv}(\{0\}\cup\{e_{y,z}\}))=\beta\,\mathrm{conv}(\{0\}\cup\{\bar G_{y,z}\})=\beta\mathcal{F}(\thk)$.
+\end{proof}
+
+\begin{remark}[Hard flips]
+\label{rem:hard-flips}
+Every realization of a policy in \cref{def:kernel} is a hard relabeling; $\mathcal{F}(\thk)$ is the set of \emph{expected} gradients under randomized hard flips, around which the empirical gradient of a poisoned $n$-sample concentrates at rate $O(n^{-1/2})$. The convex relaxation is exact in expectation and is \emph{not} a soft-label relaxation.
+\end{remark}
+
+\begin{remark}[No robustness coefficient here]
+\label{rem:mean-not-robust}
+$\kappastar{f}(\mathrm{mean})=+\infty$: a single unit sending $g_1\to\infty$ drives the numerator of \cref{def:kappa_star} to infinity at fixed denominator. \cref{lem:bk-kappa} and \cref{prop:ball_inclusion} are therefore \emph{vacuous} for the mean and are used nowhere in Part~A. What bounds $\mathcal{E}_k^{\mathrm{mean}}$ is not the defense but solely the write access.
+\end{remark}
+
+
+\subsection{Geometry of $\mathcal{E}_k^{\mathrm{mean}}$}
+\label{sec:geometry}
+
+\begin{lemma}[Support function and radius]
+\label{lem:support}
+\textbf{Assume $\Agg$ is the mean}, and for $p\in\R^d$ set
+$\psi_y(p):=\max\{0,\max_{z\neq y}\langle p,\bar G_{y,z}(\thk)\rangle\}$. Then
+\begin{equation}
+\max_{e\in\mathcal{E}_k^{\mathrm{mean}}}\langle p,e\rangle
+=\sum_{y=1}^{C}\psi_{(y)}(p)\,m^\star_{(y)}\qquad\text{with the allocation \cref{eq:knapsack}},
+\label{eq:support-general}
+\end{equation}
+and the exact radius $\varrho^{\mathrm{ex}}_k:=\max_{e\in\mathcal{E}_k^{\mathrm{mean}}}\norm{e}$
+satisfies
+\begin{equation}
+\min\{\beta,\gamma\pi_{y^\star}\}\,\varsigma_k\ \le\ \varrho^{\mathrm{ex}}_k\ \le\ \beta\varsigma_k,
+\qquad y^\star\in\argmax_y\max_{z\neq y}\norm{\bar G_{y,z}(\thk)} ,
+\label{eq:radius-general}
+\end{equation}
+with $\varsigma_k$ as in \cref{eq:varsigma}. If $\beta\le\gamma\pi_{y^\star}$ --- in particular if
+$\beta\le\gamma\min_y\pi_y$ --- the right-hand inequality is an equality, and under
+$\beta\le\gamma\min_y\pi_y$ the support function reduces to
+$\beta\max\{0,\max_{z\neq y}\langle p,\bar G_{y,z}(\thk)\rangle\}$.
+\end{lemma}
+\begin{proof}
+$\mathcal{E}_k^{\mathrm{mean}}=\bar G(\thk)\mathcal{U}_\beta$ by \cref{prop:Ek-mean}, so
+$\langle p,\bar G(\thk)u\rangle=\langle\bar G(\thk)^\top p,u\rangle$ and \cref{lem:knapsack}
+applies with $c=\bar G(\thk)^\top p$, whose $\psi_y$ is the one above. For the radius,
+$\norm{\bar G(\thk)u}\le\varsigma_k\|u\|_1\le\beta\varsigma_k$ gives the upper bound, while
+$u=\min\{\beta,\gamma\pi_{y^\star}\}e_{y^\star,z^\star}$ is admissible and attains
+$\min\{\beta,\gamma\pi_{y^\star}\}\varsigma_k$; the two coincide when $\beta\le\gamma\pi_{y^\star}$,
+where \cref{lem:Ubeta} also gives the closed form.
+\end{proof}
+
+\begin{remark}[Saturated regime $s_\beta>1$: what changes and what does not]
+\label{rem:saturated}
+\emph{Unaffected.} Every statement using only that $\mathcal{U}_\beta$ is a compact convex polytope
+containing $0$, and that $\mathcal{E}_k^{\mathrm{mean}}=\bar G(\thk)\mathcal{U}_\beta$: the first
+identity of \cref{prop:Ek-mean}, \cref{lem:proj}, \cref{prop:dim}, \cref{rem:rank},
+\cref{prop:ak-dist} (the QP simply keeps the two families of constraints of \cref{eq:Ubeta}),
+\cref{sec:solution} in its entirety (\cref{eq:qp}, \cref{prop:danskin}), \cref{prop:oneshot-gap},
+and all of Part~B, which uses only $\|u^i\|_1\le\beta/\gamma$ and $\varsigma_k$.
+
+\emph{Affected, but only in the constants.} \emph{(i)} $\mathcal{E}_k^{\mathrm{mean}}\subsetneq
+\beta\mathcal{F}(\thk)$: the corner-simplex description is an outer relaxation. \emph{(ii)} The
+support function is the water-filling \cref{eq:support-general} instead of a single maximum, and the
+radius obeys \cref{eq:radius-general}; $\beta\varsigma_k$ overestimates $\varrho^{\mathrm{ex}}_k$ by
+at most $\max\{1,\beta/(\gamma\pi_{y^\star})\}\le s_\beta$. \emph{(iii)} (M1) and (M2) of
+\cref{prop:certificates-mean} remain \emph{valid} certificates as stated, since
+$\mathcal{E}_k^{\mathrm{mean}}\subseteq\beta\mathcal{F}(\thk)\subseteq\bar B(0,\beta\varsigma_k)$;
+they are merely conservative, their sharp versions replacing $\beta\varsigma_k$ by
+$\varrho^{\mathrm{ex}}_k$ and the maximum by \cref{eq:support-general}. (M3) is untouched.
+\emph{(iv)} $\varrho_k=\beta\varsigma_k$ still satisfies (R1)--(R3) of \cref{sec:norm} and remains
+the normalization we use; only its reading changes, from ``the largest reachable deviation'' to
+``the largest deviation the budget could buy if it could be spent on a single class'', the gap being
+at most $s_\beta$.
+
+\emph{Genuinely lost.} \cref{prop:budget-match}: homogeneity in $\beta$ requires $\mathcal{U}_\beta$
+to scale with $\beta$, which fails once capacities bind --- $\tfrac1\lambda\mathcal{U}_\beta$ then
+depends on $\beta/\lambda$ \emph{and} on $\gamma\pi_y/\lambda$ separately, so $\lambda=\beta$ no
+longer reduces exact feasibility to a budget-free condition.
+
+\emph{Structural reading.} Since $\sum_{z\neq y}\bar u_{y,z}\le\gamma\pi_y$, the mass the aggregate
+can carry \emph{out of a single source class} is capped at $\gamma\pi_{y_{\mathrm{source}}}$
+irrespective of $\beta$. For a backdoor concentrated on one source class, budget beyond
+$\gamma\pi_{y_{\mathrm{source}}}$ is therefore \emph{unusable}: $\mathcal{E}_k^{\mathrm{mean}}$
+plateaus in the relevant directions, and the extra alterations either serve other classes or are
+left unspent (the vertex $0$ of \cref{lem:Ubeta}). This is a prediction about the budget sweep, not
+an artifact of the analysis.
+\end{remark}
+
+\begin{lemma}[Projection]
+\label{lem:proj}
+\textbf{Assume $\Agg$ is the mean.} Then \emph{(i)} $\mathcal{E}_k^{\mathrm{mean}}$ is nonempty, convex and compact; \emph{(ii)} for every $q\in\R^d$ the projection $P_k(q):=\argmin_{e\in\mathcal{E}_k^{\mathrm{mean}}}\norm{e-q}$ exists and is unique; \emph{(iii)} $P_k(q)$ is the unique $e^\star$ with $\langle q-e^\star,e-e^\star\rangle\le0$ for all $e\in\mathcal{E}_k^{\mathrm{mean}}$; \emph{(iv)} $q\mapsto\operatorname{dist}(q,\mathcal{E}_k^{\mathrm{mean}})^2$ is differentiable with gradient $2(q-P_k(q))$.
+\end{lemma}
+\begin{proof}
+\emph{(i)} $0\in\mathcal{U}_\beta$ gives $0\in\mathcal{E}_k^{\mathrm{mean}}$; $\mathcal{U}_\beta$ is cut out by finitely many linear inequalities and bounded, hence a compact convex polytope, and linear images preserve convexity and compactness.
+\emph{(ii)} Continuity on a compact set gives existence. If $e_1\neq e_2$ both attain the minimum value $r$, convexity gives $\tfrac{e_1+e_2}2\in\mathcal{E}_k^{\mathrm{mean}}$ and the parallelogram identity gives $\normsq{\tfrac{e_1+e_2}2-q}=\tfrac12\normsq{e_1-q}+\tfrac12\normsq{e_2-q}-\tfrac14\normsq{e_1-e_2}<r^2$, a contradiction.
+\emph{(iii)} ($\Rightarrow$) For $t\in(0,1]$, $e^\star+t(e-e^\star)\in\mathcal{E}_k^{\mathrm{mean}}$, so $\normsq{q-e^\star}\le\normsq{q-e^\star}-2t\langle q-e^\star,e-e^\star\rangle+t^2\normsq{e-e^\star}$, whence $2\langle q-e^\star,e-e^\star\rangle\le t\normsq{e-e^\star}$; let $t\to0^+$. ($\Leftarrow$) $\normsq{q-e}=\normsq{q-e^\star}-2\langle q-e^\star,e-e^\star\rangle+\normsq{e-e^\star}\ge\normsq{q-e^\star}$; uniqueness by (ii).
+\emph{(iv)} $P_k$ is $1$-Lipschitz: writing (iii) at $q_1$ with $e=P_kq_2$ and at $q_2$ with $e=P_kq_1$ and adding gives $\normsq{P_kq_1-P_kq_2}\le\langle q_1-q_2,P_kq_1-P_kq_2\rangle\le\norm{q_1-q_2}\norm{P_kq_1-P_kq_2}$. With $\Psi(q):=\normsq{q-P_k(q)}$, the bounds $\Psi(q+h)\le\normsq{q+h-P_kq}$ and $\Psi(q)\le\normsq{q-P_k(q+h)}$ give
+$2\langle q-P_k(q+h),h\rangle+\normsq{h}\le\Psi(q+h)-\Psi(q)\le2\langle q-P_kq,h\rangle+\normsq{h}$,
+and $\norm{P_k(q+h)-P_kq}\le\norm{h}$ makes both sides $2\langle q-P_kq,h\rangle+O(\normsq{h})$.
+\end{proof}
+
+\begin{proposition}[Dimension ceiling]
+\label{prop:dim}
+\textbf{Assume $\Agg$ is the mean.} $\mathcal{E}_k^{\mathrm{mean}}\subseteq\mathcal{G}_k:=\operatorname{Im}\bar G(\thk)$, a subspace of dimension at most $C(C-1)$. Hence $\mathcal{E}_k^{\mathrm{mean}}$ is Lebesgue-negligible in $\R^d$ whenever $C(C-1)<d$, and no ball description of it can be tight.
+\end{proposition}
+\begin{proof}
+$\mathcal{E}_k^{\mathrm{mean}}=\bar G(\thk)\mathcal{U}_\beta\subseteq\operatorname{Im}\bar G(\thk)$ by \cref{prop:Ek-mean}, and $\operatorname{Im}\bar G(\thk)$ is spanned by the $C(C-1)$ columns. A proper subspace has empty interior and zero Lebesgue measure, whereas $\bar B(0,r)$ with $r>0$ has positive measure.
+\end{proof}
+
+\begin{remark}[Rank ceiling; to be checked experimentally]
+\label{rem:rank}
+Let $P^{\mathcal{G}}_k$ project orthogonally onto $\mathcal{G}_k$ and set
+$\varpi_k:=\normsq{P^{\mathcal{G}}_kv_k}/\normsq{v_k}\in[0,1]$, the \emph{rank ratio}. Since
+$\mathcal{E}_k^{\mathrm{mean}}\subseteq\mathcal{G}_k$, Pythagoras gives
+\begin{equation}
+a_k=\normsq{(I-P^{\mathcal{G}}_k)v_k}+\operatorname{dist}\big(P^{\mathcal{G}}_kv_k,\mathcal{E}_k^{\mathrm{mean}}\big)^2\ \ge\ (1-\varpi_k)\normsq{v_k}.
+\label{eq:rank-ceiling}
+\end{equation}
+For $v_k$ uniform on the sphere $\mathbb{E}[\varpi_k]=\dim\mathcal{G}_k/d$, so the meaningful
+comparison is $\varpi_k$ against $\dim\mathcal{G}_k/d$, not against $1$. Numerically, $\varpi_k$
+should be evaluated with a truncated least-squares solve rather than a bare pseudo-inverse:
+$\bar G(\thk)^\top\bar G(\thk)$ is typically ill-conditioned, and an untruncated $\mathrm{pinv}$
+amplifies its smallest eigendirections enough to return values above $1$.
+\end{remark}
+
+
+\subsection{Feasibility under the mean}
+\label{sec:feas-mean}
+
+\begin{proposition}[$a$-feasibility as a projection]
+\label{prop:ak-dist}
+For any aggregation rule and every $k$,
+$a_k=\inf_{\ga\in\qk^{\mathrm{flip}}}\normsq{b_k^\dagger}=\operatorname{dist}(v_k,\mathcal{E}_k)^2$,
+the distance to a possibly nonconvex set. \textbf{If $\Agg$ is the mean}, the infimum is attained
+at the unique $b_k^\star=P_k(v_k)$, computed by the convex QP
+$\min_{u\in\mathcal{U}_\beta}\normsq{\bar G(\thk)u-v_k}$ in $O(C^2)$ variables.
+\end{proposition}
+\begin{proof}
+$b_k^\dagger=b_k-v_k$ by \cref{prop:biais-relationship} and $b_k$ ranges exactly over
+$\mathcal{E}_k$ as $\ga$ ranges over $\qk^{\mathrm{flip}}$, by
+\cref{def:feasible-attack-set,def:qk-flip}; take the infimum. Under the mean,
+\cref{prop:Ek-mean} identifies $\mathcal{E}_k$ and \cref{lem:proj} gives existence, uniqueness
+and the QP form.
+\end{proof}
+
+\begin{proposition}[Certificates of infeasibility under the mean]
+\label{prop:certificates-mean}
+\textbf{Assume $\Agg$ is the mean}, and let $v_k\neq0$. Each of the following implies $a_k>0$:
+\begin{align}
+\textbf{(M1)}\quad&\norm{v_k}>\beta\varsigma_k
+&&\text{(radius, \cref{lem:support})},\\
+\textbf{(M2)}\quad&\exists\,p\in\R^d:\ \langle p,v_k\rangle>\beta\max\{0,\max_{z\neq y}\langle p,\bar G_{y,z}(\thk)\rangle\}
+&&\text{(separating hyperplane)},\\
+\textbf{(M3)}\quad&\varpi_k<1
+&&\text{(rank, \cref{rem:rank})}.
+\end{align}
+The sharp forms of (M1)--(M2) replace $\beta\varsigma_k$ by $\varrho^{\mathrm{ex}}_k$ and the
+right-hand side of (M2) by \cref{eq:support-general}; the two coincide under
+$\beta\le\gamma\min_y\pi_y$.
+\end{proposition}
+\begin{proof}
+By \cref{prop:Ek-mean} and $\mathcal{U}_\beta\subseteq\beta\bar\Delta$ we have
+$\mathcal{E}_k^{\mathrm{mean}}\subseteq\beta\mathcal{F}(\thk)\subseteq\bar B(0,\beta\varsigma_k)$,
+the last inclusion because every element of $\beta\mathcal{F}(\thk)$ is a convex combination of
+$0$ and the $\beta\bar G_{y,z}$, all of norm at most $\beta\varsigma_k$. Hence
+$v_k\in\mathcal{E}_k^{\mathrm{mean}}$ implies $\norm{v_k}\le\beta\varsigma_k$ and, for every $p$,
+$\langle p,v_k\rangle\le\max_{e\in\beta\mathcal{F}(\thk)}\langle p,e\rangle
+=\beta\max\{0,\max_{z\neq y}\langle p,\bar G_{y,z}\rangle\}$; contrapose for (M1)--(M2). (M3) is
+\cref{eq:rank-ceiling}. The sharp forms follow from \cref{lem:support} applied to
+$\mathcal{E}_k^{\mathrm{mean}}$ itself.
+\end{proof}
+
+\begin{remark}[Exact feasibility is generically unattainable]
+\label{rem:generic-infeasible}
+(M3) is severe. By \cref{prop:dim}, $\dim\mathcal{G}_k\le C(C-1)\lll d$, so $\varpi_k<1$ for every $v_k$ outside a subspace of measure zero: \textbf{$a_k>0$ generically}, and exact feasibility ($v_k\in\mathcal{E}_k$) is not an attainable target but a degenerate limiting case. The object of $(\mathrm{P}^{\mathrm{mean}})$ is accordingly to \emph{minimize} $a_k$, not to annul it, and the normalization $\varrho_k$ of \cref{sec:norm} is what makes the achieved value interpretable. Statements of the form ``exact feasibility iff $v_k\in\mathcal{E}_k$'' are to be read as characterizations, not as goals.
+\end{remark}
+
+None of (M1)--(M3) involves $\Agg$, consistently with \cref{rem:mean-not-robust}. In particular proximity of $\gradp(\thk)$ to $\gradc(\thk)$ is \emph{not} the relevant criterion, since $\gradc(\thk)$ is the single vertex $0$ of $\mathcal{E}_k^{\mathrm{mean}}$.
+
+
+\subsection{The trigger enters only through $v_k$}
+\label{sec:trigger-vk}
+
+Let $T_\delta(x)=x+\delta$, $\norm{\delta}_\infty\le\varepsilon$. By \cref{eq:bd-Dp,eq:bd-Lp-split}, with $\lambda$ the mixture weight,
+\begin{equation}
+v_k(\delta)=\gradp[\delta](\thk)-\gradc(\thk)
+=\lambda\Big(\nabla_\theta\mathbb{E}_{X\sim\mathcal D_s}\big[\ell_c\big(f_{\thk}(T_\delta(X)),y_{\mathrm{target}}\big)\big]-\gradc(\thk)\Big).
+\label{eq:vk-delta}
+\end{equation}
+The two decision variables act on disjoint objects: the configuration $(u^i)$ parameterizes $\mathcal{E}_k$, the trigger $\delta$ parameterizes $v_k$. This is the structural reason the reachable set is trigger-free.
+
+\begin{remark}[$v_k$ does not vanish at $\delta=0$]
+\label{rem:no-collapse}
+At $\delta=0$, \cref{eq:vk-delta} still compares the gradient of assigning $y_{\mathrm{target}}$ to clean source-class inputs with $\gradc(\thk)$: it asks the model to classify the same inputs under two labels, so $\norm{v_k}$ is large. Minimizing $a_k$ therefore does \emph{not} collapse towards the null trigger; the efficacy term of \cref{eq:P} serves the different purpose of making the backdoor learnable.
+\end{remark}
+
+\begin{proposition}[Budget matching]
+\label{prop:budget-match}
+\textbf{Assume $\Agg$ is the mean and $\beta\le\gamma\min_y\pi_y$.} For all $\lambda,\beta>0$,
+$\operatorname{dist}(v_k,\beta\mathcal{F}(\thk))=\lambda\operatorname{dist}\big(\tfrac1\lambda v_k,\tfrac\beta\lambda\mathcal{F}(\thk)\big)$,
+so the geometry depends on $(\lambda,\beta)$ only through $\beta/\lambda$, and $\lambda=\beta$ reduces exact feasibility to the budget-free condition $\tfrac1\lambda v_k\in\mathcal{F}(\thk)$.
+\end{proposition}
+\begin{proof}
+Homogeneity of the distance, $\operatorname{dist}(\lambda q,\lambda S)=\lambda\operatorname{dist}(q,S)$, with $q=\tfrac1\lambda v_k$ and $S=\tfrac\beta\lambda\mathcal{F}(\thk)$.
+\end{proof}
+
+Since $\tfrac1\lambda v_k$ is $\lambda$-free by \cref{eq:vk-delta}, the expert must be trained at
+the poisoning rate the write access affords: if $\lambda\neq\beta$ the residual retains a
+component that no configuration cancels and no trigger removes. The hypothesis is essential: in
+the saturated regime the reduction fails, as recorded in \cref{rem:saturated}.
+
+
+\subsection{Normalization}
+\label{sec:norm}
+
+$\norm{v_k}$ and $\varsigma_k$ vary by orders of magnitude along the trajectory, so $\mathbb{E}_k[a_k]$ would be dominated by the rounds carrying the largest gradients. A per-round scale $s_k>0$ is needed; we require it to (\textbf{R1}) equalize summands across $k$, (\textbf{R2}) not depend on $\delta$ \emph{given the reference trajectory} of \cref{sec:ref-traj}, so as not to distort the landscape being optimized, and (\textbf{R3}) be computable from quantities already assembled.
+
+\begin{proposition}[Saturation of the scale-invariant criterion]
+\label{prop:saturation}
+Let $A\subset\R^d$ be convex compact with $0\in A$, $e\in\R^d$ with $\norm{e}=1$, and $r(t):=\operatorname{dist}(te,A)^2/t^2$. Then $r$ is nondecreasing on $(0,\infty)$, vanishes on $(0,t^\star]$ with $t^\star:=\max\{t:te\in A\}$, and $r(t)\to1$ with $r'(t)=O(t^{-2})$.
+\end{proposition}
+\begin{proof}
+For $s<t$ and $e_t:=P_A(te)$, convexity and $0\in A$ give $\tfrac ste_t\in A$, so $\operatorname{dist}(se,A)\le\norm{se-\tfrac ste_t}=\tfrac st\operatorname{dist}(te,A)$; squaring gives monotonicity. For large $t$, $\operatorname{dist}(te,A)=t-h_A(e)+O(1/t)$ with $h_A$ the support function of \cref{lem:support}, so $r(t)=1-2h_A(e)/t+O(t^{-2})$.
+\end{proof}
+
+Both candidate scales leave the criterion equal to zero throughout $\mathcal{E}_k$ --- that is a
+property of $a_k$, not of the normalization. What distinguishes them is the behaviour
+\emph{outside}: taking $s_k=\norm{v_k}$ violates (R2) and, by \cref{prop:saturation}, saturates
+at $1$ with gradient $O(t^{-2})$, so a trigger far outside $\mathcal{E}_k$ receives no usable
+signal to return. We use instead the budget scale
+\begin{equation}
+\varrho_k:=\beta\varsigma_k=\beta\max_{z\neq y}\norm{\bar G_{y,z}(\thk)},
+\label{eq:rho}
+\end{equation}
+which measures the residual in units of what the budget can buy, is $\delta$-free once the
+trajectory is frozen, and grows quadratically outside $\mathcal{E}_k$ instead of saturating. By
+\cref{eq:radius-general}, $\varrho_k$ \emph{upper bounds} the exact radius
+$\varrho^{\mathrm{ex}}_k$, with equality iff $\beta\le\gamma\pi_{y^\star}$; a value below $1$
+therefore means the residual is smaller than the largest deviation the budget could buy if it
+could be spent on a single class, and in the unsaturated regime, smaller than the largest
+reachable deviation itself.
+
+
+\subsection{The attacker's problem under the mean}
+\label{sec:attacker-problem}
+
+\begin{equation}
+\begin{aligned}
+(\mathrm{P}^{\mathrm{mean}})\quad
+\min_{\norm{\delta}_\infty\le\varepsilon,\ (u^i)\in\mathfrak{U}_\beta}\
+&\mathbb{E}_{k\sim\tau([k_0,K])}\!\left[\frac{\normsq{\bar G(\bar\theta_k)\bar u-v_k(\delta)}}{\varrho_k^{2}}\right]\\
+&+\kappa\,\mathbb{E}_{k}\Big[\mathbb{E}_{X\sim\mathcal{D}_s}\big[\ell_c\big(f_{\bar\theta_k}(T_\delta(X)),y_{\mathrm{target}}\big)\big]\Big]
+\end{aligned}
+\label{eq:P}
+\end{equation}
+\begin{equation*}
+\text{s.t.}\quad
+\bar\theta_{k+1}=\bar\theta_k-\ek\,\gradp[\delta](\bar\theta_k),
+\qquad
+\lambda=\beta ,
+\end{equation*}
+where $\kappa$ calibrates stealth against strength. No acceptance constraint appears, by
+\cref{rem:mean-not-robust}. The decision variable is the pair $(\delta,\bar u)$ jointly; if an
+implementation parameterizes by the per-worker $u^i$ instead, the first term reads
+$\normsq{\gamma\bar G(\bar\theta_k)u^i-v_k(\delta)}/\varrho_k^2$ by \cref{eq:local-scope}.
+
+\begin{proposition}[Per-round feasibility is a relaxation]
+\label{prop:oneshot-gap}
+Let $J(u)$ be the first term of \cref{eq:P}. Then $\inf_{(u^i)\in\mathfrak{U}_\beta}J(u)\ge\mathbb{E}_k[a_k/\varrho_k^2]$, with equality iff some configuration attains the per-round infimum for almost every $k$.
+\end{proposition}
+\begin{proof}
+For fixed $(u^i)$ the integrand dominates its pointwise infimum, which is $a_k/\varrho_k^2$ by \cref{prop:ak-dist}; take expectations, then the infimum on the left.
+\end{proof}
+
+Thus $a_k$, defined round by round, is a \emph{lower bound} on what a one-shot adversary
+achieves; the gap is exactly the price of $\mathcal{Q}^{\mathrm{os}}$ against
+$\mathcal{Q}^{\mathrm{ad}}$ in \cref{def:induced}, i.e.\ of committing the dataset once.
+
+\begin{proposition}[Structure]
+\label{prop:structure}
+\emph{(i)} $(\mathrm{P}^{\mathrm{mean}})$ is a discrete-time optimal control problem with \emph{static} control $(\delta,\bar u)$; the only nesting is the trajectory recursion and there is no inner $\argmin$ over $\theta$.
+\emph{(ii)} $\mathcal{U}_\beta$ and $\{\norm{\delta}_\infty\le\varepsilon\}$ are compact convex; the objective is continuous in $(\delta,\bar u)$ whenever $\delta\mapsto\gradp[\delta]$ and $\delta\mapsto\mathcal{L}_{bd}^\delta$ are, so the minimum is attained.
+\emph{(iii)} Writing $V(\delta):=\min_uJ(\delta,u)$ is \emph{not} a decoupling: $\min_\delta\min_u=\min_{(\delta,u)}$ is an identity; optimizing $\delta$ against any surrogate other than $\min_uJ$ would be.
+\emph{(iv)} By \cref{lem:hom-wlog} the configuration may be taken homogeneous, and one-shot poisoning makes $\bar u$ shared across rounds, so the inner problem is a \emph{single} QP coupling the whole trajectory.
+\end{proposition}
+
+\begin{remark}[Two admissible solvers, and what distinguishes them]
+\label{rem:solver}
+By \cref{prop:structure}(iii) the problem is joint in $(\delta,\bar u)$, and two solvers are
+consistent with it.
+\emph{(a) Exact inner solve.} At each outer step, solve the QP of \cref{eq:qp} for
+$\bar u^\star(\delta)$, detach it, and take one projected-gradient step on $\delta$ using
+\cref{prop:danskin}. The reported objective is then exactly $\mathbb{E}_k[a_k/\varrho_k^2]$ at
+the current $\delta$, and the hypergradient is the true one.
+\emph{(b) Simultaneous descent.} Step $\delta$ and $\bar u$ together, projecting $\bar u$ onto
+$\mathcal{U}_\beta$ after each step. This is cheaper and remains a descent method on the joint
+objective, but $\bar u$ lags $\delta$: the reported value \emph{overstates}
+$\mathbb{E}_k[a_k/\varrho_k^2]$, and \cref{prop:danskin} does not apply, so the $\delta$-gradient
+is not the hypergradient of $V$.
+The two are reconciled by reporting, alongside the running objective, the value attained by the
+exact inner solve on the same $v_k$; the gap measures the lag and is the quantity to monitor.
+\end{remark}
+
+
+\mbcomment{Since exact feasibility notion is a quite strong notion, it could be interesting to obtain a similar optimisation problem starting from the feasibility in alignment notion.}
+
+\subsection{Reference trajectory}
+\label{sec:ref-traj}
+
+$\bar\theta(\delta)$ in \cref{eq:P} is the expected SGD trajectory on $\Lp$, i.e.\ the expert trajectory. Recall from \cref{def:hk-decomposition} that $h_k=\gradp(\thk)+b_k^\dagger+\xi_k$ with $\Ethk{\xi_k}=0$.
+
+\begin{proposition}[Self-consistency]
+\label{prop:selfcons}
+Assume $\gradp$ is $L$-Lipschitz, $\ek\le\eta$, $\sup_k\norm{b_k^\dagger}\le\epsilon_b$ and $\bar\sigma:=\sup_k\mathbb{E}\norm{\xi_k}$. Then
+\begin{equation}
+\mathbb{E}\,\norm{\thk-\bar\theta_k(\delta)}\ \le\ \frac{\epsilon_b+\bar\sigma}{L}\Big[(1+\eta L)^k-1\Big].
+\label{eq:selfcons}
+\end{equation}
+In particular, if the aggregation is noiseless ($\xi_k\equiv0$) and the attack exact ($b_k^\dagger\equiv0$), then $\thk=\bar\theta_k(\delta)$ for all $k$.
+\end{proposition}
+\begin{proof}
+Let $e_k:=\thk-\bar\theta_k$. Subtracting the two recursions,
+$e_{k+1}=e_k-\ek\big(\gradp(\thk)-\gradp(\bar\theta_k)\big)-\ek\big(b_k^\dagger+\xi_k\big)$,
+so pathwise $\norm{e_{k+1}}\le(1+\eta L)\norm{e_k}+\eta\big(\norm{b_k^\dagger}+\norm{\xi_k}\big)$. Taking expectations and iterating from $e_0=0$ gives $\mathbb{E}\norm{e_k}\le\eta(\epsilon_b+\bar\sigma)\sum_{l<k}(1+\eta L)^l$, which is \cref{eq:selfcons}. The last claim is the case $\epsilon_b=\bar\sigma=0$.
+\end{proof}
+
+\begin{remark}[What self-consistency does and does not say]
+\label{rem:selfcons-scope}
+\cref{eq:selfcons} bounds $\mathbb{E}\norm{\thk-\bar\theta_k}$, not $\norm{\Ethk{\thk}-\bar\theta_k}$: since $\gradp$ is not affine, $\mathbb{E}[\gradp(\thk)]\neq\gradp(\mathbb{E}[\thk])$ and no statement about the mean iterate follows. Moreover the aggregation noise $\bar\sigma$ \emph{does not vanish} when the attack is exact, so the reference trajectory is the fixed point of $(\mathrm{P}^{\mathrm{mean}})$ only at the level of the expected update. The bound is exponential in $k$ and is a consistency statement rather than a numerical guarantee; the direct measurement of item~5 in \cref{sec:todo} is what certifies it in practice.
+\end{remark}
+
+Two approximations must be distinguished. \textbf{(T1)} evaluating on $\bar\theta(\delta)$ rather than on the victim's iterates, controlled by \cref{eq:selfcons}. \textbf{(T2)} not re-recording $\bar\theta$ as $\delta$ varies: the exact hypergradient obeys $p_k=\nabla_\theta\ell_k+(I-\ek\nabla^2\Lp(\bar\theta_k))^{\!\top}p_{k+1}$ with $p_{K+1}=0$, and (T2) sets $p\equiv0$; if $\norm{I-\ek\nabla^2\Lp(\bar\theta_k)}\le\rho<1$ and $\sup_k\norm{\nabla_\theta\ell_k}\le G_\ell$, the error is at most $K\eta\bar BG_\ell/(1-\rho)$ with $\bar B:=\sup_k\norm{\partial_\delta\gradp[\delta](\bar\theta_k)}$. (T2) is removed by one outer loop: re-record $\bar\theta(\delta)$ and re-solve.
+
+\begin{remark}[Momentum]
+\label{rem:momentum}
+\cref{prop:selfcons} is stated for the plain SGD update \cref{eq:sgd}. With momentum the state becomes $(\theta,m)$ and both the recursion and the adjoint of (T2) must be written on that pair; the argument is unchanged in structure.
+\end{remark}
+
+
+\subsection{Solution}
+\label{sec:solution}
+
+By \cref{lem:hom-wlog} the configuration may be taken homogeneous, so the decision reduces to $\bar u\in\mathcal{U}_\beta$, shared across rounds:
+\begin{equation}
+u^{\star}(\delta)=\argmin_{u\in\mathcal{U}_\beta}\ u^{\top}Q\,u-2(c^{\delta})^{\top}u,
+\qquad
+Q=\sum_k\omega_k\bar G_k^{\top}\bar G_k,
+\quad
+c^{\delta}=\sum_k\omega_k\bar G_k^{\top}v_k(\delta),
+\label{eq:qp}
+\end{equation}
+with $\bar G_k:=\bar G(\bar\theta_k)$ and $\omega_k:=1/(\varrho_k^2|[k_0,K]|)$. Under (T2) the matrix $Q$ is $\delta$-free and assembled once; only $c^\delta$ changes along the optimization. The dimension is $O(C^2)$, independent of $K$ and of $d$.
+
+\begin{proposition}[Hypergradient]
+\label{prop:danskin}
+\textbf{Assume $\Agg$ is the mean and (T2)}, so $\mathcal{U}_\beta$ is compact convex and $\delta$-independent and $\bar G_k$ is $\delta$-independent. If $u^\star(\delta)$ is unique, $V(\delta):=\min_{u\in\mathcal{U}_\beta}J(\delta,u)$ is differentiable at $\delta$ with $\nabla V(\delta)=\nabla_\delta J(\delta,u^\star(\delta))$, $u^\star$ \emph{detached}.
+\end{proposition}
+\begin{proof}
+Danskin's theorem: the feasible set is compact and $\delta$-independent and $J$ is $C^1$ in $\delta$ with continuous partial gradient; uniqueness of the minimizer makes the directional derivative linear in the direction.
+\end{proof}
+
+Uniqueness holds when $Q\succ0$; otherwise $+\epsilon\normsq{u}$ restores it at $O(\epsilon)$ bias and makes $V$ of class $C^1$. Since $\bar G_k$ is computed once per checkpoint and reused, each outer step costs one backward pass for $v_k(\delta)$ per round plus one small QP. Projected gradient descent on $\delta$ with step $\le1/L$ converges to a projected stationary point at rate $O(1/\sqrt T)$.
