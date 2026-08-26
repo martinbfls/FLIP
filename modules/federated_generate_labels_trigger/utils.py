@@ -1,8 +1,43 @@
+import random
+
 import numpy as np
 import torch
 
 from modules.base_utils.datasets import MTTDataset
 from modules.federated_generate_labels.utils import DEFAULT_EXPERT_CONFIG
+
+
+def build_expert_pool(expert_starts, expert_opt_starts, pool_size):
+    """P3 (checkpoint-pool stability fix): preloads `pool_size` distinct (params, optimizer-
+    state) checkpoint pairs into RAM (float32, CPU) once, to be drawn from uniformly at random
+    per outer training step -- instead of a single checkpoint indexed sequentially by the step,
+    which conditioned every step's gradient on just one point of the expert trajectory.
+
+    `expert_starts`/`expert_opt_starts` (parallel path lists, as returned by extract_experts /
+    extract_experts_biased) may contain duplicate (params_path, opt_path) pairs -- e.g. from
+    independent random draws colliding -- so the pool is sampled from the DISTINCT pairs only.
+    If `pool_size` exceeds the number of distinct pairs available, uses all of them instead
+    (warns).
+
+    Returns (pool, pool_size): `pool` is a list of (params_state_dict, opt_state_dict) tuples,
+    both CPU/float32 tensors; `pool_size` is the (possibly clamped) actual pool size.
+    """
+    all_pairs = list(dict.fromkeys(zip(expert_starts, expert_opt_starts)))
+    if pool_size > len(all_pairs):
+        print(
+            f"WARNING: pool_size={pool_size} > {len(all_pairs)} distinct available expert "
+            f"checkpoints for this run -- using all {len(all_pairs)} instead."
+        )
+        pool_size = len(all_pairs)
+    pool_paths = random.sample(all_pairs, pool_size)
+    pool = [
+        (
+            {k: v.float().cpu() for k, v in torch.load(p_path, map_location="cpu").items()},
+            torch.load(o_path, map_location="cpu"),
+        )
+        for p_path, o_path in pool_paths
+    ]
+    return pool, pool_size
 
 
 class TriggerMTTDataset(MTTDataset):

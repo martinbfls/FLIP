@@ -464,13 +464,17 @@ def optimize_trigger_policy_step(
     SAME v_k (see `_compute_step_policy`) and report it (`B2_qp`) alongside the co-descended
     `B2`, so the gap -- the quantity to monitor -- is measured rather than assumed small.
     '''
-    sampled_k = sample_checkpoints(
-        len(expert_models), num_chckpt, alpha=alpha_ckpt, device=device,
-    )
-
     # G/Q depend only on (checkpoint, dataset), not on delta/u: fresh cache reused across every
     # batch of this call, discarded once these checkpoints are replaced -- same convention as
-    # federated_optimizing_trigger's optimize_trigger_step.
+    # federated_optimizing_trigger's optimize_trigger_step. P3 (checkpoint-pool stability fix):
+    # `sampled_k` is now redrawn PER BATCH (below), not once for the whole call -- conditioning
+    # every batch's B2/B2_qp on the SAME fixed num_chckpt checkpoints for the entire call was
+    # the same single-point-of-the-trajectory instability the sibling _trigger/_joint modules'
+    # checkpoint pool addresses. flip_grad_cache needs no structural change to support this: it
+    # already does a lazy per-k lookup (cache hit -> reuse G_obj/Q_obj; miss -> compute once and
+    # store), so it already IS the pool -- redrawing sampled_k more often just lets it cover
+    # more of `expert_models` over the course of this call (up to len(expert_models), each
+    # entry computed at most once) instead of being capped at num_chckpt for the whole call.
     flip_grad_cache = {}
 
     total_steps = len(loader)
@@ -492,6 +496,10 @@ def optimize_trigger_policy_step(
     for batch_idx, batch in enumerate(pbar):
         optimizer_delta.zero_grad()
         optimizer_policy.zero_grad()
+
+        sampled_k = sample_checkpoints(
+            len(expert_models), num_chckpt, alpha=alpha_ckpt, device=device,
+        )
 
         run_diag = (batch_idx % diag_every == 0)
         result = _compute_step_policy(
@@ -800,6 +808,23 @@ def optimize_trigger_policy(
             optim_kwargs=optim_kwargs,
             scheduler_kwargs=scheduler_kwargs,
         )
+        # get_train_info (modules/base_utils/util.py) falls back to DEFAULT_SGD_EPOCHS=200
+        # whenever the passed `epochs` is falsy (0 or None) -- the same value federated_
+        # train_user typically trains for. A config bug resolving `epochs` to a falsy value
+        # would therefore silently make this per-step expert retraining run as long as
+        # federated_train_user's own schedule instead of this module's configured `epochs`,
+        # with no error. Fail loudly instead.
+        expert_epochs = epochs_
+        assert expert_epochs == epochs, (
+            f"expert_epochs resolved to {expert_epochs}, expected config epochs={epochs} -- "
+            "get_train_info silently substitutes DEFAULT_SGD_EPOCHS for a falsy `epochs`."
+        )
+        if step == 0:
+            print(
+                f"[hyperparams] expert_epochs={expert_epochs} (per outer step), "
+                f"n_steps={n_steps}, batch_size={batch_size_}, train_flag={train_flag}, "
+                f"lr_delta={lr_delta}, lr_policy={lr_policy}"
+            )
 
         # lambda_target=lambda_poison=beta: theta_bar_{k+1} = theta_bar_k - eta_k grad(theta_bar_k)
         # is trained at the SAME poison rate the (P^mean) objective assumes -- this is what

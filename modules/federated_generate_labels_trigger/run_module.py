@@ -23,6 +23,7 @@ scoped this fix to this module and federated_generate_labels_trigger_joint only.
 """
 
 from pathlib import Path
+import random
 import sys
 import warnings
 import torch
@@ -38,7 +39,8 @@ from modules.federated_optimizing_trigger.utils import (
     get_mu, init_delta, raw_to_trigger_preprocess, get_raw_clean_dataset,
     trigger_penalty_hinge, tv_loss,
 )
-from modules.federated_generate_labels_trigger.utils import TriggerMTTDataset, extract_experts_biased
+from modules.federated_generate_labels_trigger.utils import TriggerMTTDataset, \
+                                                             extract_experts_biased, build_expert_pool
 
 
 def run(experiment_name, module_name, **kwargs):
@@ -173,6 +175,13 @@ def run(experiment_name, module_name, **kwargs):
     checkpoint_sampling = args.get("checkpoint_sampling", "uniform")
     alpha_ckpt = args.get("alpha_ckpt", 0.01)
 
+    # P3: pool_size checkpoints preloaded into RAM once, then drawn from uniformly at random
+    # per outer step (`it`), instead of a single checkpoint indexed sequentially by `it` --
+    # conditioning every step's gradient on just one point of the expert trajectory made
+    # optimization unstable. pool_size=1 keeps the exact previous (sequential, per-step) code
+    # path -- see the pool_size==1 branch below.
+    pool_size = args.get("pool_size", 15)
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Build datasets and initialize labels
@@ -250,6 +259,33 @@ def run(experiment_name, module_name, **kwargs):
         )
         loaders.append(loader)
 
+    # P3: preload `pool_size` (params, optimizer-state) checkpoint pairs into RAM once, then
+    # draw one uniformly at random per outer step below -- instead of a single checkpoint
+    # indexed sequentially by `it` (conditioning every step's gradient on just one point of the
+    # expert trajectory made optimization unstable). pool_size==1 keeps the ORIGINAL sequential
+    # per-step disk load, bit-for-bit -- see prelim/tests/test_expert_checkpoint_pool.py.
+    expert_pool = None
+    if pool_size != 1:
+        print(f"Preloading up to {pool_size} expert checkpoints into RAM (float32, CPU)...")
+        expert_pool, pool_size = build_expert_pool(expert_starts, expert_opt_starts, pool_size)
+
+    def _load_expert_for_step(it):
+        """Returns (params_state_dict, opt_state_dict) for outer step `it` -- the params are
+        load_state_dict-ed into expert_model/student_model by the caller, and opt_state_dict is
+        both load_state_dict-ed into optimizer_expert AND read directly (sgd_step, below)."""
+        if pool_size == 1:
+            checkpoint = torch.load(expert_starts[it])
+            optimizer_expert.load_state_dict(torch.load(expert_opt_starts[it]))
+            opt_state = torch.load(expert_opt_starts[it])
+            return checkpoint, opt_state
+        checkpoint, opt_state_cpu = random.choice(expert_pool)
+        optimizer_expert.load_state_dict(opt_state_cpu)
+        # optimizer_expert.state_dict() (not opt_state_cpu directly): sgd_step below reads
+        # state_dict["state"].values() straight into device-resident tensor arithmetic, unlike
+        # load_state_dict itself (which casts device/dtype internally) -- reading back through
+        # the optimizer gives tensors already on expert_model's own device.
+        return checkpoint, optimizer_expert.state_dict()
+
     losses = []
 
     with make_pbar(total=config['iterations'] * len(mtt_dataset)) as pbar:
@@ -257,14 +293,11 @@ def run(experiment_name, module_name, **kwargs):
             for batches in zip(*loaders):
 
                 # Load expert trajectory
-                checkpoint = torch.load(expert_starts[it])
+                checkpoint, state_dict = _load_expert_for_step(it)
                 expert_model.load_state_dict(checkpoint)
                 student_model.load_state_dict({k: v.clone() for k, v in checkpoint.items()})
 
                 expert_start = [p.clone() for p in expert_model.parameters()]
-
-                optimizer_expert.load_state_dict(torch.load(expert_opt_starts[it]))
-                state_dict = torch.load(expert_opt_starts[it])
 
                 expert_params = list(expert_model.parameters())
                 student_params = list(student_model.parameters())

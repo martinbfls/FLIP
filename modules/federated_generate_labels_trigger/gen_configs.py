@@ -24,8 +24,8 @@ import toml
 # Sweep axes -- edit these for a real campaign. Defaults match the grid agreed
 # for this threat-model family (docs/policy_module_audit_report.md, Bloc B).
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 1
-NUM_HONESTS = 0
+NUM_POISONED = 3
+NUM_HONESTS = 7
 SEEDS = [0]
 BUDGETS = [1500]
 AGG_METHODS = ["mean"]
@@ -36,15 +36,30 @@ TARGET_LABEL = 4
 
 CHECKPOINT_SAMPLING = "uniform"  # this module's own prior default -- see the joint generator's
                                   # cross-module warning
-GAMMA_STEALTH = 1.0
-LAMBDA_BD = 1.0
-EPSILON = 0.1
-LR_DELTA = 1e-2
 ALPHA_CKPT = 0.01
 TRAIN_PCT = 1.0
 EPOCHS_EXPERT = 20
 CHECKPOINT_ITERS = 50
 N_ITERATIONS = 15
+
+# --------------------------------------------------------------------------- #
+# REGULARIZATION_GRID -- trigger regularization knobs, kept separate from the sweep axes
+# above so a real campaign's regularization sweep is easy to find and edit in one place.
+# `single_cell` mode (see generate_single_cell / --single-cell) fixes ALL of these to the
+# defaults below and sweeps only the main axes (SEEDS/BUDGETS/AGG_METHODS).
+# --------------------------------------------------------------------------- #
+EPSILON = 0.1        # L_infinity bound on the trigger delta -- larger allows a stronger/more
+                      # visible perturbation; too small can make the backdoor unreachable.
+LR_DELTA = 1e-2       # Adam learning rate for the trigger optimization.
+LAMBDA_BD = 1.0       # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
+                      # formulas) -- higher pushes harder for backdoor success at the cost of
+                      # the MTT alignment term.
+GAMMA_STEALTH = 1.0   # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
+                      # to federated_optimizing_trigger_policy's gamma = num_poisoned/
+                      # (num_poisoned+num_honests) -- disjoint concept, see gen_configs.py's
+                      # docstring / schema note).
+LAMBDA_DELTA = 0.0    # L2 norm penalty on delta ("lambda_trigger_l2") -- 0.0 (schema default)
+                      # leaves the trigger magnitude unregularized beyond the epsilon clamp.
 
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
@@ -122,6 +137,7 @@ target_label = {target_label}
 epsilon = {epsilon}
 lr_delta = {lr_delta}
 lambda_bd = {lambda_bd}
+lambda_delta = {lambda_delta}
 
 train_pct = {train_pct}
 num_honests = {num_honests}
@@ -197,7 +213,8 @@ def generate_cell(model_flag, dataset, agg_method, seed, budgets, dry_run=False)
         module_dir / "config.toml": DIRECT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT, model_flag=model_flag, dataset=dataset,
             cell_dir=module_dir, source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            epsilon=EPSILON, lr_delta=LR_DELTA, lambda_bd=LAMBDA_BD, train_pct=TRAIN_PCT,
+            epsilon=EPSILON, lr_delta=LR_DELTA, lambda_bd=LAMBDA_BD, lambda_delta=LAMBDA_DELTA,
+            train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS, num_poisoned=NUM_POISONED, agg_method=agg_method,
             gamma_stealth=GAMMA_STEALTH, checkpoint_sampling=CHECKPOINT_SAMPLING,
             alpha_ckpt=ALPHA_CKPT, n_iterations=N_ITERATIONS,
@@ -231,6 +248,15 @@ def generate_cell(model_flag, dataset, agg_method, seed, budgets, dry_run=False)
     return paths
 
 
+def generate_single_cell(dry_run=True):
+    """Exactly one cell (first model/dataset/agg_method/seed, first budget), regularization
+    fixed at REGULARIZATION_GRID's defaults -- the minimal preliminary campaign used to sanity
+    check the chain before spending a real sweep's compute."""
+    return generate_cell(
+        MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], BUDGETS[:1], dry_run=dry_run,
+    )
+
+
 def generate_minimal_campaign(dry_run=True):
     """B3: the minimal exploitable campaign -- 3 seeds x 3 budgets x 2 aggregators, one
     model/dataset. Shown before generating the full grid."""
@@ -261,15 +287,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--minimal", action="store_true", help="B3 minimal campaign only")
+    parser.add_argument(
+        "--single-cell", action="store_true",
+        help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
+             "preliminary campaign",
+    )
     args = parser.parse_args()
+    assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
 
-    gen_fn = generate_minimal_campaign if args.minimal else generate_all_configs
+    if args.single_cell:
+        gen_fn = generate_single_cell
+    elif args.minimal:
+        gen_fn = generate_minimal_campaign
+    else:
+        gen_fn = generate_all_configs
     paths = gen_fn(dry_run=args.dry_run)
 
-    n_budgets = len(BUDGETS[:3]) if args.minimal else len(BUDGETS)
-    n_seeds = len(SEEDS[:3]) if args.minimal else len(SEEDS)
-    n_aggs = len(AGG_METHODS[:2]) if args.minimal else len(AGG_METHODS)
-    n_cells = n_seeds * n_aggs * (1 if args.minimal else len(MODEL_FLAGS) * len(DATASETS))
+    if args.single_cell:
+        n_budgets, n_seeds, n_aggs, n_cells = 1, 1, 1, 1
+    else:
+        n_budgets = len(BUDGETS[:3]) if args.minimal else len(BUDGETS)
+        n_seeds = len(SEEDS[:3]) if args.minimal else len(SEEDS)
+        n_aggs = len(AGG_METHODS[:2]) if args.minimal else len(AGG_METHODS)
+        n_cells = n_seeds * n_aggs * (1 if args.minimal else len(MODEL_FLAGS) * len(DATASETS))
     n_configs_per_cell = 3 + n_budgets  # train_expert (shared) + module + select_flips + N train_user
 
     if args.dry_run:

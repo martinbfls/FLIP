@@ -10,6 +10,7 @@ unmodified/side by side.
 """
 
 from pathlib import Path
+import random
 import sys
 import json
 import warnings
@@ -27,7 +28,7 @@ from modules.federated_optimizing_trigger.utils import (
     trigger_penalty_hinge, tv_loss,
 )
 from modules.federated_generate_labels_trigger_joint.utils import (
-    TriggerMTTDataset, extract_experts_biased,
+    TriggerMTTDataset, extract_experts_biased, build_expert_pool,
     directional_floor_penalty, magnitude_floor_penalty, project_trigger_constraints,
     cosine_to,
 )
@@ -308,6 +309,13 @@ def run(experiment_name, module_name, **kwargs):
     checkpoint_sampling = args.get("checkpoint_sampling", "biased")
     alpha_ckpt = args.get("alpha_ckpt", 0.01)
 
+    # P3: pool_size checkpoints preloaded into RAM once, then drawn from uniformly at random
+    # per outer step (`it`), instead of a single checkpoint indexed sequentially by `it` --
+    # conditioning every step's gradient on just one point of the expert trajectory made
+    # optimization unstable. pool_size=1 keeps the exact previous (sequential, per-step) code
+    # path -- see the pool_size==1 branch below.
+    pool_size = args.get("pool_size", 15)
+
     # Instrumentation (mandatory, see run() docstring): if set, per-batch metrics (expert_asr,
     # delta_inf, delta_l2, param_loss, param_dist, L_bd_mean, grand_loss) are dumped as JSON.
     metrics_log_path = args.get("metrics_log_path", None)
@@ -426,6 +434,41 @@ def run(experiment_name, module_name, **kwargs):
 
     delta_init = None  # H1 diagnostic -- captured on the first batch, see below
 
+    # P3: preload `pool_size` (params, optimizer-state) checkpoint pairs into RAM once, then
+    # draw one uniformly at random per outer step below -- instead of a single checkpoint
+    # indexed sequentially by `it`. pool_size==1 keeps the ORIGINAL sequential per-step disk
+    # load, bit-for-bit -- see prelim/tests/test_expert_checkpoint_pool.py. Weights are cached
+    # in float32 on CPU (never half) -- this module's create_graph=True backward (student_grad_
+    # buf below) differentiates through expert_start/state_dict-derived quantities, and half
+    # precision there risks numerical issues the original code never had to deal with.
+    expert_pool = None
+    if pool_size != 1:
+        print(f"Preloading up to {pool_size} expert checkpoints into RAM (float32, CPU)...")
+        expert_pool, pool_size = build_expert_pool(expert_starts, expert_opt_starts, pool_size)
+
+    def _opt_state_to_device(opt_state_cpu, device):
+        return {
+            "state": {
+                k: {
+                    kk: (vv.to(device) if torch.is_tensor(vv) else vv)
+                    for kk, vv in v.items()
+                }
+                for k, v in opt_state_cpu["state"].items()
+            },
+            "param_groups": opt_state_cpu["param_groups"],
+        }
+
+    def _load_expert_for_step(it):
+        """Returns (params_state_dict, opt_state_dict) for outer step `it` -- params are
+        load_state_dict-ed into expert_model/student_model by the caller, opt_state_dict is
+        read directly (sgd_step, below) into device-resident tensor arithmetic."""
+        if pool_size == 1:
+            checkpoint = torch.load(expert_starts[it])
+            opt_state = torch.load(expert_opt_starts[it])
+            return checkpoint, opt_state
+        checkpoint, opt_state_cpu = random.choice(expert_pool)
+        return checkpoint, _opt_state_to_device(opt_state_cpu, device)
+
     losses = []
     align_active_window = []  # rolling fraction of steps where L_align > 0 -- see hinge_rate
     mag_active_window = []    # in federated_optimizing_trigger_policy for the same pattern
@@ -436,7 +479,7 @@ def run(experiment_name, module_name, **kwargs):
             for batches in zip(*loaders):
 
                 # Load expert trajectory
-                checkpoint = torch.load(expert_starts[it])
+                checkpoint, state_dict = _load_expert_for_step(it)
                 expert_model.load_state_dict(checkpoint)
                 student_model.load_state_dict({k: v.clone() for k, v in checkpoint.items()})
 
@@ -446,7 +489,6 @@ def run(experiment_name, module_name, **kwargs):
                 # point 2b) -- state_dict (loaded directly, independent of optimizer_expert) is
                 # the only source of per-param momentum buffers / SGD hyperparameters used by
                 # both sgd_step calls below.
-                state_dict = torch.load(expert_opt_starts[it])
 
                 expert_params = list(expert_model.parameters())
                 student_params = list(student_model.parameters())

@@ -8,6 +8,7 @@ Run:  python prelim/tests/test_policy_module_fixes.py
 """
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,6 +20,7 @@ from modules.federated_optimizing_trigger_policy.utils import (
     _project_nonneg_capped_sum,
 )
 from modules.federated_policy_to_flips.utils import materialize_policy_flips
+from modules.federated_optimizing_trigger.utils import resolve_beta_and_lambda_poison
 
 _results = []
 
@@ -175,11 +177,93 @@ def test_materialize_policy_flips_uses_gamma():
           f"ratio={old_convention_count / max(len(idx_flipped), 1):.2f} (expected ~= 1/gamma={1/gamma:.2f})")
 
 
+# --------------------------------------------------------------------------#
+# P0 regression (2026-08-26 cluster AssertionError): the stale gen_configs.py sweep-axis
+# defaults (num_poisoned=1, num_honests=0, gamma=1) were mistaken for a metadata-writing bug
+# in federated_optimizing_trigger_policy/federated_policy_to_flips. Both modules already read
+# num_honests/num_poisoned correctly from config -- the fix was in gen_configs.py's own
+# defaults (now num_poisoned=3, num_honests=7, matching orchestrate_runs_policy_slurm.sh and
+# the real federated deployment). This pins down that federated_policy_to_flips's own
+# consistency assertion (run_module.py's "Materialized flip count does not match beta's
+# flip_budget") does NOT fire under the real (3, 7) config for a saturated policy.
+# --------------------------------------------------------------------------#
+def test_policy_to_flips_assertion_passes_under_real_federated_config():
+    n_classes = 10
+    n_train = 50000
+    num_poisoned, num_honests = 3, 7
+    gamma = num_poisoned / (num_poisoned + num_honests)
+    check("gamma from real federated config (num_poisoned=3, num_honests=7) == 0.3",
+          abs(gamma - 0.3) < 1e-9, f"gamma={gamma}")
+
+    # beta_local = 0.1 matches experiments/.../3vs7/budget1500 (beta_global = gamma*beta_local
+    # = 0.03, the target global budget of 1500/50000).
+    beta_local = 0.1
+    pairs = [(9, 4)]
+    u = np.array([beta_local])  # fully saturated: sum(u) == beta_local
+
+    rng = np.random.RandomState(0)
+    labels = rng.randint(0, n_classes, size=n_train)
+
+    idx_flipped, _targets = materialize_policy_flips(
+        u, pairs, n_train, labels, n_classes, gamma, seed=0,
+    )
+    budget = int(len(np.unique(idx_flipped)))
+
+    # Exact replica of federated_policy_to_flips/run_module.py's consistency check.
+    _, flip_budget_expected, _ = resolve_beta_and_lambda_poison(
+        beta=beta_local, flip_budget=None, lambda_poison="beta",
+        num_poisoned=num_poisoned, num_honests=num_honests, n_train=n_train,
+    )
+    tol = max(len(pairs), round(0.02 * flip_budget_expected))
+
+    check("materialized budget matches beta's flip_budget under the real (3,7) config "
+          "(no AssertionError)",
+          abs(budget - flip_budget_expected) <= tol,
+          f"budget={budget}, flip_budget_expected={flip_budget_expected}, tol={tol}")
+
+    # Same scenario under the STALE gen_configs.py defaults (1, 0): this reproduces the
+    # exact cluster trace (flip_budget=1500, gamma=1.0) to document what was actually wrong.
+    stale_num_poisoned, stale_num_honests = 1, 0
+    stale_gamma = stale_num_poisoned / (stale_num_poisoned + stale_num_honests)
+    _, stale_flip_budget, _ = resolve_beta_and_lambda_poison(
+        beta=0.03, flip_budget=None, lambda_poison="beta",
+        num_poisoned=stale_num_poisoned, num_honests=stale_num_honests, n_train=n_train,
+    )
+    check("stale (1,0) defaults reproduce the cluster trace's flip_budget=1500, gamma=1.0",
+          stale_gamma == 1.0 and stale_flip_budget == 1500,
+          f"stale_gamma={stale_gamma}, stale_flip_budget={stale_flip_budget}")
+
+
+# --------------------------------------------------------------------------#
+# P3 (checkpoint-pool stability, policy module -- arbitrated option A): sample_checkpoints
+# must be redrawn INSIDE the batch loop (once per batch), not once for the whole
+# optimize_trigger_policy_step call, so B2/B2_qp are not conditioned on the same fixed
+# num_chckpt checkpoints for the entire call. flip_grad_cache (initialized OUTSIDE the batch
+# loop, so it persists across batches within one call) needed no structural change -- its
+# existing lazy per-k lookup already serves as the pool.
+# --------------------------------------------------------------------------#
+def test_policy_sampled_k_redrawn_per_batch():
+    repo_root = Path(__file__).resolve().parents[2]
+    src = (repo_root / "modules/federated_optimizing_trigger_policy/run_module.py").read_text()
+
+    cache_idx = src.index("flip_grad_cache = {}")
+    loop_idx = src.index("for batch_idx, batch in enumerate(pbar):")
+    check("flip_grad_cache initialized BEFORE the batch loop (persists across batches)",
+          cache_idx < loop_idx, f"cache_idx={cache_idx}, loop_idx={loop_idx}")
+
+    sample_call_idx = src.index("sampled_k = sample_checkpoints(", loop_idx)
+    check("sample_checkpoints is called INSIDE the batch loop (redrawn per batch, not once "
+          "per call)",
+          sample_call_idx > loop_idx, f"sample_call_idx={sample_call_idx}, loop_idx={loop_idx}")
+
+
 if __name__ == "__main__":
     test_duchi_negative_components()
     test_project_policy_budget_feasible_and_near_optimal()
     test_project_policy_budget_block_cap_binds_before_global()
     test_materialize_policy_flips_uses_gamma()
+    test_policy_to_flips_assertion_passes_under_real_federated_config()
+    test_policy_sampled_k_redrawn_per_batch()
 
     n_fail = sum(1 for _, ok, _ in _results if not ok)
     print(f"\n{len(_results) - n_fail}/{len(_results)} checks passed.")

@@ -31,8 +31,8 @@ import toml
 # Sweep axes -- edit these for a real campaign. num_poisoned/num_honests, agg_method*, dataset,
 # model, checkpoint provenance ("1xs") kept ALIGNED with the other two generators.
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 1
-NUM_HONESTS = 0
+NUM_POISONED = 3
+NUM_HONESTS = 7
 SEEDS = [0]
 # Target GLOBAL flip budgets, aligned with the other two generators' BUDGETS -- converted to
 # this module's own LOCAL beta below (beta_local = (budget/n_train) / gamma).
@@ -49,17 +49,42 @@ TARGET_LABEL = 4
 N_TRAIN = {"cifar": 50000, "cifar_100": 50000, "svhn": 73257}
 
 LAMBDA_POISON = "beta"  # "beta" (A1-corrected: resolves to beta_global) or a numeric override
-LR_POLICY = 1e-2
-LR_DELTA = 1e-2
-NORMALIZATION = "rho"
-DIAG_EVERY = 50
 ALPHA_CKPT = 0.01
 NUM_CHCKPT = 4
-N_STEPS = 20
-EPOCHS = 20
-LAMBDA_BD = 1.0
-EPSILON = 0.1
 CHECKPOINT_ITERS = 50
+# train_expert's own bootstrap-checkpoint epochs -- a DIFFERENT quantity from POLICY_EPOCHS
+# below (the per-outer-step expert-retraining epochs inside federated_optimizing_trigger_
+# policy itself). Deliberately a separate constant: reusing one EPOCHS constant for both was
+# the exact ambiguity behind the "expert trains 200 epochs instead of 20" investigation --
+# see run_module.py's expert_epochs assertion at the top of each outer step.
+EPOCHS_EXPERT = 20
+
+# --------------------------------------------------------------------------- #
+# REGULARIZATION_GRID -- trigger/policy regularization knobs, kept separate from the sweep
+# axes above so a real campaign's regularization sweep is easy to find and edit in one place.
+# `single_cell` mode (see generate_single_cell / --single-cell) fixes ALL of these to the
+# defaults below and sweeps only the main axes (SEEDS/BUDGETS_TARGET).
+# --------------------------------------------------------------------------- #
+EPSILON = 0.1         # L_infinity bound on the trigger delta -- larger allows a stronger/more
+                       # visible perturbation; too small can make the backdoor unreachable.
+LR_DELTA = 1e-2        # Adam learning rate for the trigger optimization.
+LR_POLICY = 1e-2       # Adam learning rate for the policy u optimization.
+LAMBDA_BD = 1.0        # weight of the backdoor-efficacy loss (kappa in the P^mean formula) --
+                       # higher pushes harder for backdoor success at the cost of the B2
+                       # alignment term.
+LAMBDA_DELTA = 0.0     # L2 norm penalty on delta ("lambda_trigger_l2") -- 0.0 (schema
+                       # default) leaves the trigger magnitude unregularized beyond the
+                       # epsilon clamp.
+NORMALIZATION = "rho"  # B2's denominator: "rho" (eq:rho, non-saturating) or "v" (legacy,
+                       # saturates once v leaves the reachable set). See schema for the tradeoff.
+DIAG_EVERY = 50        # frequency (in batches) of the QP diagnostic (B2_qp) against the
+                       # co-descended policy -- lower gives a tighter Danskin-gap read, at
+                       # the cost of solving the QP more often.
+N_STEPS = 20           # number of outer (retrain expert + optimize trigger/policy) steps.
+POLICY_EPOCHS = 20     # epochs of expert retraining PER outer step -- distinct from both
+                       # EPOCHS_EXPERT (the bootstrap expert above) and federated_train_user's
+                       # own epochs (unset in TRAIN_USER_TEMPLATE below, so it falls back to
+                       # modules/base_utils/util.py's DEFAULT_SGD_EPOCHS=200).
 
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
@@ -151,7 +176,7 @@ output_dir_policy = "{cell_dir}/policy"
 device = "cpu"
 lambda_bd = {lambda_bd}
 lambda_penalty = 0.0
-lambda_delta = 0.0
+lambda_delta = {lambda_delta}
 lambda_tv = 0.0
 kappa = 0.0
 epsilon = {epsilon}
@@ -249,7 +274,7 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
         train_expert_dir / "config.toml": TRAIN_EXPERT_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT, model_flag=model_flag, dataset=dataset,
             source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            checkpoint_iters=CHECKPOINT_ITERS, epochs=EPOCHS, lr=lr, wd=wd,
+            checkpoint_iters=CHECKPOINT_ITERS, epochs=EPOCHS_EXPERT, lr=lr, wd=wd,
             milestones=milestones,
         ),
         policy_dir / "config.toml": POLICY_TEMPLATE.format(
@@ -260,8 +285,9 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
             dataset=dataset, model_flag=model_flag, source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL, lr=lr, wd=wd, milestones=milestones,
             cluster_root=CLUSTER_ROOT, cell_tag=cell_tag, cell_dir=policy_dir,
-            lambda_bd=LAMBDA_BD, epsilon=EPSILON, lr_delta=LR_DELTA, lr_policy=LR_POLICY,
-            n_steps=N_STEPS, epochs=EPOCHS, alpha_ckpt=ALPHA_CKPT, num_chckpt=NUM_CHCKPT,
+            lambda_bd=LAMBDA_BD, lambda_delta=LAMBDA_DELTA, epsilon=EPSILON,
+            lr_delta=LR_DELTA, lr_policy=LR_POLICY,
+            n_steps=N_STEPS, epochs=POLICY_EPOCHS, alpha_ckpt=ALPHA_CKPT, num_chckpt=NUM_CHCKPT,
             normalization=NORMALIZATION, diag_every=DIAG_EVERY,
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
@@ -301,6 +327,17 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
     return paths, None
 
 
+def generate_single_cell(dry_run=True):
+    """Exactly one cell (first model/dataset/seed, first target budget), regularization fixed
+    at REGULARIZATION_GRID's defaults -- the minimal preliminary campaign used to sanity check
+    the chain before spending a real sweep's compute."""
+    paths, reason = generate_cell(
+        MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+    )
+    refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
+    return paths, refused
+
+
 def generate_minimal_campaign(dry_run=True):
     """B3: 3 seeds x 3 budgets (as target global budgets, converted to beta_local) x [agg_method
     is logged-only for this module, see AGG_METHODS' comment -- not a distinct axis here]."""
@@ -337,9 +374,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--minimal", action="store_true", help="B3 minimal campaign only")
+    parser.add_argument(
+        "--single-cell", action="store_true",
+        help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
+             "preliminary campaign",
+    )
     args = parser.parse_args()
+    assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
 
-    gen_fn = generate_minimal_campaign if args.minimal else generate_all_configs
+    if args.single_cell:
+        gen_fn = generate_single_cell
+    elif args.minimal:
+        gen_fn = generate_minimal_campaign
+    else:
+        gen_fn = generate_all_configs
     paths, refused = gen_fn(dry_run=args.dry_run)
 
     if args.dry_run:
