@@ -37,11 +37,11 @@ from modules.federated_optimizing_trigger.utils import init_delta
 # axis is shared (num_poisoned/num_honests/budgets/agg_method/epsilon/expert provenance) --
 # see the checkpoint_sampling note below for the one axis that is NOT aligned by default.
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 3
-NUM_HONESTS = 7
-SEEDS = [0, 1, 2]
-BUDGETS = [500, 1500, 3000]
-AGG_METHODS = ["mean", "trmean"]
+NUM_POISONED = 1
+NUM_HONESTS = 0
+SEEDS = [0]
+BUDGETS = [1500]
+AGG_METHODS = ["mean"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
@@ -79,7 +79,7 @@ LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
 MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
 
-CLUSTER_ROOT = Path(os.environ.get("FLIP_CLUSTER_ROOT", str(Path(__file__).resolve().parents[2])))
+CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 
 EXP_BASE = Path("experiments/federated_experiments/threat_model_direct_trigger_joint").resolve()
 

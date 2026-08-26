@@ -978,8 +978,8 @@ def plot_poisoned_examples(
     print(f"Saved comparison figure to {save_path}")
     plt.show()
 
-def plot_optimized_poisoned_examples(model_flag="r32p", dataset_flags=["cifar"], aggregator_flags=["mean", "median", "trmean", "multikrum", "krum"], save_path="./plots/comparison_trigger_{}_{}.png", seed=4):
-    
+def plot_optimized_poisoned_examples(model_flag="r32p", dataset_flags=["cifar"], aggregator_flags=["mean"], save_path="./plots/comparison_trigger_{}_{}.png", seed=4):
+    #, "median", "trmean", "multikrum", "krum"
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -994,8 +994,8 @@ def plot_optimized_poisoned_examples(model_flag="r32p", dataset_flags=["cifar"],
 
     source_label = 9
     target_label = 4
-    NUM_POISONED = 3
-    NUM_CLEAN = 7
+    NUM_POISONED = 1
+    NUM_CLEAN = 0
 
     delta_path = "./optimized_trigger/fed_opt_trig_stripe_{}_{}_{}_{}vs{}.pt"
 
@@ -1033,6 +1033,9 @@ def plot_optimized_poisoned_examples(model_flag="r32p", dataset_flags=["cifar"],
                 NUM_POISONED,
                 NUM_CLEAN
             )
+            #delta_path_ = "experiments/federated_experiments/threat_model_direct_trigger/r32p/cifar/1vs0/mean/seed0/gen_labels_trigger/trigger/opt_trig_direct_stripe_r32p_cifar_1vs0.pt"
+            
+            delta_path_ = "experiments/federated_experiments/threat_model_direct_trigger_joint/r32p/cifar/1vs0/mean/seed0/gen_labels_trigger_joint/trigger/opt_trig_direct_joint_stripe_r32p_cifar_1vs0.pt"
 
             poisoner = pick_poisoner(
                 "optimized",
@@ -1059,4 +1062,4 @@ def plot_optimized_poisoned_examples(model_flag="r32p", dataset_flags=["cifar"],
 
 if __name__ == "__main__":
     plot_poisoned_examples()
-    plot_optimized_poisoned_examples()
+    #plot_optimized_poisoned_examples()

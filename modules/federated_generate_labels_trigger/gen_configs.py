@@ -24,11 +24,11 @@ import toml
 # Sweep axes -- edit these for a real campaign. Defaults match the grid agreed
 # for this threat-model family (docs/policy_module_audit_report.md, Bloc B).
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 3
-NUM_HONESTS = 7
-SEEDS = [0, 1, 2]
-BUDGETS = [500, 1500, 3000]
-AGG_METHODS = ["mean", "trmean"]
+NUM_POISONED = 1
+NUM_HONESTS = 0
+SEEDS = [0]
+BUDGETS = [1500]
+AGG_METHODS = ["mean"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
@@ -54,7 +54,7 @@ MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
 # your own cluster mount, or set FLIP_CLUSTER_ROOT. Kept as ONE constant (unlike
 # modules/base_utils/gen_configs.py, which repeats the literal path per template) so a
 # campaign can be retargeted in one place.
-CLUSTER_ROOT = Path(os.environ.get("FLIP_CLUSTER_ROOT", str(Path(__file__).resolve().parents[2])))
+CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 
 EXP_BASE = Path("experiments/federated_experiments/threat_model_direct_trigger").resolve()
 

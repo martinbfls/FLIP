@@ -31,13 +31,13 @@ import toml
 # Sweep axes -- edit these for a real campaign. num_poisoned/num_honests, agg_method*, dataset,
 # model, checkpoint provenance ("1xs") kept ALIGNED with the other two generators.
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 3
-NUM_HONESTS = 7
-SEEDS = [0, 1, 2]
+NUM_POISONED = 1
+NUM_HONESTS = 0
+SEEDS = [0]
 # Target GLOBAL flip budgets, aligned with the other two generators' BUDGETS -- converted to
 # this module's own LOCAL beta below (beta_local = (budget/n_train) / gamma).
-BUDGETS_TARGET = [500, 1500, 3000]
-AGG_METHODS = ["mean", "trmean"]  # logged only -- (P^mean) has no agg_method of its own (mean
+BUDGETS_TARGET = [1500]
+AGG_METHODS = ["mean"]  # logged only -- (P^mean) has no agg_method of its own (mean
                                    # aggregation is the (P^mean) formulation itself); kept as an
                                    # axis purely so directory names/campaign size line up 1:1
                                    # with the other two modules for comparison.
@@ -65,7 +65,7 @@ LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
 MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
 
-CLUSTER_ROOT = Path(os.environ.get("FLIP_CLUSTER_ROOT", str(Path(__file__).resolve().parents[2])))
+CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 
 EXP_BASE = Path("experiments/federated_experiments/threat_model_expert_policy").resolve()
 
