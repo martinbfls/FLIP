@@ -173,7 +173,7 @@ scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 output_dir = "{cluster_root}/out/checkpoints/{model_flag}_policy_{cell_tag}/0/"
 output_dir_trigger = "{cell_dir}/trigger"
 output_dir_policy = "{cell_dir}/policy"
-device = "cpu"
+device = "cuda"
 lambda_bd = {lambda_bd}
 lambda_penalty = 0.0
 lambda_delta = {lambda_delta}
