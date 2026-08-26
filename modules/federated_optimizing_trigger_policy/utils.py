@@ -5,6 +5,11 @@ See that module's header docstring for the full chain position and scope convent
 here is the theory's LOCAL corruption rate, `beta_theory/gamma`, not the global `beta` of
 def:budget). `init_policy` creates the raw parameter u; `project_policy_budget` (with its
 `_project_nonneg_capped_sum` helper) is the exact Euclidean projection onto U_loc (eq:Uloc).
+
+Diagnostics instrumenting WHERE the co-descended (delta, u) attack fails (optimization of u,
+geometric feasibility of v(delta), discretization loss, analytic/actual gradient mismatch,
+delta-gradient balance) live in the sibling `diagnostics.py` module -- see its docstring for how
+to read the resulting metrics together.
 """
 import numpy as np
 import torch

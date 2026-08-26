@@ -12,6 +12,15 @@ under `rem:solver`'s solver (b) (simultaneous descent on delta and u, not solver
 inner QP + Danskin step -- see `optimize_trigger_policy_step`'s docstring for why, and the
 `B2_qp` diagnostic that quantifies the gap to solver (a)).
 
+Diagnostics: this module can optionally emit a diagnostics.jsonl (one JSON record per
+diagnostic event, `diag_path`/`diag_*` config options below) instrumenting WHERE the attack is
+failing -- optimization of u vs. the QP optimum, geometric feasibility of v(delta) under
+G_obj@U_loc, the loss from discretizing u into integer flip counts, analytic-vs-actual gradient
+mismatch, and delta's own gradient balance between B2 and lambda_bd*L_bd. See
+`diagnostics.py`'s module docstring for the full field list and how to read them together, and
+this module's `run()` docstring for the individual `diag_*` options. All default to `diag_path
+= null` (no file written) -- disabled diagnostics change nothing about the run.
+
 Scope conventions adopted throughout this module (see docs/policy_module_audit_report.md
 Section 2.2 for the full derivation):
   - `beta` (the module's own parameter) is the theory's LOCAL corruption rate -- the fraction
@@ -73,6 +82,7 @@ from modules.federated_optimizing_trigger.run_module import build_loader
 from modules.federated_optimizing_trigger_policy.utils import (
     init_policy, project_policy_budget, project_gradient_descent_local,
 )
+from modules.federated_optimizing_trigger_policy import diagnostics as diag
 from modules.train_expert.utils import checkpoint_callback
 import torch
 from torch.utils.data import ConcatDataset, Subset
@@ -112,6 +122,17 @@ def _compute_step_policy(
     checkpoint_backward,
     lambda_bd,
     run_diag,
+    diag_qp_iters=50,
+    diag_qp_convergence=False,
+    diag_qp_check_iters=(50, 200, 1000),
+    diag_policy_nnz_threshold=1e-8,
+    diag_policy_topk=10,
+    diag_policy_full_vector=False,
+    diag_discretization=True,
+    diag_gradient_balance=True,
+    diag_actual_gradient_run=False,
+    n_train=None,
+    class_counts=None,
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
 
@@ -199,6 +220,13 @@ def _compute_step_policy(
     B2_rho_sum, B2_v_sum, B2_qp_sum = None, None, None
     B2_qp_relaxed_sum, pg_iters_sum, pg_obj_decrement_sum = None, None, None
     n_valid = 0
+
+    # Diagnostic G (gradient balance) accumulators -- only populated on run_diag batches.
+    grad_B2_norm_sum, grad_BD_norm_sum, grad_balance_n = None, None, 0
+    # Context stashed at the FIRST sampled checkpoint only, for the representative-checkpoint
+    # diagnostics (A/B/C/D below) -- diag_record stays a single-checkpoint snapshot rather than
+    # an average over sampled_k, so it is directly attributable to one (checkpoint, batch).
+    diag_ctx = None
 
     for k in sampled_k:
         M = expert_models[k].to(device).eval()
@@ -337,7 +365,7 @@ def _compute_step_policy(
             den_qp = den_rho if normalization == "rho" else den_v
 
             w_pg, pg_iters_k, pg_obj_decrement_k = project_gradient_descent_local(
-                Q_obj, c_np, u.detach(), beta, pairs_k, pi,
+                Q_obj, c_np, u.detach(), beta, pairs_k, pi, n_iters=diag_qp_iters,
             )
             w_pg = w_pg.to(device=v.device, dtype=v.dtype)
             sq_err_pg = ((G_obj @ w_pg - v.detach()) ** 2).sum()
@@ -349,6 +377,31 @@ def _compute_step_policy(
             w_star = w_star.to(device=v.device, dtype=v.dtype)
             sq_err_qp = ((G_obj @ w_star - v.detach()) ** 2).sum()
             B2_qp_relaxed_k = (sq_err_qp / den_qp).detach()
+
+        # Diagnostic G (Section 8): grad_delta B2_k and grad_delta (lambda_bd*L_bd_k),
+        # measured SEPARATELY via non-accumulating, graph-preserving `torch.autograd.grad`
+        # calls -- BEFORE the real `step_loss.backward()` below, which is the (only) call
+        # allowed to touch delta.grad and, under checkpoint_backward, frees the graph.
+        if run_diag and diag_gradient_balance and has_poison:
+            g_B2_norm, g_BD_norm = diag.gradient_balance(B2_k, L_bd_k, lambda_bd, delta)
+            if g_B2_norm is not None:
+                grad_B2_norm_sum = g_B2_norm if grad_B2_norm_sum is None else grad_B2_norm_sum + g_B2_norm
+                grad_BD_norm_sum = g_BD_norm if grad_BD_norm_sum is None else grad_BD_norm_sum + g_BD_norm
+                grad_balance_n += 1
+
+        # Stash the FIRST sampled checkpoint's diagnostic-relevant tensors for the
+        # representative-checkpoint diagnostics (A/B/C/D) computed once after this loop --
+        # captured BEFORE checkpoint_backward's in-place `.detach()` below.
+        if run_diag and diag_ctx is None:
+            diag_ctx = {
+                "k": k, "model": M, "v": v.detach(), "G_obj": G_obj, "Q_obj": Q_obj,
+                "pairs_k": pairs_k, "rho_k": rho_k,
+                "den": float(den_rho if normalization == "rho" else den_v),
+                "Gu_current": Gu.detach(), "B2_current": B2_k.detach().item(),
+                "w_pg": w_pg.detach() if run_diag else None,
+                "B2_qp": B2_qp_k.item() if B2_qp_k is not None else None,
+                "c_np": c_np if run_diag else None,
+            }
 
         if checkpoint_backward:
             step_loss = (B2_k + lambda_bd * L_bd_k) / n_exp
@@ -390,13 +443,148 @@ def _compute_step_policy(
         (pg_obj_decrement_sum / n_valid) if pg_obj_decrement_sum is not None else None
     )
 
+    grad_delta_B2_norm = grad_B2_norm_sum / grad_balance_n if grad_balance_n else None
+    grad_delta_BD_norm = grad_BD_norm_sum / grad_balance_n if grad_balance_n else None
+    grad_delta_ratio = (
+        grad_delta_B2_norm / max(grad_delta_BD_norm, 1e-8)
+        if grad_delta_B2_norm is not None else None
+    )
+
+    # Representative-checkpoint diagnostics (A/B/C/D) -- a single-checkpoint snapshot (the
+    # first entry of sampled_k, stashed as diag_ctx above), NOT averaged over sampled_k like
+    # B2/B2_qp above: these diagnostics are meant to be read alongside a specific checkpoint,
+    # not blurred across several. None of this touches B2/B2_qp/u/delta themselves.
+    diag_record = None
+    if run_diag and diag_ctx is not None:
+        diag_record = _build_diag_record(
+            diag_ctx, u, beta, gamma, n_train, class_counts, pi, loss_fn, class_samples_raw,
+            dataset_flag, model_flag, diag_qp_convergence, diag_qp_check_iters,
+            diag_policy_nnz_threshold, diag_policy_topk, diag_policy_full_vector,
+            diag_discretization, diag_actual_gradient_run,
+        )
+
     return {
         "B2": B2, "L_bd": L_bd, "lambda_effective": lambda_effective,
         "lambda_effective_ratio": lambda_effective_ratio,
         "B2_rho": B2_rho, "B2_v": B2_v, "B2_qp": B2_qp,
         "B2_qp_relaxed": B2_qp_relaxed, "pg_iters": pg_iters,
         "pg_obj_decrement": pg_obj_decrement,
+        "grad_delta_B2_norm": grad_delta_B2_norm, "grad_delta_BD_norm": grad_delta_BD_norm,
+        "grad_delta_ratio": grad_delta_ratio,
+        "diag_record": diag_record, "diag_checkpoint": diag_ctx["k"] if diag_ctx else None,
     }
+
+
+def _build_diag_record(
+    diag_ctx, u, beta, gamma, n_train, class_counts, pi, loss_fn, class_samples_raw,
+    dataset_flag, model_flag, diag_qp_convergence, diag_qp_check_iters,
+    diag_policy_nnz_threshold, diag_policy_topk, diag_policy_full_vector,
+    diag_discretization, diag_actual_gradient_run,
+):
+    '''
+    Assembles one diagnostics.jsonl record's worth of Diagnostic A/B/C/D/F metrics for a single
+    representative checkpoint (diag_ctx, stashed by `_compute_step_policy` at the first sampled
+    checkpoint of the batch). See diagnostics.py's module docstring for how to read the
+    resulting fields together. Pure w.r.t. u/delta -- everything here reads existing tensors or
+    solves an independent reference problem (QP, discretization, an actual gradient), never
+    feeds back into the optimizer.
+    '''
+    v = diag_ctx["v"]
+    G_obj = diag_ctx["G_obj"]
+    rho_k = diag_ctx["rho_k"]
+    den = diag_ctx["den"]
+    pairs_k = diag_ctx["pairs_k"]
+    w_pg = diag_ctx["w_pg"]
+
+    record = {
+        "B2_current_continuous": diag_ctx["B2_current"],
+        "B2_qp_continuous": diag_ctx["B2_qp"],
+    }
+    if diag_ctx["B2_qp"] is not None:
+        gap_abs, gap_rel = diag.qp_gap(diag_ctx["B2_current"], diag_ctx["B2_qp"])
+        record["qp_gap_absolute"] = gap_abs
+        record["qp_gap_relative"] = gap_rel
+
+    u_np = diag.as_numpy(u)
+    record.update({f"current_{k}": v_ for k, v_ in diag.policy_stats(
+        u_np, pairs_k, beta, diag_policy_nnz_threshold, diag_policy_topk,
+    ).items()})
+    if diag_policy_full_vector:
+        record["current_u_full"] = u_np.tolist()
+
+    # Diagnostic B: geometric feasibility of v(delta) under G_obj @ U_loc, for both the
+    # co-descended u and (if available) the QP reference w_pg.
+    record.update(diag.geometric_feasibility(diag_ctx["Gu_current"], v, rho_k, "current"))
+    record["v_norm"] = v.detach().norm().item()
+
+    if w_pg is not None:
+        Gu_qp = (G_obj @ w_pg).detach()
+        record.update(diag.geometric_feasibility(Gu_qp, v, rho_k, "qp"))
+        record.update({f"qp_{k}": v_ for k, v_ in diag.policy_stats(
+            w_pg, pairs_k, beta, diag_policy_nnz_threshold, diag_policy_topk,
+        ).items()})
+        if diag_policy_full_vector:
+            record["qp_u_full"] = diag.as_numpy(w_pg).tolist()
+
+    # Diagnostic C: discretization gap, for both the continuous current policy and the QP
+    # reference, materialized via the EXACT federated_policy_to_flips counting rule.
+    if diag_discretization and n_train is not None and class_counts is not None:
+        u_discrete, n_realized_current = diag.discretize_policy(
+            u_np, pairs_k, gamma, n_train, class_counts,
+        )
+        B2_current_discrete, Gu_current_discrete = diag.b2_value(G_obj, u_discrete, v, den)
+        record["B2_current_discrete"] = B2_current_discrete
+        gap_abs, gap_rel = diag.discretization_gap(diag_ctx["B2_current"], B2_current_discrete)
+        record["discretization_gap_current_absolute"] = gap_abs
+        record["discretization_gap_current_relative"] = gap_rel
+        record["current_u_minus_u_discrete_l1"] = float(np.abs(u_np - u_discrete).sum())
+        record["current_u_minus_u_discrete_l2"] = float(np.linalg.norm(u_np - u_discrete))
+
+        if w_pg is not None and diag_ctx["B2_qp"] is not None:
+            u_qp_discrete, n_realized_qp = diag.discretize_policy(
+                w_pg, pairs_k, gamma, n_train, class_counts,
+            )
+            B2_qp_discrete, _ = diag.b2_value(G_obj, u_qp_discrete, v, den)
+            record["B2_qp_discrete"] = B2_qp_discrete
+            gap_abs, gap_rel = diag.discretization_gap(diag_ctx["B2_qp"], B2_qp_discrete)
+            record["discretization_gap_qp_absolute"] = gap_abs
+            record["discretization_gap_qp_relative"] = gap_rel
+            record["qp_u_minus_u_discrete_l1"] = float(np.abs(w_pg.detach().cpu().numpy() - u_qp_discrete).sum())
+            record["qp_u_minus_u_discrete_l2"] = float(
+                np.linalg.norm(w_pg.detach().cpu().numpy() - u_qp_discrete)
+            )
+
+    # Diagnostic A.2.1: solver-convergence sweep -- only when explicitly enabled (expensive at
+    # the largest check_iters value), only on this already-diagnostic batch.
+    if diag_qp_convergence and diag_ctx["c_np"] is not None:
+        sweep = diag.qp_convergence_sweep(
+            diag_ctx["Q_obj"], diag_ctx["c_np"], u.detach(), beta, pairs_k, pi,
+            diag_qp_check_iters,
+        )
+        b2_by_iters = {}
+        for n_iters, w in sweep.items():
+            b2_val, _ = diag.b2_value(G_obj, w, v, den)
+            b2_by_iters[n_iters] = b2_val
+            record[f"B2_qp_{n_iters}"] = b2_val
+        largest = max(b2_by_iters)
+        for n_iters, b2_val in b2_by_iters.items():
+            if n_iters == largest:
+                continue
+            record[f"B2_qp_{n_iters}_vs_{largest}_relative_diff"] = (
+                (b2_val - b2_by_iters[largest]) / max(abs(b2_by_iters[largest]), 1e-8)
+            )
+
+    # Diagnostic D: actual vs. predicted gradient shift -- expensive (materializes flips and
+    # runs real forward/backward passes), only when explicitly requested for this batch.
+    if diag_actual_gradient_run and w_pg is not None:
+        actual_shift = diag.compute_actual_gradient_shift(
+            diag_ctx["model"], loss_fn, class_samples_raw, pairs_k, pi, gamma, w_pg,
+            dataset_flag, model_flag,
+        )
+        predicted_shift = (G_obj @ w_pg).detach()
+        record.update(diag.actual_vs_predicted(actual_shift, predicted_shift))
+
+    return record
 
 
 def optimize_trigger_policy_step(
@@ -435,6 +623,20 @@ def optimize_trigger_policy_step(
     checkpoint_backward=True,
     normalization="rho",
     diag_every=50,
+    outer_step=0,
+    diagnostics_writer=None,
+    n_train=None,
+    class_counts=None,
+    diag_qp_iters=50,
+    diag_qp_convergence=False,
+    diag_qp_check_iters=(50, 200, 1000),
+    diag_policy_nnz_threshold=1e-8,
+    diag_policy_topk=10,
+    diag_policy_full_vector=False,
+    diag_discretization=True,
+    diag_gradient_balance=True,
+    diag_actual_gradient=False,
+    diag_actual_gradient_every=0,
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -494,6 +696,8 @@ def optimize_trigger_policy_step(
         "B2_qp_relaxed": [], "pg_iters": [], "pg_obj_decrement": [],
     }
 
+    diag_event_counter = 0
+
     for batch_idx, batch in enumerate(pbar):
         optimizer_delta.zero_grad()
         optimizer_policy.zero_grad()
@@ -503,13 +707,40 @@ def optimize_trigger_policy_step(
         )
 
         run_diag = (batch_idx % diag_every == 0)
+        diag_actual_gradient_run = False
+        if run_diag:
+            diag_actual_gradient_run = diag_actual_gradient and (
+                diag_actual_gradient_every <= 0
+                or diag_event_counter % diag_actual_gradient_every == 0
+            )
+            diag_event_counter += 1
+
         result = _compute_step_policy(
             batch, expert_models, sampled_k, source_label, target_label, loss_fn, delta, u,
             device, dataset_flag, model_flag, lambda_poison, n_classes,
             flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global, pairs,
             normalization, checkpoint_backward, lambda_bd, run_diag,
+            diag_qp_iters=diag_qp_iters, diag_qp_convergence=diag_qp_convergence,
+            diag_qp_check_iters=diag_qp_check_iters,
+            diag_policy_nnz_threshold=diag_policy_nnz_threshold,
+            diag_policy_topk=diag_policy_topk,
+            diag_policy_full_vector=diag_policy_full_vector,
+            diag_discretization=diag_discretization,
+            diag_gradient_balance=diag_gradient_balance,
+            diag_actual_gradient_run=diag_actual_gradient_run,
+            n_train=n_train, class_counts=class_counts,
         )
         B2, L_bd = result["B2"], result["L_bd"]
+
+        if run_diag and diagnostics_writer is not None and result["diag_record"] is not None:
+            diagnostics_writer.write({
+                "outer_step": outer_step, "batch_idx": batch_idx,
+                "checkpoint": result["diag_checkpoint"],
+                **result["diag_record"],
+                "grad_delta_B2_norm": result["grad_delta_B2_norm"],
+                "grad_delta_BD_norm": result["grad_delta_BD_norm"],
+                "grad_delta_ratio": result["grad_delta_ratio"],
+            })
 
         L_pen = trigger_penalty_hinge(delta, mu, mu_source, kappa)
         L_tv = tv_loss(delta)
@@ -643,6 +874,17 @@ def optimize_trigger_policy(
     normalization="rho",
     diag_every=50,
     expert_budget=None,
+    diag_path=None,
+    diag_qp_iters=50,
+    diag_qp_convergence=False,
+    diag_qp_check_iters=(50, 200, 1000),
+    diag_policy_nnz_threshold=1e-8,
+    diag_policy_topk=10,
+    diag_policy_full_vector=False,
+    diag_discretization=True,
+    diag_gradient_balance=True,
+    diag_actual_gradient=False,
+    diag_actual_gradient_every=0,
 ):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
@@ -695,6 +937,14 @@ def optimize_trigger_policy(
     # percentage points below lambda_poison for the same nominal budget.
     pi = compute_class_frequencies(dataset_flag, n_classes)
     pi_source = pi[source_label]
+
+    # Diagnostic C (discretization): approximated per-class example counts, used ONLY to
+    # replay federated_policy_to_flips's exact rounding+clipping rule (compute_flip_counts)
+    # without re-scanning the training set's label array a second time -- pi is already an
+    # empirical frequency over that same training set, computed once above. Not necessarily
+    # bit-identical to the real per-class count federated_policy_to_flips sees (see
+    # diagnostics.discretize_policy's docstring).
+    diag_class_counts = {y: int(round(pi[y] * n_train)) for y in pi}
 
     # A1 correction (docs/policy_module_audit_report.md Section 2.6): resolve_beta_and_
     # lambda_poison (shared) resolves lambda_poison="beta" to `beta` itself -- mechanically
@@ -795,6 +1045,7 @@ def optimize_trigger_policy(
     big_ims = needs_big_ims(model_flag)
 
     history = [] if metrics_log_path else None
+    diagnostics_writer = diag.DiagnosticsWriter(diag_path)
 
     for step in range(n_steps):
         print(f"\n=== Trigger+policy optimization step {step + 1}/{n_steps} ===")
@@ -925,6 +1176,20 @@ def optimize_trigger_policy(
             checkpoint_backward=checkpoint_backward,
             normalization=normalization,
             diag_every=diag_every,
+            outer_step=step,
+            diagnostics_writer=diagnostics_writer,
+            n_train=n_train,
+            class_counts=diag_class_counts,
+            diag_qp_iters=diag_qp_iters,
+            diag_qp_convergence=diag_qp_convergence,
+            diag_qp_check_iters=diag_qp_check_iters,
+            diag_policy_nnz_threshold=diag_policy_nnz_threshold,
+            diag_policy_topk=diag_policy_topk,
+            diag_policy_full_vector=diag_policy_full_vector,
+            diag_discretization=diag_discretization,
+            diag_gradient_balance=diag_gradient_balance,
+            diag_actual_gradient=diag_actual_gradient,
+            diag_actual_gradient_every=diag_actual_gradient_every,
         )
 
         del expert_models
@@ -942,6 +1207,8 @@ def optimize_trigger_policy(
         Path(metrics_log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(metrics_log_path, "w") as f:
             json.dump(history, f, indent=2)
+
+    diagnostics_writer.close()
 
     return delta.detach(), u.detach(), pairs, beta, n_train, run_tag
 
@@ -1051,6 +1318,20 @@ def run(experiment_name, module_name, **kwargs):
     diag_every = args.get("diag_every", 50)
     expert_budget = args.get("expert_budget", None)
 
+    diag_path = args.get("diag_path", None)
+    if diag_path is not None:
+        diag_path = slurmify_path(diag_path, slurm_id)
+    diag_qp_iters = args.get("diag_qp_iters", 50)
+    diag_qp_convergence = args.get("diag_qp_convergence", False)
+    diag_qp_check_iters = args.get("diag_qp_check_iters", [50, 200, 1000])
+    diag_policy_nnz_threshold = args.get("diag_policy_nnz_threshold", 1e-8)
+    diag_policy_topk = args.get("diag_policy_topk", 10)
+    diag_policy_full_vector = args.get("diag_policy_full_vector", False)
+    diag_discretization = args.get("diag_discretization", True)
+    diag_gradient_balance = args.get("diag_gradient_balance", True)
+    diag_actual_gradient = args.get("diag_actual_gradient", False)
+    diag_actual_gradient_every = args.get("diag_actual_gradient_every", 0)
+
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
     policy_optim_kwargs = args.get("policy_optim_kwargs", {})
@@ -1129,6 +1410,17 @@ def run(experiment_name, module_name, **kwargs):
         normalization=normalization,
         diag_every=diag_every,
         expert_budget=expert_budget,
+        diag_path=diag_path,
+        diag_qp_iters=diag_qp_iters,
+        diag_qp_convergence=diag_qp_convergence,
+        diag_qp_check_iters=diag_qp_check_iters,
+        diag_policy_nnz_threshold=diag_policy_nnz_threshold,
+        diag_policy_topk=diag_policy_topk,
+        diag_policy_full_vector=diag_policy_full_vector,
+        diag_discretization=diag_discretization,
+        diag_gradient_balance=diag_gradient_balance,
+        diag_actual_gradient=diag_actual_gradient,
+        diag_actual_gradient_every=diag_actual_gradient_every,
     )
 
     print("Optimized trigger and policy obtained.")

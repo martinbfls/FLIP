@@ -86,6 +86,33 @@ POLICY_EPOCHS = 20     # epochs of expert retraining PER outer step -- distinct 
                        # own epochs (unset in TRAIN_USER_TEMPLATE below, so it falls back to
                        # modules/base_utils/util.py's DEFAULT_SGD_EPOCHS=200).
 
+# --------------------------------------------------------------------------- #
+# Diagnostics (modules/federated_optimizing_trigger_policy/diagnostics.py) -- every generated
+# cell writes a diagnostics.jsonl under its own policy dir (diag_path below) with the CHEAP
+# diagnostics on by default (discretization gap, gradient balance -- no extra model forward/
+# backward passes beyond what B2_qp already costs), so a run is diagnosable out of the box per
+# prelim/SPEC.md's "observe before correcting" instruction. diag_actual_gradient (Diagnostic D)
+# is the expensive one (materializes flips + real forward/backward passes against
+# class_samples_raw) and stays OFF by default -- flip DIAG_ACTUAL_GRADIENT to True (and set
+# DIAG_ACTUAL_GRADIENT_EVERY>0 to throttle it) for a targeted diagnosis run once the cheap
+# diagnostics have narrowed down where B2 is failing.
+# --------------------------------------------------------------------------- #
+DIAG_QP_ITERS = 50
+DIAG_QP_CONVERGENCE = False
+DIAG_QP_CHECK_ITERS = [50, 200, 1000]
+DIAG_POLICY_NNZ_THRESHOLD = 1e-8
+DIAG_POLICY_TOPK = 10
+DIAG_POLICY_FULL_VECTOR = False
+DIAG_DISCRETIZATION = True
+DIAG_GRADIENT_BALANCE = True
+DIAG_ACTUAL_GRADIENT = False
+DIAG_ACTUAL_GRADIENT_EVERY = 0
+
+
+def _toml_bool(x):
+    return "true" if x else "false"
+
+
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
 MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
@@ -197,6 +224,21 @@ normalization = "{normalization}"
 diag_every = {diag_every}
 metrics_log_path = "{cell_dir}/metrics.json"
 
+# Diagnostics (see modules/federated_optimizing_trigger_policy/diagnostics.py's module
+# docstring for how to read these together) -- diag_path below means diagnostics.jsonl IS
+# written for this cell; see gen_configs.py's DIAG_* constants to change what gets logged.
+diag_path = "{cell_dir}/diagnostics.jsonl"
+diag_qp_iters = {diag_qp_iters}
+diag_qp_convergence = {diag_qp_convergence}
+diag_qp_check_iters = {diag_qp_check_iters}
+diag_policy_nnz_threshold = {diag_policy_nnz_threshold}
+diag_policy_topk = {diag_policy_topk}
+diag_policy_full_vector = {diag_policy_full_vector}
+diag_discretization = {diag_discretization}
+diag_gradient_balance = {diag_gradient_balance}
+diag_actual_gradient = {diag_actual_gradient}
+diag_actual_gradient_every = {diag_actual_gradient_every}
+
 [federated_optimizing_trigger_policy.expert_config]
 experts = 1
 min = 0
@@ -289,6 +331,15 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
             lr_delta=LR_DELTA, lr_policy=LR_POLICY,
             n_steps=N_STEPS, epochs=POLICY_EPOCHS, alpha_ckpt=ALPHA_CKPT, num_chckpt=NUM_CHCKPT,
             normalization=NORMALIZATION, diag_every=DIAG_EVERY,
+            diag_qp_iters=DIAG_QP_ITERS, diag_qp_convergence=_toml_bool(DIAG_QP_CONVERGENCE),
+            diag_qp_check_iters=DIAG_QP_CHECK_ITERS,
+            diag_policy_nnz_threshold=DIAG_POLICY_NNZ_THRESHOLD,
+            diag_policy_topk=DIAG_POLICY_TOPK,
+            diag_policy_full_vector=_toml_bool(DIAG_POLICY_FULL_VECTOR),
+            diag_discretization=_toml_bool(DIAG_DISCRETIZATION),
+            diag_gradient_balance=_toml_bool(DIAG_GRADIENT_BALANCE),
+            diag_actual_gradient=_toml_bool(DIAG_ACTUAL_GRADIENT),
+            diag_actual_gradient_every=DIAG_ACTUAL_GRADIENT_EVERY,
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
             cell_dir=policy_dir, model_flag=model_flag, dataset=dataset,

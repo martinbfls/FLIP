@@ -1,6 +1,43 @@
 import numpy as np
 
 
+def compute_flip_counts(u, pairs, gamma, n_train, class_counts):
+    '''
+    The rounding + per-source-class sequential-clipping rule that turns continuous LOCAL policy
+    weights into per-pair flip COUNTS, factored out of `materialize_policy_flips` below so that
+    federated_optimizing_trigger_policy's discretization diagnostic (diagnostics.py's
+    `discretize_policy`) can compute exactly the same realized counts without drawing actual
+    example indices -- one convention, not two.
+
+    n_yc = round(u_yc * gamma * n_train) requested for pair (y, c); realized counts for the
+    same source class y are consumed from a single shared cursor in `pairs` order (mirroring
+    `materialize_policy_flips`'s per-class draw-without-replacement pools), clipped once the
+    cursor would exceed class_counts[y].
+
+    Args:
+        u: (P,) array-like of LOCAL policy weights, u_p >= 0.
+        pairs: list of P (y, c) int tuples, same ordering as u.
+        gamma, n_train: as `materialize_policy_flips`.
+        class_counts: dict (or array) y -> number of class-y examples available to draw from.
+
+    Returns:
+        n_realized: (P,) int64 array, the realized (post-clip) flip count for each pair, in
+            `pairs` order.
+    '''
+    cursor = {y: 0 for y, _ in pairs}
+    n_realized = np.zeros(len(pairs), dtype=np.int64)
+    for i, (y, c) in enumerate(pairs):
+        n_yc = int(round(float(u[i]) * gamma * n_train))
+        if n_yc <= 0:
+            continue
+        avail = int(class_counts[y])
+        start = cursor[y]
+        end = min(start + n_yc, avail)
+        n_realized[i] = max(end - start, 0)
+        cursor[y] = end
+    return n_realized
+
+
 def materialize_policy_flips(u, pairs, n_train, labels, n_classes, gamma, seed=0):
     '''
     Theory: rem:units, "Label counts" -- the number of class-y samples relabelled to z across
@@ -48,25 +85,28 @@ def materialize_policy_flips(u, pairs, n_train, labels, n_classes, gamma, seed=0
     idx_by_class = {y: np.where(labels == y)[0].copy() for y in range(n_classes)}
     for y in idx_by_class:
         rng.shuffle(idx_by_class[y])
-    cursor = {y: 0 for y in range(n_classes)}
 
+    class_counts = {y: len(idx_by_class[y]) for y in range(n_classes)}
+    n_realized = compute_flip_counts(u, pairs, gamma, n_train, class_counts)
+
+    cursor = {y: 0 for y in range(n_classes)}
     idx_chunks, target_chunks = [], []
-    for (y, c), u_yc in zip(pairs, u):
-        n_yc = int(round(float(u_yc) * gamma * n_train))
+    for i, (y, c) in enumerate(pairs):
+        n_yc_requested = int(round(float(u[i]) * gamma * n_train))
+        n_yc = int(n_realized[i])
+        if n_yc_requested > 0 and n_yc < n_yc_requested:
+            print(
+                f"[materialize_policy_flips] WARNING: pair (y={y}, c={c}) requested "
+                f"{n_yc_requested} flips but only {n_yc} unused class-{y} examples remain; "
+                "clipping."
+            )
         if n_yc <= 0:
             continue
 
         pool = idx_by_class[y]
         start = cursor[y]
-        end = min(start + n_yc, len(pool))
-        chosen = pool[start:end]
-        if end - start < n_yc:
-            print(
-                f"[materialize_policy_flips] WARNING: pair (y={y}, c={c}) requested "
-                f"{n_yc} flips but only {end - start} unused class-{y} examples remain; "
-                "clipping."
-            )
-        cursor[y] = end
+        chosen = pool[start:start + n_yc]
+        cursor[y] = start + n_yc
 
         idx_chunks.append(chosen)
         target_chunks.append(np.full(len(chosen), c, dtype=np.int64))
