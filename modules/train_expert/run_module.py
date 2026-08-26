@@ -4,6 +4,7 @@ Trains an expert model on a traditionally backdoored dataset.
 
 from pathlib import Path
 import sys
+import time as _time
 
 from modules.train_expert.utils import checkpoint_callback
 from modules.base_utils.datasets import (
@@ -81,6 +82,12 @@ def run(experiment_name, module_name, **kwargs):
         scheduler_kwargs=scheduler_kwargs,
     )
 
+    print(f"[DIAG train_expert] epochs={epochs}", flush=True)
+    print(f"[DIAG train_expert] n_train={len(poison_train)}", flush=True)
+    print(f"[DIAG train_expert] n_test={len(test) if test else None}", flush=True)
+    print(f"[DIAG train_expert] batch_size={batch_size}", flush=True)
+    _t0 = _time.time()
+
     mini_train(
         model=model,
         train_data=poison_train,
@@ -93,6 +100,8 @@ def run(experiment_name, module_name, **kwargs):
             m, o, e, i, ckpt_iters, output_dir
         ),
     )
+
+    print(f"[DIAG train_expert] done in {_time.time()-_t0:.1f}s", flush=True)
 
     # Evaluate
     print("Evaluating...")

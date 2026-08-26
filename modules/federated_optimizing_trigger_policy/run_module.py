@@ -82,6 +82,7 @@ import os
 import json
 import matplotlib.pyplot as plt
 import copy
+import time as _time
 
 WINDOW_SIZE = 50
 
@@ -851,6 +852,14 @@ def optimize_trigger_policy(
             include_clean=False,
         )
 
+        print(
+            f"[DIAG policy] calling mini_train: epochs={epochs_}, "
+            f"n_train={len(poison_train_dataset)}, "
+            f"n_test={len(clean_test_dataset) if clean_test_dataset else None}",
+            flush=True,
+        )
+        _t_expert = _time.time()
+
         mini_train_out = mini_train(
             model=model,
             train_data=poison_train_dataset,
@@ -864,6 +873,8 @@ def optimize_trigger_policy(
             ),
             record=history is not None,
         )
+
+        print(f"[DIAG policy] mini_train done in {_time.time()-_t_expert:.1f}s", flush=True)
         clean_acc, poison_acc = None, None
         if history is not None:
             _, clean_hist, poison_hist = mini_train_out
@@ -991,6 +1002,9 @@ def run(experiment_name, module_name, **kwargs):
     """
     slurm_id = kwargs.get("slurm_id", None)
     args = extract_toml(experiment_name, module_name)
+
+    print(f"[DIAG policy] config epochs={args.get('epochs', 'NOT SET')}", flush=True)
+    print(f"[DIAG policy] config n_steps={args.get('n_steps', 'NOT SET')}", flush=True)
 
     dataset_flag = args["dataset"]
     model_flag = args["model"]
