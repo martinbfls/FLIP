@@ -24,6 +24,7 @@ from the .npz, cross-checked below) through `materialize_policy_flips`'s local-u
 from pathlib import Path
 import sys
 import os
+import json
 
 import numpy as np
 
@@ -133,11 +134,34 @@ def run(experiment_name, module_name, **kwargs):
     idx_flipped = np.unique(idx_flipped)
     idx_clean = np.setdiff1d(np.arange(N), idx_flipped)
 
-    budget = int(len(idx_flipped))
+    # budget_realized: what materialize_policy_flips ACTUALLY produced -- used below for the
+    # saturation check and recorded to disk for traceability, but NOT used for file naming (see
+    # budget_nominal below): naming outputs by the realized count breaks the downstream
+    # federated_train_user config's `budget = 1500` (or whatever was swept), which expects a
+    # fixed filename known ahead of time, independent of how well this particular policy run
+    # converged.
+    budget_realized = int(len(idx_flipped))
+
+    # budget_nominal: the FIXED, config-known budget outputs are named after -- explicit
+    # `budget` in this module's own config if given (so it can be set to match a sibling
+    # federated_select_flips/train_user sweep exactly), else the policy's own theoretical
+    # target round(beta*gamma*n_train) (rem:units' label-count formula, same value
+    # federated_optimizing_trigger_policy's own startup log reports as flip_budget). This is
+    # what keeps the {budget}_indices.npy / {budget}_labels.npy filenames stable across policy
+    # runs of varying convergence, so federated_train_user's config never has to change.
+    budget_nominal = args.get("budget", round(beta * gamma * N))
+
     print(
-        f"Materialized {budget} flips from policy (beta={beta:.6f}, gamma={gamma:.6f}, "
-        f"budget/N={budget / N:.6f})."
+        f"Materialized {budget_realized} flips from policy (beta={beta:.6f}, gamma={gamma:.6f}, "
+        f"budget/N={budget_realized / N:.6f})."
     )
+    if budget_nominal != budget_realized:
+        print(
+            f"[budget] realized={budget_realized} vs nominal={budget_nominal} -- outputs are "
+            f"named after budget_nominal={budget_nominal} (fixed, config-known) so the "
+            "downstream train_user config's `budget` does not need to change; the realized "
+            f"count is saved to {budget_nominal}_flip_report.json for traceability."
+        )
 
     # Budget-saturation check: an optimized policy is expected to (nearly) saturate its own
     # local budget (sum(u) == beta -- `project_policy_budget`'s projection pushes toward this
@@ -166,18 +190,33 @@ def run(experiment_name, module_name, **kwargs):
         msg = (
             f"||u||_1={u_l1:.6f} < budget_saturation_tol({budget_saturation_tol}) * "
             f"beta({beta:.6f}) -- the policy has not saturated its local budget (materialized "
-            f"{budget} flips, beta={beta:.6f}, gamma={gamma:.6f}). Likely under-convergence "
-            "(too few n_steps) rather than a scaling bug -- check beta_used in the optimizer's "
-            "metrics_log_path. Set strict_budget_check=true in the config to turn this into a "
-            "hard failure once a sufficient n_steps has been found."
+            f"{budget_realized} flips vs budget_nominal={budget_nominal}, beta={beta:.6f}, "
+            f"gamma={gamma:.6f}). Likely under-convergence (too few n_steps) rather than a "
+            "scaling bug -- check beta_used in the optimizer's metrics_log_path. Set "
+            "strict_budget_check=true in the config to turn this into a hard failure once a "
+            "sufficient n_steps has been found."
         )
         if strict_budget_check:
             raise AssertionError(msg)
         print(f"WARNING: {msg}")
 
     np.save(output_dir / "true.npy", true)
-    np.save(output_dir / f"{budget}_idx_flipped.npy", idx_flipped)
-    np.save(output_dir / f"{budget}_idx_clean.npy", idx_clean)
+    np.save(output_dir / f"{budget_nominal}_idx_flipped.npy", idx_flipped)
+    np.save(output_dir / f"{budget_nominal}_idx_clean.npy", idx_clean)
+
+    # Traceability: the realized flip count (and how it was obtained) is saved alongside the
+    # budget_nominal-named artifacts above, so a downstream reader can tell -- without having to
+    # go back to the policy's metrics_log_path -- whether budget_nominal was actually reached.
+    with open(output_dir / f"{budget_nominal}_flip_report.json", "w") as f:
+        json.dump({
+            "budget_nominal": budget_nominal,
+            "budget_realized": budget_realized,
+            "beta": beta,
+            "gamma": gamma,
+            "u_l1": u_l1,
+            "n_train": N,
+            "policy_path": str(policy_path),
+        }, f, indent=2)
 
     print("Partitioning across workers...")
     worker_indices, worker_labels = partition_across_workers(
@@ -186,10 +225,13 @@ def run(experiment_name, module_name, **kwargs):
 
     for w in range(num_honests + num_poisoned):
         os.makedirs(output_dir / f"worker{w}", exist_ok=True)
-        np.save(output_dir / f"worker{w}/{budget}_labels.npy", worker_labels[w])
-        np.save(output_dir / f"worker{w}/{budget}_indices.npy", worker_indices[w])
+        np.save(output_dir / f"worker{w}/{budget_nominal}_labels.npy", worker_labels[w])
+        np.save(output_dir / f"worker{w}/{budget_nominal}_indices.npy", worker_indices[w])
 
-    print(f"Saved materialized flips to {output_dir} (budget={budget}).")
+    print(
+        f"Saved materialized flips to {output_dir} (budget_nominal={budget_nominal}, "
+        f"budget_realized={budget_realized})."
+    )
 
 
 if __name__ == "__main__":
