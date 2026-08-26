@@ -6,8 +6,10 @@ from functools import partial
 from torch import optim
 from torch.utils.data import DataLoader, Dataset
 from typing import Iterable, Union
-from modules.base_utils.model.model import SequentialImageNetwork,\
-                                   SequentialImageNetworkMod
+from modules.base_utils.model.model import (
+    SequentialImageNetwork,
+    SequentialImageNetworkMod,
+)
 import torch.backends.cudnn as cudnn
 import toml
 from collections import OrderedDict
@@ -24,29 +26,19 @@ default_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 DEFAULT_SGD_BATCH_SIZE = 256
 DEFAULT_SGD_EPOCHS = 200
 DEFAULT_SGD_KWARGS = {
-    'lr': 0.01,
-    'momentum': 0.9,
-    'nesterov': True,
-    'weight_decay': 2e-4
+    "lr": 0.01,
+    "momentum": 0.9,
+    "nesterov": True,
+    "weight_decay": 2e-4,
 }
-DEFAULT_SGD_SCHED_KWARGS = {
-    'milestones': [75, 125],
-    'gamma': 0.1
-}
+DEFAULT_SGD_SCHED_KWARGS = {"milestones": [75, 125], "gamma": 0.1}
 
 DEFAULT_ADAM_BATCH_SIZE = 256
 DEFAULT_ADAM_EPOCHS = 200
-DEFAULT_ADAM_KWARGS = {
-    'lr': 0.001,
-    'betas': (0.9, 0.999),
-    'weight_decay': 1e-4
-}
-DEFAULT_ADAM_SCHED_KWARGS = {
-    'milestones': [125],
-    'gamma': 0.1
-}
+DEFAULT_ADAM_KWARGS = {"lr": 0.001, "betas": (0.9, 0.999), "weight_decay": 1e-4}
+DEFAULT_ADAM_SCHED_KWARGS = {"milestones": [125], "gamma": 0.1}
 
-BIG_IMS_MODELS = ['convnext-tiny', 'vgg', 'vgg-pretrain', 'vit-pretrain']
+BIG_IMS_MODELS = ["convnext-tiny", "vgg", "vgg-pretrain", "vit-pretrain"]
 
 
 def generate_full_path(path):
@@ -60,7 +52,7 @@ def slurmify_path(path, slurm_id):
 
 
 def extract_toml(experiment_name, module_name=None):
-    relative_path = "experiments/" + experiment_name + "/config.toml"
+    relative_path = experiment_name + "/config.toml"  # "experiments/" +
     full_path = generate_full_path(relative_path)
     assert os.path.exists(full_path)
 
@@ -68,7 +60,7 @@ def extract_toml(experiment_name, module_name=None):
     if module_name is not None:
         return exp_toml[module_name]
     return exp_toml
- 
+
 
 def load_model(model_flag, num_classes=10):
     # if num_classes != 10 and model_flag not in ['r32p', 'r18', 'r18-tin']:
@@ -79,64 +71,65 @@ def load_model(model_flag, num_classes=10):
 
         return SequentialImageNetworkMod(resnet.resnet32(num_classes)).cuda()
     elif model_flag == "r18":
-        from pytorch_cifar.models import ResNet, BasicBlock        
-        return SequentialImageNetwork(ResNet(BasicBlock,
-                                             [2, 2, 2, 2],
-                                             num_classes)).cuda()
+        from pytorch_cifar.models import ResNet, BasicBlock
+
+        return SequentialImageNetwork(
+            ResNet(BasicBlock, [2, 2, 2, 2], num_classes)
+        ).cuda()
     elif model_flag == "r18-tin":
         from pytorch_cifar.models import ResNet, BasicBlock
 
-        model = SequentialImageNetwork(ResNet(BasicBlock,
-                                             [2, 2, 2, 2],
-                                             num_classes))
+        model = SequentialImageNetwork(ResNet(BasicBlock, [2, 2, 2, 2], num_classes))
         model[13] = torch.nn.Linear(2048, 200)
 
         return model.cuda()
     elif model_flag == "vgg":
         from torchvision.models import vgg19_bn
-        
+
         return vgg19_bn(num_classes=num_classes).cuda()
     elif model_flag == "vgg-pretrain":
         from torchvision.models import vgg19_bn, VGG19_BN_Weights
+
         model = vgg19_bn(weights=VGG19_BN_Weights.DEFAULT)
         model.classifier[6] = torch.nn.Linear(4096, num_classes)
         for name, param in model.named_parameters():
-            if 'classifier' not in name:
-                param.requires_grad=False
+            if "classifier" not in name:
+                param.requires_grad = False
 
         return model.cuda()
     elif model_flag == "vit-pretrain":
         from torchvision.models import vit_b_16, ViT_B_16_Weights
+
         model = vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
         model.heads.head = torch.nn.Linear(768, num_classes)
         for name, param in model.named_parameters():
-            if 'head' not in name:
-                param.requires_grad=False
+            if "head" not in name:
+                param.requires_grad = False
         return model.cuda()
-    
+
     elif model_flag == "convnext_tiny":
         from torchvision.models import convnext_tiny
 
-        model = convnext_tiny(weights='IMAGENET1K_V1')
-        model.classifier[2] = torch.nn.Linear(model.classifier[2].in_features, num_classes)
+        model = convnext_tiny(weights="IMAGENET1K_V1")
+        model.classifier[2] = torch.nn.Linear(
+            model.classifier[2].in_features, num_classes
+        )
 
         return model.cuda()
-    
+
     elif model_flag == "convnext_micro":
         from modules.base_utils.model.convnext_micro import ConvNeXtMicro
 
         model = ConvNeXtMicro(num_classes=num_classes)
 
         return model.cuda()
-    
+
     else:
         raise NotImplementedError
 
 
 def make_pbar(*args, **kwargs):
-    pbar_constructor = (
-        partial(tqdm.tqdm, dynamic_ncols=True)
-    )
+    pbar_constructor = partial(tqdm.tqdm, dynamic_ncols=True)
     return pbar_constructor(*args, **kwargs)
 
 
@@ -157,8 +150,7 @@ def either_dataloader_dataset_to_both(
         dl_kwargs = {}
 
         if eval:
-            dl_kwargs.update(dict(batch_size=256, shuffle=False,
-                                  drop_last=False))
+            dl_kwargs.update(dict(batch_size=256, shuffle=False, drop_last=False))
         else:
             dl_kwargs.update(dict(batch_size=128, shuffle=True))
 
@@ -214,20 +206,21 @@ def mini_train(
     *,
     model: torch.nn.Module,
     train_data: Union[DataLoader, Dataset],
-    test_data: Union[Union[DataLoader, Dataset],
-                     Iterable[Union[DataLoader, Dataset]]] = None,
+    test_data: Union[
+        Union[DataLoader, Dataset], Iterable[Union[DataLoader, Dataset]]
+    ] = None,
     batch_size=32,
     opt: optim.Optimizer,
     scheduler,
     epochs: int,
     shuffle=True,
     callback=None,
-    record=False
+    record=False,
 ):
     device = get_module_device(model)
-    dataloader, _ = either_dataloader_dataset_to_both(train_data,
-                                                      batch_size=batch_size,
-                                                      shuffle=shuffle)
+    dataloader, _ = either_dataloader_dataset_to_both(
+        train_data, batch_size=batch_size, shuffle=shuffle
+    )
     n = len(dataloader.dataset)
     total_examples = epochs * n
 
@@ -289,8 +282,9 @@ def mini_train_multi(
     *,
     model: torch.nn.Module,
     train_datasets: Iterable[Union[DataLoader, Dataset]],
-    test_data: Union[Union[DataLoader, Dataset],
-                     Iterable[Union[DataLoader, Dataset]]] = None,
+    test_data: Union[
+        Union[DataLoader, Dataset], Iterable[Union[DataLoader, Dataset]]
+    ] = None,
     batch_size=32,
     opt: optim.Optimizer,
     scheduler,
@@ -299,15 +293,13 @@ def mini_train_multi(
     callback=None,
     record=False,
     agg_method="mean",
-    f=1
+    f=1,
 ):
     device = get_module_device(model)
 
     dataloaders = [
         either_dataloader_dataset_to_both(
-            train_data,
-            batch_size=batch_size,
-            shuffle=shuffle
+            train_data, batch_size=batch_size, shuffle=shuffle
         )[0]
         for train_data in train_datasets
     ]
@@ -328,15 +320,13 @@ def mini_train_multi(
             train_epoch_correct = 0
 
             for batches in zip(*dataloaders):
-                grad_buffer = [
-                    [] for _ in model.parameters()
-                ]
+                grad_buffer = [[] for _ in model.parameters()]
 
                 batch_loss = 0.0
                 batch_correct = 0
                 batch_samples = 0
 
-                for (x, y) in batches:
+                for x, y in batches:
                     x, y = x.to(device), y.to(device)
                     batch_samples += len(x)
 
@@ -349,9 +339,7 @@ def mini_train_multi(
 
                     for i, p in enumerate(model.parameters()):
                         if p.grad is not None:
-                            grad_buffer[i].append(
-                                p.grad.detach().clone()
-                            )
+                            grad_buffer[i].append(p.grad.detach().clone())
 
                     batch_loss += loss.item() * len(x)
                     batch_correct += correct.item()
@@ -372,7 +360,7 @@ def mini_train_multi(
                     elif agg_method == "multikrum":
                         g = aggr_multikrum(grads, f=f)
                     elif agg_method == "softmultikrum":
-                        g = aggr_soft_multikrum(grads, f=f, m=grads.shape[0]-f-2)
+                        g = aggr_soft_multikrum(grads, f=f, m=grads.shape[0] - f - 2)
                     elif agg_method == "krum":
                         g = aggr_multikrum(grads, f=f, m=1)
                     elif agg_method == "softkrum":
@@ -421,7 +409,7 @@ def get_train_info(
     batch_size=None,
     epochs=None,
     optim_kwargs={},
-    scheduler_kwargs={}
+    scheduler_kwargs={},
 ):
     if train_flag == "sgd":
         batch_size = batch_size or DEFAULT_SGD_BATCH_SIZE
@@ -448,9 +436,9 @@ def get_mtt_attack_info(
     labels,
     expert_kwargs,
     labels_kwargs,
-    train_flag='sgd',
+    train_flag="sgd",
     batch_size=None,
-    epochs=None
+    epochs=None,
 ):
     if train_flag == "sgd":
         batch_size = batch_size or DEFAULT_SGD_BATCH_SIZE
@@ -460,7 +448,7 @@ def get_mtt_attack_info(
     else:
         raise NotImplementedError
 
-    assert len(opt_expert.state_dict()['param_groups']) == 1
+    assert len(opt_expert.state_dict()["param_groups"]) == 1
     return batch_size, epochs, opt_expert, opt_labels
 
 

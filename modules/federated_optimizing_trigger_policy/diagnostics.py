@@ -45,6 +45,41 @@ module produces):
            relative to B2's scale for delta to actually learn to backdoor -- a LOSS-BALANCE
            problem, independent of how well u itself is doing.
 
+    B2_qp_50 ~= B2_qp_200 ~= B2_qp_1000 (qp_*_vs_*_relative_improvement ~= 0 at every step)
+        => the QP diagnostic itself has converged -- diag_qp_iters is not the bottleneck, and
+           B2_qp can be trusted as (close to) the true U_loc optimum for the checks below. If
+           instead the sweep keeps improving at the largest check_iters, B2_qp is itself
+           under-converged and every downstream comparison against it is optimistic.
+
+    B2_span low (v is well explained by span(G_obj) with NO constraints), but B2_qp still high
+        => the constraint set U_loc (u>=0, budget, per-class caps) -- NOT the flip gradients'
+           span -- is what is actually limiting the attack. Check `qp_global_budget_active` /
+           `qp_any_class_cap_active`: if the budget is active, sweeping beta may help; if a
+           class cap is active instead, no beta sweep will (that source class is out of
+           examples to flip, see prop:budget-match's saturated regime, rem:saturated).
+
+    B2_span itself high
+        => even the FULLY UNCONSTRAINED best linear combination of flip-gradient columns cannot
+           track v(delta) -- a genuine subspace-coverage limitation of the (source, target)
+           pairs available, independent of beta/lr_policy/n_steps entirely. Changing delta (or
+           the set of pairs u is optimized over) is the only lever left.
+
+    cosine_qp_v ~= 1 but residual_after_optimal_scaling_qp is still a large fraction of
+    residual_qp
+        => AMPLITUDE-only mismatch: the QP policy already points the right way, it just cannot
+           reach the right magnitude under U_loc -- consistent with `qp_global_budget_active`
+           (not enough budget to scale up) rather than a directional problem.
+
+    cosine_qp_v far from 1 AND residual_after_optimal_scaling_qp stays close to residual_qp
+        => a genuine DIRECTIONAL limitation: no rescaling of Gu_qp gets it close to v -- look at
+           B2_span next to tell whether this is a constraint effect or intrinsic to G_obj's
+           span.
+
+    policy_qp_l1_distance / policy_qp_l2_distance small (u_current close to u_qp) but B2 still
+    high
+        => u itself is close to its own local optimum already; the residual is a feasibility
+           problem (see B2_qp/B2_span above), not a lagging/under-trained policy.
+
     Every diagnostic above looks fine, but the final trained attack still fails
         => the mismatch is likely between this module's per-step local objective (eq:P, a
            gradient-alignment proxy evaluated on FIXED expert checkpoints) and the actual LONG
@@ -156,6 +191,22 @@ def qp_convergence_sweep(Q, c, u_init, beta, pairs, pi, check_iters):
     }
 
 
+def qp_convergence_relative_improvements(b2_by_iters, eps=_EPS):
+    '''
+    Given {n_iters: B2(w_{n_iters})} from a `qp_convergence_sweep` (all warm-started from the
+    SAME point, per that function's docstring), returns the CONSECUTIVE relative improvements
+    -- {(a, b): (B2_a - B2_b) / max(|B2_a|, eps)} for each pair of consecutive iteration budgets
+    a < b in sorted order. Close to 0 for every consecutive pair means the sweep has plateaued
+    (the usual `diag_qp_iters` budget is already close to converged); still shrinking at the
+    largest pair means it has not.
+    '''
+    ordered = sorted(b2_by_iters)
+    out = {}
+    for a, b in zip(ordered, ordered[1:]):
+        out[(a, b)] = (b2_by_iters[a] - b2_by_iters[b]) / max(abs(b2_by_iters[a]), eps)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Diagnostic B -- geometric feasibility of v(delta) under G_obj @ U_loc
 # --------------------------------------------------------------------------- #
@@ -171,6 +222,112 @@ def geometric_feasibility(Gu, v, rho, prefix, eps=_EPS):
         f"{prefix}_residual_over_rho": residual / max(rho, eps),
         f"{prefix}_residual_over_v": residual / max(v_norm, eps),
         f"{prefix}_cosine": cos,
+    }
+
+
+def policy_distance(u, u_ref):
+    '''||u - u_ref||_1 and ||u - u_ref||_2, e.g. the co-descended policy vs. the QP reference --
+    to tell "u_current is far from u_qp" apart from "u_current is close to u_qp but B2 is still
+    high" (the latter means u itself is not really the problem, see this module's docstring).'''
+    diff = _as_np(u) - _as_np(u_ref)
+    return float(np.abs(diff).sum()), float(np.linalg.norm(diff))
+
+
+def constraint_activity(w, beta, pairs, pi, tol=1e-8):
+    '''
+    Which constraints of U_loc = {w>=0, sum(w)<=beta, sum_c w_{y,c}<=pi_y} are ACTIVE (binding,
+    i.e. hit to within `tol`) at `w` -- tells whether a QP solution is limited by the global
+    budget, one or more per-class caps, or is a genuine interior optimum (no active constraint,
+    prop:structure's inner minimum reached without projection). `diag_constraint_tol` controls
+    `tol`: too tight and float/PGD-iterate noise makes a truly-active constraint look inactive;
+    too loose and it flags constraints that are merely close, not binding.
+
+    Returns:
+        dict with global_budget_active (bool), any_class_cap_active (bool),
+        num_active_class_caps (int), active_class_caps (list of the source classes y whose
+        sum_c w_{y,c} <= pi_y cap is active).
+    '''
+    w_np = _as_np(w)
+    l1 = float(w_np.sum())
+    global_active = bool(l1 >= beta - tol)
+
+    ys = sorted(set(y for y, _ in pairs))
+    active_classes = []
+    for y in ys:
+        idx = [i for i, (yy, _) in enumerate(pairs) if yy == y]
+        class_sum = float(w_np[idx].sum())
+        if class_sum >= pi[y] - tol:
+            active_classes.append(int(y))
+
+    return {
+        "global_budget_active": global_active,
+        "any_class_cap_active": len(active_classes) > 0,
+        "num_active_class_caps": len(active_classes),
+        "active_class_caps": active_classes,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostic (Section 7 of the follow-up task) -- unconstrained projection of v onto
+# span(G_obj): separates a subspace-coverage limitation (label flips' gradients simply don't
+# span the poison direction) from a CONSTRAINT limitation (u>=0 / budget / per-class caps make
+# an otherwise-reachable direction inaccessible).
+# --------------------------------------------------------------------------- #
+
+def span_projection(G_obj, Q_obj, c_np, v, den, rcond=1e-10, eps=_EPS):
+    '''
+    u_ls = argmin_u ||G_obj @ u - v||^2, UNCONSTRAINED (u need not be >=0, need not respect
+    beta/pi -- this is a pure diagnostic, never usable as an attack policy). Solved via the
+    Moore-Penrose pseudoinverse of Q_obj = G_obj^T @ G_obj (already cached alongside G_obj, so
+    this reuses it rather than re-deriving a fresh (D, P) least-squares problem over the full
+    parameter dimension D): u_ls = pinv(Q_obj) @ c_np, c_np = G_obj^T @ v. When Q_obj is
+    singular/ill-conditioned (columns of G_obj not linearly independent), pinv's `rcond`
+    truncates near-zero singular values -- u_ls may then not be unique, but G_obj @ u_ls (the
+    projection of v onto span(G_obj)) IS unique regardless of which minimizer pinv picks, so the
+    metrics below are well-defined even then.
+
+    Returns a dict: B2_span (the objective's own value at this UNCONSTRAINED optimum -- a lower
+    bound on B2_qp, since U_loc subset R^P), span_residual = ||G_obj@u_ls - v||,
+    span_relative_residual (normalized by ||v||), span_projection_cosine (cosine between the
+    projection and v -- 1.0 iff v in span(G_obj) exactly).
+    '''
+    Q_pinv = np.linalg.pinv(Q_obj, rcond=rcond)
+    u_ls = Q_pinv @ np.asarray(c_np, dtype=np.float64)
+    b2_span, Gu_span = b2_value(G_obj, u_ls, v, den)
+    v_d = v.detach()
+    residual = (Gu_span - v_d).norm().item()
+    v_norm = v_d.norm().item()
+    cos = F.cosine_similarity(Gu_span.reshape(1, -1), v_d.reshape(1, -1), eps=eps).item()
+    return {
+        "B2_span": b2_span,
+        "span_residual": residual,
+        "span_relative_residual": residual / max(v_norm, eps) if v_norm > eps else None,
+        "span_projection_cosine": cos if v_norm > eps and Gu_span.norm().item() > eps else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostic (Section 6 of the follow-up task) -- direction vs. amplitude decomposition:
+# rescaling Gu by its OWN optimal scalar a* = <Gu,v>/||Gu||^2 isolates whether the residual is
+# mostly a DIRECTION mismatch (residual stays high even after the best possible rescaling) or an
+# AMPLITUDE-only mismatch (residual collapses once rescaled -- the direction was already right).
+# --------------------------------------------------------------------------- #
+
+def direction_amplitude_scaling(Gu, v, eps=_EPS):
+    Gu_d, v_d = Gu.detach(), v.detach()
+    denom = (Gu_d ** 2).sum().item()
+    v_norm = v_d.norm().item()
+    if denom <= eps:
+        return {"optimal_scale": None, "residual_after_optimal_scaling": None,
+                "residual_after_optimal_scaling_relative": None}
+    a_star = float((Gu_d * v_d).sum().item() / denom)
+    residual_scaled = (a_star * Gu_d - v_d).norm().item()
+    return {
+        "optimal_scale": a_star,
+        "residual_after_optimal_scaling": residual_scaled,
+        "residual_after_optimal_scaling_relative": (
+            residual_scaled / max(v_norm, eps) if v_norm > eps else None
+        ),
     }
 
 

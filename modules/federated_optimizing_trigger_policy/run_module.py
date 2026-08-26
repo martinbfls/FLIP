@@ -133,6 +133,9 @@ def _compute_step_policy(
     diag_actual_gradient_run=False,
     n_train=None,
     class_counts=None,
+    diag_constraint_tol=1e-8,
+    diag_span_projection=True,
+    diag_direction_scaling=True,
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
 
@@ -461,6 +464,7 @@ def _compute_step_policy(
             dataset_flag, model_flag, diag_qp_convergence, diag_qp_check_iters,
             diag_policy_nnz_threshold, diag_policy_topk, diag_policy_full_vector,
             diag_discretization, diag_actual_gradient_run,
+            diag_constraint_tol, diag_span_projection, diag_direction_scaling,
         )
 
     return {
@@ -480,6 +484,7 @@ def _build_diag_record(
     dataset_flag, model_flag, diag_qp_convergence, diag_qp_check_iters,
     diag_policy_nnz_threshold, diag_policy_topk, diag_policy_full_vector,
     diag_discretization, diag_actual_gradient_run,
+    diag_constraint_tol=1e-8, diag_span_projection=True, diag_direction_scaling=True,
 ):
     '''
     Assembles one diagnostics.jsonl record's worth of Diagnostic A/B/C/D/F metrics for a single
@@ -516,6 +521,17 @@ def _build_diag_record(
     # co-descended u and (if available) the QP reference w_pg.
     record.update(diag.geometric_feasibility(diag_ctx["Gu_current"], v, rho_k, "current"))
     record["v_norm"] = v.detach().norm().item()
+    if diag_direction_scaling:
+        record.update({f"{k}_current": v_ for k, v_ in diag.direction_amplitude_scaling(
+            diag_ctx["Gu_current"], v,
+        ).items()})
+
+    # current-side constraint activity: cheap (u is already in hand), logged for symmetry with
+    # the qp_* fields below, even though Section 4/7's main question is about the QP reference.
+    activity_current = diag.constraint_activity(u_np, beta, pairs_k, pi, diag_constraint_tol)
+    record["current_global_budget_active"] = activity_current["global_budget_active"]
+    record["current_any_class_cap_active"] = activity_current["any_class_cap_active"]
+    record["current_num_active_class_caps"] = activity_current["num_active_class_caps"]
 
     if w_pg is not None:
         Gu_qp = (G_obj @ w_pg).detach()
@@ -525,6 +541,33 @@ def _build_diag_record(
         ).items()})
         if diag_policy_full_vector:
             record["qp_u_full"] = diag.as_numpy(w_pg).tolist()
+
+        # Section 3: is u_current close to u_qp (a lag problem) or far from it while B2 is
+        # already close to B2_qp (an already-near-optimal-but-still-infeasible u)?
+        l1_dist, l2_dist = diag.policy_distance(u_np, w_pg)
+        record["policy_qp_l1_distance"] = l1_dist
+        record["policy_qp_l2_distance"] = l2_dist
+
+        # Section 4/7: which constraint of U_loc (if any) is binding at the QP reference --
+        # tells whether sweeping beta could plausibly help (global budget active) or not
+        # (a per-class cap is active instead -- that source class is simply out of examples).
+        activity_qp = diag.constraint_activity(w_pg, beta, pairs_k, pi, diag_constraint_tol)
+        record["qp_global_budget_active"] = activity_qp["global_budget_active"]
+        record["qp_any_class_cap_active"] = activity_qp["any_class_cap_active"]
+        record["qp_num_active_class_caps"] = activity_qp["num_active_class_caps"]
+        record["qp_active_class_caps"] = activity_qp["active_class_caps"]
+
+        # Section 6: `project_gradient_descent_local` is ALWAYS warm-started from the current
+        # (co-descended) u -- both here (diag_qp_iters) and in the convergence sweep below (same
+        # u_init passed to every check_iters value) -- so B2_qp_50/200/1000 are directly
+        # comparable to each other and to B2_qp_continuous, never confounded by a different
+        # starting point. See project_gradient_descent_local's own docstring.
+        record["qp_warm_start"] = True
+
+        if diag_direction_scaling:
+            record.update({f"{k}_qp": v_ for k, v_ in diag.direction_amplitude_scaling(
+                Gu_qp, v,
+            ).items()})
 
     # Diagnostic C: discretization gap, for both the continuous current policy and the QP
     # reference, materialized via the EXACT federated_policy_to_flips counting rule.
@@ -555,7 +598,10 @@ def _build_diag_record(
             )
 
     # Diagnostic A.2.1: solver-convergence sweep -- only when explicitly enabled (expensive at
-    # the largest check_iters value), only on this already-diagnostic batch.
+    # the largest check_iters value), only on this already-diagnostic batch. Every check_iters
+    # value is warm-started from the SAME u.detach() (see project_gradient_descent_local's own
+    # docstring and the qp_warm_start note above), so the B2_qp_<n> values below are directly
+    # comparable to each other.
     if diag_qp_convergence and diag_ctx["c_np"] is not None:
         sweep = diag.qp_convergence_sweep(
             diag_ctx["Q_obj"], diag_ctx["c_np"], u.detach(), beta, pairs_k, pi,
@@ -566,13 +612,14 @@ def _build_diag_record(
             b2_val, _ = diag.b2_value(G_obj, w, v, den)
             b2_by_iters[n_iters] = b2_val
             record[f"B2_qp_{n_iters}"] = b2_val
-        largest = max(b2_by_iters)
-        for n_iters, b2_val in b2_by_iters.items():
-            if n_iters == largest:
-                continue
-            record[f"B2_qp_{n_iters}_vs_{largest}_relative_diff"] = (
-                (b2_val - b2_by_iters[largest]) / max(abs(b2_by_iters[largest]), 1e-8)
-            )
+        for (a, b), rel_improvement in diag.qp_convergence_relative_improvements(b2_by_iters).items():
+            record[f"qp_{a}_vs_{b}_relative_improvement"] = rel_improvement
+
+    # Section 7: unconstrained projection of v onto span(G_obj) -- separates a subspace-coverage
+    # limitation (B2_span itself high) from a CONSTRAINT limitation (B2_span low, B2_qp high --
+    # see qp_global_budget_active/qp_any_class_cap_active above for which constraint).
+    if diag_span_projection and diag_ctx["c_np"] is not None:
+        record.update(diag.span_projection(G_obj, diag_ctx["Q_obj"], diag_ctx["c_np"], v, den))
 
     # Diagnostic D: actual vs. predicted gradient shift -- expensive (materializes flips and
     # runs real forward/backward passes), only when explicitly requested for this batch.
@@ -637,6 +684,9 @@ def optimize_trigger_policy_step(
     diag_gradient_balance=True,
     diag_actual_gradient=False,
     diag_actual_gradient_every=0,
+    diag_constraint_tol=1e-8,
+    diag_span_projection=True,
+    diag_direction_scaling=True,
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -729,6 +779,9 @@ def optimize_trigger_policy_step(
             diag_gradient_balance=diag_gradient_balance,
             diag_actual_gradient_run=diag_actual_gradient_run,
             n_train=n_train, class_counts=class_counts,
+            diag_constraint_tol=diag_constraint_tol,
+            diag_span_projection=diag_span_projection,
+            diag_direction_scaling=diag_direction_scaling,
         )
         B2, L_bd = result["B2"], result["L_bd"]
 
@@ -885,6 +938,9 @@ def optimize_trigger_policy(
     diag_gradient_balance=True,
     diag_actual_gradient=False,
     diag_actual_gradient_every=0,
+    diag_constraint_tol=1e-8,
+    diag_span_projection=True,
+    diag_direction_scaling=True,
 ):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
@@ -1190,6 +1246,9 @@ def optimize_trigger_policy(
             diag_gradient_balance=diag_gradient_balance,
             diag_actual_gradient=diag_actual_gradient,
             diag_actual_gradient_every=diag_actual_gradient_every,
+            diag_constraint_tol=diag_constraint_tol,
+            diag_span_projection=diag_span_projection,
+            diag_direction_scaling=diag_direction_scaling,
         )
 
         del expert_models
@@ -1331,6 +1390,9 @@ def run(experiment_name, module_name, **kwargs):
     diag_gradient_balance = args.get("diag_gradient_balance", True)
     diag_actual_gradient = args.get("diag_actual_gradient", False)
     diag_actual_gradient_every = args.get("diag_actual_gradient_every", 0)
+    diag_constraint_tol = args.get("diag_constraint_tol", 1e-8)
+    diag_span_projection = args.get("diag_span_projection", True)
+    diag_direction_scaling = args.get("diag_direction_scaling", True)
 
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
@@ -1421,6 +1483,9 @@ def run(experiment_name, module_name, **kwargs):
         diag_gradient_balance=diag_gradient_balance,
         diag_actual_gradient=diag_actual_gradient,
         diag_actual_gradient_every=diag_actual_gradient_every,
+        diag_constraint_tol=diag_constraint_tol,
+        diag_span_projection=diag_span_projection,
+        diag_direction_scaling=diag_direction_scaling,
     )
 
     print("Optimized trigger and policy obtained.")

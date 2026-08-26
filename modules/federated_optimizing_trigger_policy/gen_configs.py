@@ -89,16 +89,24 @@ POLICY_EPOCHS = 20     # epochs of expert retraining PER outer step -- distinct 
 # --------------------------------------------------------------------------- #
 # Diagnostics (modules/federated_optimizing_trigger_policy/diagnostics.py) -- every generated
 # cell writes a diagnostics.jsonl under its own policy dir (diag_path below) with the CHEAP
-# diagnostics on by default (discretization gap, gradient balance -- no extra model forward/
-# backward passes beyond what B2_qp already costs), so a run is diagnosable out of the box per
-# prelim/SPEC.md's "observe before correcting" instruction. diag_actual_gradient (Diagnostic D)
-# is the expensive one (materializes flips + real forward/backward passes against
+# diagnostics on by default (discretization gap, gradient balance, span projection, direction/
+# amplitude decomposition, constraint activity -- no extra model forward/backward passes beyond
+# what B2_qp already costs), so a run is diagnosable out of the box per prelim/SPEC.md's
+# "observe before correcting" instruction. diag_actual_gradient (Diagnostic D) is the ONE
+# expensive diagnostic (materializes flips + real forward/backward passes against
 # class_samples_raw) and stays OFF by default -- flip DIAG_ACTUAL_GRADIENT to True (and set
-# DIAG_ACTUAL_GRADIENT_EVERY>0 to throttle it) for a targeted diagnosis run once the cheap
-# diagnostics have narrowed down where B2 is failing.
+# DIAG_ACTUAL_GRADIENT_EVERY>0 to throttle it) once the cheap diagnostics have narrowed down
+# where B2 is failing.
+#
+# DIAG_QP_CONVERGENCE is ON here (unlike diag_actual_gradient): the first diagnosis round
+# (B2=0.0415 vs B2_qp=0.0248, B2_qp vs B2_qp_relaxed barely differing) raised the question of
+# whether the diagnostic QP solver itself (diag_qp_iters=50) had actually converged -- this
+# re-solves the SAME (Q, c) at 50/200/1000 iterations (all warm-started from the SAME point,
+# see project_gradient_descent_local's docstring) and logs qp_<a>_vs_<b>_relative_improvement
+# for each consecutive pair, so that question is answered directly from diagnostics.jsonl.
 # --------------------------------------------------------------------------- #
 DIAG_QP_ITERS = 50
-DIAG_QP_CONVERGENCE = False
+DIAG_QP_CONVERGENCE = True
 DIAG_QP_CHECK_ITERS = [50, 200, 1000]
 DIAG_POLICY_NNZ_THRESHOLD = 1e-8
 DIAG_POLICY_TOPK = 10
@@ -107,6 +115,9 @@ DIAG_DISCRETIZATION = True
 DIAG_GRADIENT_BALANCE = True
 DIAG_ACTUAL_GRADIENT = False
 DIAG_ACTUAL_GRADIENT_EVERY = 0
+DIAG_CONSTRAINT_TOL = 1e-8
+DIAG_SPAN_PROJECTION = True
+DIAG_DIRECTION_SCALING = True
 
 
 def _toml_bool(x):
@@ -238,6 +249,9 @@ diag_discretization = {diag_discretization}
 diag_gradient_balance = {diag_gradient_balance}
 diag_actual_gradient = {diag_actual_gradient}
 diag_actual_gradient_every = {diag_actual_gradient_every}
+diag_constraint_tol = {diag_constraint_tol}
+diag_span_projection = {diag_span_projection}
+diag_direction_scaling = {diag_direction_scaling}
 
 [federated_optimizing_trigger_policy.expert_config]
 experts = 1
@@ -340,6 +354,9 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
             diag_gradient_balance=_toml_bool(DIAG_GRADIENT_BALANCE),
             diag_actual_gradient=_toml_bool(DIAG_ACTUAL_GRADIENT),
             diag_actual_gradient_every=DIAG_ACTUAL_GRADIENT_EVERY,
+            diag_constraint_tol=DIAG_CONSTRAINT_TOL,
+            diag_span_projection=_toml_bool(DIAG_SPAN_PROJECTION),
+            diag_direction_scaling=_toml_bool(DIAG_DIRECTION_SCALING),
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
             cell_dir=policy_dir, model_flag=model_flag, dataset=dataset,

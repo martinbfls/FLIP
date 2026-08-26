@@ -270,6 +270,168 @@ def test_gradient_balance_does_not_touch_delta_grad_and_preserves_graph():
           f"delta.grad={delta.grad}, expected={expected_total}")
 
 
+# --------------------------------------------------------------------------#
+# E. QP solver-convergence sweep: B2_1000 <= B2_200 <~ B2_50 (Section 11.A of the follow-up
+# diagnostics task), expressed via the actual consecutive relative-improvement helper.
+# --------------------------------------------------------------------------#
+
+def test_qp_convergence_relative_improvements_are_nonnegative_and_shrinking():
+    G, v, Q, c, pairs, pi = _synthetic_qp_problem(seed=6)
+    beta = 0.3
+    den = 1.0
+    u_init = torch.zeros(len(pairs), dtype=torch.float64)
+
+    sweep = diag.qp_convergence_sweep(Q, c, u_init, beta, pairs, pi, [10, 50, 200, 1000])
+    b2_by_iters = {n: diag.b2_value(G, w, v, den)[0] for n, w in sweep.items()}
+
+    improvements = diag.qp_convergence_relative_improvements(b2_by_iters)
+    check("qp_convergence_relative_improvements has one entry per consecutive pair",
+          sorted(improvements.keys()) == [(10, 50), (50, 200), (200, 1000)],
+          f"keys={sorted(improvements.keys())}")
+    check("every consecutive relative improvement is >= 0 (B2 does not get WORSE with more iters)",
+          all(v_ >= -1e-9 for v_ in improvements.values()), f"improvements={improvements}")
+    check("the improvement at the largest-iteration pair is the smallest (near-converged tail)",
+          improvements[(200, 1000)] <= improvements[(10, 50)] + 1e-9,
+          f"improvements={improvements}")
+
+
+# --------------------------------------------------------------------------#
+# F. Span projection (Section 7): reachable vs. unreachable v under an UNCONSTRAINED
+# least-squares fit to span(G_obj) -- separates a subspace-coverage limitation from a
+# constraint (U_loc) limitation.
+# --------------------------------------------------------------------------#
+
+def test_span_projection_reachable_case():
+    D, n_pairs = 8, 3
+    rng = np.random.RandomState(7)
+    G_np = rng.normal(size=(D, n_pairs))
+    G = torch.tensor(G_np, dtype=torch.float64)
+    u_true = rng.normal(size=n_pairs)
+    v = torch.tensor(G_np @ u_true, dtype=torch.float64)  # v IS in span(G) exactly
+
+    Q = G_np.T @ G_np
+    c_np = G_np.T @ (G_np @ u_true)
+    result = diag.span_projection(G, Q, c_np, v, den=1.0)
+
+    check("reachable v: span_residual ~= 0", result["span_residual"] < 1e-6,
+          f"span_residual={result['span_residual']:.3e}")
+    check("reachable v: B2_span ~= 0", result["B2_span"] < 1e-10,
+          f"B2_span={result['B2_span']:.3e}")
+    check("reachable v: span_projection_cosine ~= 1", abs(result["span_projection_cosine"] - 1.0) < 1e-6,
+          f"cosine={result['span_projection_cosine']}")
+
+
+def test_span_projection_unreachable_case():
+    D, n_pairs = 8, 2
+    rng = np.random.RandomState(8)
+    G_np = rng.normal(size=(D, n_pairs))
+    G = torch.tensor(G_np, dtype=torch.float64)
+
+    # v with a large component ORTHOGONAL to span(G) (built via QR against G's columns), so no
+    # linear combination of G's columns -- constrained or not -- can reach it.
+    q, _ = np.linalg.qr(G_np)  # q's columns span the same subspace as G's
+    in_span_component = q[:, 0] * 2.0
+    probe = np.eye(D)[:, -1]
+    orthogonal_component = probe - q @ (q.T @ probe)
+    orthogonal_component /= np.linalg.norm(orthogonal_component) + 1e-12
+    v_np = in_span_component + 5.0 * orthogonal_component
+    v = torch.tensor(v_np, dtype=torch.float64)
+
+    Q = G_np.T @ G_np
+    c_np = G_np.T @ v_np
+    result = diag.span_projection(G, Q, c_np, v, den=1.0)
+
+    check("unreachable v: span_residual > 0 (a real, non-negligible gap)",
+          result["span_residual"] > 1.0, f"span_residual={result['span_residual']:.3f}")
+    check("unreachable v: B2_span > 0", result["B2_span"] > 0.5, f"B2_span={result['B2_span']:.3f}")
+    check("unreachable v: span_projection_cosine noticeably below 1",
+          result["span_projection_cosine"] < 0.95, f"cosine={result['span_projection_cosine']}")
+
+
+# --------------------------------------------------------------------------#
+# G. Direction vs. amplitude decomposition (Section 6).
+# --------------------------------------------------------------------------#
+
+def test_direction_amplitude_scaling_amplitude_only_mismatch():
+    v = torch.tensor([1.0, 2.0, -1.0, 0.5], dtype=torch.float64)
+    Gu = 0.5 * v  # same direction, half the magnitude -- a pure AMPLITUDE mismatch
+
+    result = diag.direction_amplitude_scaling(Gu, v)
+    check("same-direction Gu: optimal_scale ~= 2.0 (rescales Gu exactly back to v)",
+          abs(result["optimal_scale"] - 2.0) < 1e-9, f"optimal_scale={result['optimal_scale']}")
+    check("same-direction Gu: residual_after_optimal_scaling ~= 0",
+          result["residual_after_optimal_scaling"] < 1e-9,
+          f"residual_after_optimal_scaling={result['residual_after_optimal_scaling']}")
+
+    raw_residual = (Gu - v).norm().item()
+    check("raw residual (before scaling) is clearly nonzero, unlike the scaled one",
+          raw_residual > 0.5, f"raw_residual={raw_residual}")
+
+
+def test_direction_amplitude_scaling_directional_mismatch():
+    v = torch.tensor([1.0, 0.0], dtype=torch.float64)
+    Gu = torch.tensor([0.0, 3.0], dtype=torch.float64)  # ORTHOGONAL to v -- no rescaling helps
+
+    result = diag.direction_amplitude_scaling(Gu, v)
+    check("orthogonal Gu: optimal_scale ~= 0 (no scalar multiple of Gu reduces the residual)",
+          abs(result["optimal_scale"]) < 1e-9, f"optimal_scale={result['optimal_scale']}")
+    check("orthogonal Gu: residual_after_optimal_scaling stays close to ||v|| (scaling cannot help)",
+          abs(result["residual_after_optimal_scaling"] - v.norm().item()) < 1e-6,
+          f"residual_after_optimal_scaling={result['residual_after_optimal_scaling']}, ||v||={v.norm().item()}")
+
+
+# --------------------------------------------------------------------------#
+# H. Constraint activity (Section 4): global budget active/inactive, per-class cap active,
+# and the no-active-constraint (genuine interior optimum) case.
+# --------------------------------------------------------------------------#
+
+_C_PAIRS = [(0, 1), (0, 2), (1, 0), (1, 2)]
+_C_PI = {0: 0.4, 1: 0.3}
+
+
+def test_constraint_activity_global_budget_active():
+    beta = 0.5
+    # class-0 sum = 0.15+0.15 = 0.3 < pi[0]=0.4; class-1 sum = 0.1+0.1 = 0.2 < pi[1]=0.3;
+    # total = 0.5 == beta -- ONLY the global budget is active, no per-class cap.
+    w = np.array([0.15, 0.15, 0.1, 0.1])
+    result = diag.constraint_activity(w, beta, _C_PAIRS, _C_PI, tol=1e-8)
+    check("global budget flagged active when sum(w) == beta",
+          result["global_budget_active"] is True, f"result={result}")
+    check("no class cap active in this case (both class sums stay below their pi_y)",
+          result["num_active_class_caps"] == 0, f"result={result}")
+
+
+def test_constraint_activity_class_cap_active():
+    beta = 10.0  # far from binding
+    w = np.array([0.4, 0.0, 0.1, 0.1])  # class-0 sum == 0.4 == pi[0] -- class cap active
+    result = diag.constraint_activity(w, beta, _C_PAIRS, _C_PI, tol=1e-8)
+    check("global budget NOT active (beta is huge)", result["global_budget_active"] is False)
+    check("class cap flagged active for class 0", result["active_class_caps"] == [0],
+          f"result={result}")
+    check("num_active_class_caps == 1", result["num_active_class_caps"] == 1)
+
+
+def test_constraint_activity_no_active_constraint():
+    beta = 10.0
+    w = np.array([0.01, 0.01, 0.01, 0.01])  # nowhere near beta or any pi[y]
+    result = diag.constraint_activity(w, beta, _C_PAIRS, _C_PI, tol=1e-8)
+    check("interior point: no active constraint at all",
+          not result["global_budget_active"] and not result["any_class_cap_active"],
+          f"result={result}")
+
+
+# --------------------------------------------------------------------------#
+# I. policy_distance -- ||u - u_qp||_1 / _2.
+# --------------------------------------------------------------------------#
+
+def test_policy_distance():
+    u = np.array([0.1, 0.2, 0.3])
+    u_qp = np.array([0.1, 0.0, 0.3])
+    l1, l2 = diag.policy_distance(u, u_qp)
+    check("policy_distance L1 matches hand-computed value", abs(l1 - 0.2) < 1e-9, f"l1={l1}")
+    check("policy_distance L2 matches hand-computed value", abs(l2 - 0.2) < 1e-9, f"l2={l2}")
+
+
 if __name__ == "__main__":
     test_discretize_policy_matches_materialize_policy_flips()
     test_discretize_policy_respects_budget_and_caps_no_negatives()
@@ -280,6 +442,15 @@ if __name__ == "__main__":
     test_qp_respects_per_class_caps()
     test_discretization_gap_destroys_perfect_continuous_solution()
     test_gradient_balance_does_not_touch_delta_grad_and_preserves_graph()
+    test_qp_convergence_relative_improvements_are_nonnegative_and_shrinking()
+    test_span_projection_reachable_case()
+    test_span_projection_unreachable_case()
+    test_direction_amplitude_scaling_amplitude_only_mismatch()
+    test_direction_amplitude_scaling_directional_mismatch()
+    test_constraint_activity_global_budget_active()
+    test_constraint_activity_class_cap_active()
+    test_constraint_activity_no_active_constraint()
+    test_policy_distance()
 
     n_fail = sum(1 for _, ok, _ in _results if not ok)
     print(f"\n{len(_results) - n_fail}/{len(_results)} checks passed.")
