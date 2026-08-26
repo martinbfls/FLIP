@@ -63,7 +63,6 @@ from modules.federated_optimizing_trigger.utils import (
     compute_batch_gradients,
     trigger_penalty_hinge,
     tv_loss,
-    compute_expected_flip_gradients,
     compute_class_frequencies,
     get_class_conditional_samples,
     get_mu,
@@ -83,6 +82,7 @@ from modules.federated_optimizing_trigger_policy.utils import (
     init_policy, project_policy_budget, project_gradient_descent_local,
 )
 from modules.federated_optimizing_trigger_policy import diagnostics as diag
+from modules.federated_optimizing_trigger_policy import inner_solve
 from modules.train_expert.utils import checkpoint_callback
 import torch
 from torch.utils.data import ConcatDataset, Subset
@@ -95,6 +95,34 @@ import copy
 import time as _time
 
 WINDOW_SIZE = 50
+
+
+def _build_poison_mask(y, n_b, source_label, target_label, lambda_poison):
+    '''
+    Pure extraction of `_compute_step_policy`'s own per-batch poison-mask construction (A3,
+    docs/policy_module_audit_report.md) -- same formula, not a new convention. Factored out so
+    the policy_inner_mode!="joint" path can build this mask ONCE per batch and pass the SAME
+    one to both the inner-solve context (inner_solve.build_inner_context) and this function's
+    own delta-update pass (via `precomputed`), instead of each independently drawing its own
+    torch.randperm and ending up with two DIFFERENT poisoned/clean splits for the same batch.
+
+    Returns (mask, y_poison, has_poison, lambda_effective, lambda_effective_ratio).
+    '''
+    mask = y == source_label
+    y_poison = y.clone()
+    has_poison = bool(mask.sum().item() > 0)
+    if has_poison:
+        idx_source = mask.nonzero(as_tuple=True)[0]
+        target_count = min(int(round(lambda_poison * n_b)), idx_source.numel())
+        perm = torch.randperm(idx_source.numel(), device=idx_source.device)[:target_count]
+        keep = idx_source[perm]
+        mask = torch.zeros_like(mask)
+        mask[keep] = True
+        y_poison[mask] = target_label
+
+    lambda_effective = mask.sum().item() / n_b if n_b > 0 else 0.0
+    lambda_effective_ratio = lambda_effective / lambda_poison if lambda_poison > 0 else 0.0
+    return mask, y_poison, has_poison, lambda_effective, lambda_effective_ratio
 
 
 def _compute_step_policy(
@@ -136,6 +164,7 @@ def _compute_step_policy(
     diag_constraint_tol=1e-8,
     diag_span_projection=True,
     diag_direction_scaling=True,
+    precomputed=None,
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
 
@@ -190,34 +219,24 @@ def _compute_step_policy(
     eps_den = 1e-8
     n_exp = len(sampled_k)
 
-    x_raw, y = move_to_device(batch, device)
-    n_b = x_raw.shape[0]
-    x_clean = raw_to_preprocess(x_raw, dataset_flag=dataset_flag, model_flag=model_flag)
-
-    # A3 (docs/policy_module_audit_report.md): the mask below can select AT MOST
-    # idx_source.numel() rows -- the source-class examples actually present in THIS batch
-    # (~pi_source*n_b on average) -- regardless of how large lambda_poison is. Unlike
-    # get_poison_dataset (ADD-based, used for theta_bar_k's retraining), this per-batch mask
-    # never duplicates rows to reach target_count, so lambda_effective is capped near
-    # pi_source whenever lambda_poison > pi_source. See lambda_effective_ratio below and the
-    # startup guard in optimize_trigger_policy (raises if lambda_poison > pi_source, since the
-    # cap is then structurally guaranteed, not just possible on an unlucky batch).
-    mask = y == source_label
-    y_poison = y.clone()
-    has_poison = bool(mask.sum().item() > 0)
-    if has_poison:
-        idx_source = mask.nonzero(as_tuple=True)[0]
-        target_count = min(int(round(lambda_poison * n_b)), idx_source.numel())
-        perm = torch.randperm(idx_source.numel(), device=idx_source.device)[:target_count]
-        keep = idx_source[perm]
-        mask = torch.zeros_like(mask)
-        mask[keep] = True
-        y_poison[mask] = target_label
-
-    lambda_effective = mask.sum().item() / n_b if n_b > 0 else 0.0
-    # A3: ratio of what was actually realized to what was requested -- 1.0 means uncapped this
-    # batch, < 1.0 means the source-class supply in this batch fell short of target_count.
-    lambda_effective_ratio = lambda_effective / lambda_poison if lambda_poison > 0 else 0.0
+    if precomputed is None:
+        x_raw, y = move_to_device(batch, device)
+        x_clean = raw_to_preprocess(x_raw, dataset_flag=dataset_flag, model_flag=model_flag)
+        mask, y_poison, has_poison, lambda_effective, lambda_effective_ratio = _build_poison_mask(
+            y, x_raw.shape[0], source_label, target_label, lambda_poison,
+        )
+    else:
+        # policy_inner_mode != "joint": the SAME mask/x_clean the inner-solve phase already
+        # built for this batch (inner_solve.build_inner_context) -- reusing it here (rather
+        # than letting this call draw its OWN fresh torch.randperm mask) is what makes the
+        # inner-solve's (Q, c) and this, delta-update pass's v_k refer to the EXACT SAME
+        # poisoned/clean split, not two independently-randomized ones.
+        x_raw, y, x_clean, mask, y_poison, has_poison = (
+            precomputed["x_raw"], precomputed["y"], precomputed["x_clean"],
+            precomputed["mask"], precomputed["y_poison"], precomputed["has_poison"],
+        )
+        lambda_effective = precomputed["lambda_effective"]
+        lambda_effective_ratio = precomputed["lambda_effective_ratio"]
 
     B2_sum, bd_loss_sum = None, None
     B2_rho_sum, B2_v_sum, B2_qp_sum = None, None, None
@@ -258,79 +277,18 @@ def _compute_step_policy(
         # two gradients under the batch's poisoned/clean labels respectively).
         v = mu_p - g_c
 
-        if k in flip_grad_cache:
-            G_obj, Q_obj, pairs_k, rho_k = flip_grad_cache[k]
-        else:
-            # Theory: def:shifts (eq:shift) -- Gbar_{y,c} = g_{y,c} - g_{y,y}, WITH NO pi_y
-            # factor (rem:no-pi). The shared compute_expected_flip_gradients still returns the
-            # PRE-rem:no-pi convention (G_k[:,(y,c)] = pi_y*(g_{y,c}-g_{y,y}), an earlier draft's
-            # definition -- see federated_optimizing_trigger/utils.py's own docstring) and is
-            # not modified here (shared, read-only): the two-factor rescaling below is where
-            # this module corrects it back to the def:shifts convention. PIEGE 1 (pi_y
-            # convention): do not double-correct -- compute_expected_flip_gradients' OWN
-            # docstring calls its pi_y factor deliberate for ITS internal budget-constraint
-            # convention (a DIFFERENT, simpler scheme used elsewhere); it is this module's job,
-            # not that shared function's, to strip it back out for eq:P's Gbar.
-            G_k, Q_k, pairs_k = compute_expected_flip_gradients(
-                M, loss_fn, class_samples_raw, n_classes, pi,
-                dataset_flag=dataset_flag, model_flag=model_flag, params=params,
-            )
-            # See this function's docstring: G_k's columns are pi_y*(g_{y,c}-g_{y,y})
-            # (aggregate-rate convention); u is local, so rescale by gamma/pi_y once here and
-            # cache the result instead of G_k -- never rescaled again per-batch.
-            #   (i)  /pi_y : undoes compute_expected_flip_gradients' pi_y factor -> Gbar itself
-            #        (def:shifts, rem:no-pi).
-            #   (ii) *gamma: theory's LOCAL reading of eq:P (the paragraph right after the
-            #        lambda=beta constraint) -- b_k = gamma*Gbar(theta_bar_k)*u^i
-            #        (eq:local-scope) when the decision variable is the per-worker u^i rather
-            #        than the aggregate ubar. PIEGE 2 (local/aggregate scope): these are TWO
-            #        SEPARATE corrections that compose multiplicatively (gamma/pi_y), not one --
-            #        see docs/policy_module_audit_report.md Section 2.1/2.2.
-            scale = torch.tensor(
-                [gamma / pi[y] for (y, c) in pairs_k], device=G_k.device, dtype=G_k.dtype,
-            )
-            G_obj = G_k * scale
-            scale_np = scale.detach().cpu().numpy().astype(np.float64)
-            Q_obj = np.outer(scale_np, scale_np) * Q_k
-
-            # A2 (docs/policy_module_audit_report.md Section "rayon de shift"): varsigma_k
-            # exposed as its OWN named variable -- Theory: eq:varsigma, varsigma_k =
-            # max_{y,c}||Gbar_{y,c}||, Gbar_{y,c} = G_k[:,(y,c)]/pi_y (the pi_y factor stripped
-            # back out, def:shifts/rem:no-pi -- PIEGE 1) -- rather than folded into a single
-            # fused norm call, so `rho_k = beta_global * varsigma_k` (eq:rho) can be read off
-            # directly without re-deriving it from G_obj's own gamma/pi_y scaling.
-            pi_col = torch.tensor(
-                [pi[y] for (y, c) in pairs_k], device=G_k.device, dtype=G_k.dtype,
-            )
-            varsigma_k = (G_k.detach() / pi_col).norm(dim=0).max().item()
-            rho_k = beta_global * varsigma_k
-
-            # A2 self-check (run once, first checkpoint cached this call): rho_k above must
-            # equal beta_local * max_col_norm(G_obj) exactly, since G_obj's own gamma factor
-            # (PIEGE 2) cancels against beta_local's local scope (beta_local*gamma ==
-            # beta_global by construction, A1) -- NOT a coincidence, but fragile: this assertion
-            # catches a future change that drops G_obj's gamma factor or switches beta to
-            # global scope without updating rho_k to match.
-            if len(flip_grad_cache) == 0:
-                rho_k_check = beta * G_obj.detach().norm(dim=0).max().item()
-                # rtol=1e-2 (not float32 machine precision): the two paths take DIFFERENT
-                # float32 multiply/reduction orders over a D~10^5-10^6 parameter vector (D =
-                # number of model params), so a ~1e-4 RELATIVE gap is normal accumulation
-                # noise, empirically observed (~1.4e-4 on r32p/CIFAR -- see
-                # prelim/verify_A1_A2_A5.py), not a sign of an algebraic error. A REAL
-                # regression (dropped gamma factor, wrong beta scope) would be off by a
-                # constant factor like gamma or 1/gamma -- orders of magnitude past this
-                # tolerance, not a rounding-sized gap.
-                assert abs(rho_k_check - rho_k) < 1e-2 * max(abs(rho_k), 1e-8), (
-                    f"A2 self-check failed: rho_k={rho_k:.6f} (beta_global*varsigma_k) vs "
-                    f"rho_k_check={rho_k_check:.6f} (beta_local*max_col_norm(G_obj)) -- these "
-                    "should match to within float32 rounding (beta_local*gamma == "
-                    "beta_global by construction). A mismatch this large means the gamma/pi_y "
-                    "scaling changed inconsistently -- see docs/theory/threat_model.tex eq:rho "
-                    "and this module's header docstring."
-                )
-
-            flip_grad_cache[k] = (G_obj, Q_obj, pairs_k, rho_k)
+        # Theory: def:shifts (eq:shift) -- Gbar_{y,c} = g_{y,c} - g_{y,y}, WITH NO pi_y factor
+        # (rem:no-pi); G_obj = (gamma/pi_y)*G_k column-wise (PIEGE 1/PIEGE 2); rho_k =
+        # beta_global*varsigma_k (eq:rho, A2), self-checked once against beta_local*max_col_norm
+        # (G_obj) the first time this batch's cache is filled. Extracted into
+        # `inner_solve.get_or_build_flip_grad_cache_entry` (pure move, same formulas, same
+        # assert) so `inner_solve.build_inner_context` -- the policy_inner_mode!="joint" path --
+        # shares the SAME per-checkpoint (G_obj, Q_obj, rho_k) via this SAME flip_grad_cache
+        # dict, rather than a second, possibly-drifting computation.
+        G_obj, Q_obj, pairs_k, rho_k = inner_solve.get_or_build_flip_grad_cache_entry(
+            k, flip_grad_cache, M, loss_fn, class_samples_raw, n_classes, pi, dataset_flag,
+            model_flag, params, gamma, beta, beta_global,
+        )
 
         # Theory: eq:P's first term (local reading, the paragraph right after the lambda=beta
         # constraint) -- ||gamma*Gbar(theta_bar_k)*u^i - v_k(delta)||^2 / rho_k^2. G_obj already
@@ -687,6 +645,12 @@ def optimize_trigger_policy_step(
     diag_constraint_tol=1e-8,
     diag_span_projection=True,
     diag_direction_scaling=True,
+    policy_inner_mode="joint",
+    policy_inner_steps=1,
+    policy_inner_iters=200,
+    policy_inner_tol=1e-8,
+    policy_inner_min_iters=10,
+    policy_inner_ridge=1e-6,
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -716,6 +680,19 @@ def optimize_trigger_policy_step(
     diagnostic rem:solver itself prescribes as the reconciliation: solve the QP optimum on the
     SAME v_k (see `_compute_step_policy`) and report it (`B2_qp`) alongside the co-descended
     `B2`, so the gap -- the quantity to monitor -- is measured rather than assumed small.
+
+    `policy_inner_mode` (default "joint", exactly the above -- see run_module.py's `run()`
+    docstring and modules/federated_optimizing_trigger_policy/inner_solve.py's module
+    docstring) offers a CONTROLLED alternative: push u closer to u*(delta_t) BEFORE delta is
+    updated (an alternating-minimization scheme), to test whether the B2>>B2_qp policy-lag
+    diagnostic is actually responsible for part of the attack's failure. "multi_step" does K
+    extra Adam steps on u (delta held fixed); "qp_pgd"/"qp_pgd_reset" replace u directly with an
+    aggressive projected-gradient QP solve over ALL of this batch's sampled checkpoints
+    (inner_solve.aggregate_qp/qp_pgd_solve), warm-started from u ("qp_pgd") or from 0
+    ("qp_pgd_reset"). In every non-"joint" mode, delta's own gradient is then computed with u
+    held CONSTANT (`u.detach()` passed into `_compute_step_policy` -- no gradient flows through
+    the inner solve into delta; a deliberate first step, not yet the Danskin/implicit-gradient
+    solver (a) rem:solver also admits).
     '''
     # G/Q depend only on (checkpoint, dataset), not on delta/u: fresh cache reused across every
     # batch of this call, discarded once these checkpoints are replaced -- same convention as
@@ -765,8 +742,107 @@ def optimize_trigger_policy_step(
             )
             diag_event_counter += 1
 
+        # policy_inner_mode != "joint": push u toward u*(delta) BEFORE delta's own update this
+        # batch (see optimize_trigger_policy_step's docstring and inner_solve.py's module
+        # docstring). Builds the mask/x_clean ONCE (`_build_poison_mask`) and passes it to
+        # `_compute_step_policy` below via `precomputed` -- so the inner solve's (Q, c) and the
+        # delta-update pass's v_k refer to the EXACT SAME poisoned/clean split this batch, not
+        # two independently-randomized ones.
+        precomputed, inner_record = None, None
+        u_for_delta_update = u
+        if policy_inner_mode != "joint":
+            x_raw_b, y_b = move_to_device(batch, device)
+            x_clean_b = raw_to_preprocess(x_raw_b, dataset_flag=dataset_flag, model_flag=model_flag)
+            mask_b, y_poison_b, has_poison_b, lam_eff_b, lam_eff_ratio_b = _build_poison_mask(
+                y_b, x_raw_b.shape[0], source_label, target_label, lambda_poison,
+            )
+            precomputed = {
+                "x_raw": x_raw_b, "y": y_b, "x_clean": x_clean_b, "mask": mask_b,
+                "y_poison": y_poison_b, "has_poison": has_poison_b,
+                "lambda_effective": lam_eff_b, "lambda_effective_ratio": lam_eff_ratio_b,
+            }
+
+            u_before = u.detach().clone()
+            contexts = inner_solve.build_inner_context(
+                expert_models, sampled_k, x_clean_b, y_b, x_raw_b, mask_b, y_poison_b,
+                has_poison_b, delta.detach(), loss_fn, dataset_flag, model_flag, n_classes,
+                flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global,
+                normalization, device,
+            )
+            Q_agg, c_agg, pairs_agg = inner_solve.aggregate_qp(contexts)
+            B2_before_inner = inner_solve.aggregate_b2(u, contexts)
+
+            if policy_inner_mode == "multi_step":
+                inner_metrics = inner_solve.multi_step_update(
+                    u, Q_agg, c_agg, beta, pairs_agg, pi, optimizer_policy, policy_inner_steps,
+                )
+            elif policy_inner_mode in ("qp_pgd", "qp_pgd_reset"):
+                u_init = (
+                    torch.zeros_like(u) if policy_inner_mode == "qp_pgd_reset" else u.detach()
+                )
+                u_star, actual_iters, obj_start, obj_end, converged = inner_solve.qp_pgd_solve(
+                    Q_agg, c_agg, u_init, beta, pairs_agg, pi,
+                    max_iters=policy_inner_iters, tol=policy_inner_tol,
+                    min_iters=policy_inner_min_iters, ridge=policy_inner_ridge,
+                )
+                with torch.no_grad():
+                    u.copy_(u_star.to(dtype=u.dtype, device=u.device))
+                inner_metrics = {
+                    "actual_iters": actual_iters, "obj_start": obj_start, "obj_end": obj_end,
+                    "obj_decrement": obj_start - obj_end, "converged": converged,
+                }
+            else:
+                raise ValueError(
+                    f"unknown policy_inner_mode={policy_inner_mode!r} -- expected one of "
+                    "'joint', 'multi_step', 'qp_pgd', 'qp_pgd_reset'."
+                )
+
+            B2_after_inner = inner_solve.aggregate_b2(u, contexts)
+            u_after = u.detach()
+            feasible = inner_solve.check_feasible(u_after, beta, pairs_agg, pi, diag_constraint_tol)
+
+            inner_record = {
+                "policy_inner_mode": policy_inner_mode,
+                "policy_inner_actual_iters": inner_metrics["actual_iters"],
+                "policy_inner_obj_start": inner_metrics["obj_start"],
+                "policy_inner_obj_end": inner_metrics["obj_end"],
+                "policy_inner_obj_decrement": inner_metrics["obj_decrement"],
+                "policy_inner_converged": inner_metrics["converged"],
+                "B2_before_inner": B2_before_inner,
+                "B2_after_inner": B2_after_inner,
+                "policy_inner_l1_update": float((u_after - u_before).abs().sum().item()),
+                "policy_inner_l2_update": float((u_after - u_before).norm().item()),
+                "policy_sum_before_inner": float(u_before.sum().item()),
+                "policy_sum_after_inner": float(u_after.sum().item()),
+                "policy_inner_feasible": feasible,
+            }
+
+            # Section 9: cross-check against the EXISTING single-checkpoint QP diagnostic
+            # (B2_qp, from _compute_step_policy's own run_diag branch) -- solves the SAME
+            # single-checkpoint (sampled_k[0]) problem via this module's OWN aggregate-QP
+            # machinery (contexts[:1], K=1 reduces to one checkpoint) at the SAME diag_qp_iters
+            # budget and warm start, and compares. A real construction bug in either path
+            # (wrong sign, missing gamma/pi factor, wrong den) would show up here as a
+            # persistent, non-shrinking gap -- NOT explained by iteration count, since both
+            # solves use the same budget.
+            if run_diag and diag_qp_convergence:
+                Q1, c1, pairs1 = inner_solve.aggregate_qp(contexts[:1])
+                w1, _, _, _, _ = inner_solve.qp_pgd_solve(
+                    Q1, c1, u_before, beta, pairs1, pi,
+                    max_iters=diag_qp_iters, tol=0.0, min_iters=diag_qp_iters,
+                    ridge=policy_inner_ridge,
+                )
+                b2_single_checkpoint = inner_solve.aggregate_b2(w1, contexts[:1])
+                inner_record["B2_after_inner_single_checkpoint"] = b2_single_checkpoint
+
+            # Stop-gradient through u* (Section 5): delta's own update below computes B2/L_bd
+            # with u held CONSTANT at its post-inner-solve value -- `u.detach()` is a fresh leaf
+            # with no graph, so no gradient flows from delta's loss back through the inner solve.
+            u_for_delta_update = u.detach()
+
         result = _compute_step_policy(
-            batch, expert_models, sampled_k, source_label, target_label, loss_fn, delta, u,
+            batch, expert_models, sampled_k, source_label, target_label, loss_fn, delta,
+            u_for_delta_update,
             device, dataset_flag, model_flag, lambda_poison, n_classes,
             flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global, pairs,
             normalization, checkpoint_backward, lambda_bd, run_diag,
@@ -782,18 +858,44 @@ def optimize_trigger_policy_step(
             diag_constraint_tol=diag_constraint_tol,
             diag_span_projection=diag_span_projection,
             diag_direction_scaling=diag_direction_scaling,
+            precomputed=precomputed,
         )
         B2, L_bd = result["B2"], result["L_bd"]
 
         if run_diag and diagnostics_writer is not None and result["diag_record"] is not None:
-            diagnostics_writer.write({
+            record = {
                 "outer_step": outer_step, "batch_idx": batch_idx,
                 "checkpoint": result["diag_checkpoint"],
                 **result["diag_record"],
                 "grad_delta_B2_norm": result["grad_delta_B2_norm"],
                 "grad_delta_BD_norm": result["grad_delta_BD_norm"],
                 "grad_delta_ratio": result["grad_delta_ratio"],
-            })
+            }
+            if inner_record is not None and "B2_after_inner_single_checkpoint" in inner_record:
+                # Section 9: compare the new inner-solve machinery (restricted to the SAME
+                # single checkpoint _compute_step_policy's own diagnostic used) against that
+                # existing, independently-implemented QP diagnostic (B2_qp_continuous).
+                b2_qp_reference = result["diag_record"].get("B2_qp_continuous")
+                record["B2_qp_reference"] = b2_qp_reference
+                record["B2_after_inner_single_checkpoint"] = (
+                    inner_record["B2_after_inner_single_checkpoint"]
+                )
+                if b2_qp_reference is not None:
+                    record["inner_vs_qp_relative_gap"] = (
+                        (inner_record["B2_after_inner_single_checkpoint"] - b2_qp_reference)
+                        / max(abs(b2_qp_reference), 1e-8)
+                    )
+            diagnostics_writer.write(record)
+
+        if inner_record is not None:
+            # Section 8: inner-solve metrics on EVERY batch this mode runs (cheap -- the inner
+            # solve already happened as part of the algorithm itself when mode != "joint", this
+            # just records what it did), independent of run_diag/diag_every.
+            if diagnostics_writer is not None:
+                diagnostics_writer.write({
+                    "outer_step": outer_step, "batch_idx": batch_idx, "event": "inner_solve",
+                    **inner_record,
+                })
 
         L_pen = trigger_penalty_hinge(delta, mu, mu_source, kappa)
         L_tv = tv_loss(delta)
@@ -816,11 +918,18 @@ def optimize_trigger_policy_step(
             L_tot.backward()
 
         optimizer_delta.step()
-        optimizer_policy.step()
+        if policy_inner_mode == "joint":
+            # Non-"joint" modes already updated (and projected) u themselves, above, via the
+            # inner solve -- an extra optimizer_policy.step() here would be a SECOND, unintended
+            # update on top of it (Section 6): u_for_delta_update was u.detach() for this
+            # backward, so u.grad was never touched by it anyway, but skip the step explicitly
+            # rather than rely on that.
+            optimizer_policy.step()
 
         with torch.no_grad():
             delta.clamp_(-epsilon, epsilon)
-            u.copy_(project_policy_budget(u, beta, pairs, pi))
+            if policy_inner_mode == "joint":
+                u.copy_(project_policy_budget(u, beta, pairs, pi))
 
         hinge_window.append(L_pen.item() > 0)
         if len(hinge_window) > WINDOW_SIZE:
@@ -941,7 +1050,28 @@ def optimize_trigger_policy(
     diag_constraint_tol=1e-8,
     diag_span_projection=True,
     diag_direction_scaling=True,
+    policy_inner_mode="joint",
+    policy_inner_steps=1,
+    policy_inner_iters=200,
+    policy_inner_tol=1e-8,
+    policy_inner_min_iters=10,
+    policy_inner_ridge=1e-6,
 ):
+    valid_inner_modes = ("joint", "multi_step", "qp_pgd", "qp_pgd_reset")
+    if policy_inner_mode not in valid_inner_modes:
+        raise ValueError(
+            f"policy_inner_mode={policy_inner_mode!r} not in {valid_inner_modes}."
+        )
+    if policy_inner_mode != "joint":
+        print(
+            f"[policy_inner_mode] running with policy_inner_mode={policy_inner_mode!r} -- u is "
+            "pushed toward its conditional optimum u*(delta) BEFORE delta's own update each "
+            "batch (see optimize_trigger_policy_step's docstring); delta's gradient uses u held "
+            "constant (stop-gradient through the inner solve, not yet the Danskin/implicit-"
+            "gradient solver). This is an EXPERIMENTAL alternative to the default 'joint' "
+            "co-descent, for diagnosing policy lag -- not the default behavior."
+        )
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
     Path(output_dir_policy).mkdir(parents=True, exist_ok=True)
@@ -1249,6 +1379,12 @@ def optimize_trigger_policy(
             diag_constraint_tol=diag_constraint_tol,
             diag_span_projection=diag_span_projection,
             diag_direction_scaling=diag_direction_scaling,
+            policy_inner_mode=policy_inner_mode,
+            policy_inner_steps=policy_inner_steps,
+            policy_inner_iters=policy_inner_iters,
+            policy_inner_tol=policy_inner_tol,
+            policy_inner_min_iters=policy_inner_min_iters,
+            policy_inner_ridge=policy_inner_ridge,
         )
 
         del expert_models
@@ -1394,6 +1530,13 @@ def run(experiment_name, module_name, **kwargs):
     diag_span_projection = args.get("diag_span_projection", True)
     diag_direction_scaling = args.get("diag_direction_scaling", True)
 
+    policy_inner_mode = args.get("policy_inner_mode", "joint")
+    policy_inner_steps = args.get("policy_inner_steps", 1)
+    policy_inner_iters = args.get("policy_inner_iters", 200)
+    policy_inner_tol = args.get("policy_inner_tol", 1e-8)
+    policy_inner_min_iters = args.get("policy_inner_min_iters", 10)
+    policy_inner_ridge = args.get("policy_inner_ridge", 1e-6)
+
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
     policy_optim_kwargs = args.get("policy_optim_kwargs", {})
@@ -1486,6 +1629,12 @@ def run(experiment_name, module_name, **kwargs):
         diag_constraint_tol=diag_constraint_tol,
         diag_span_projection=diag_span_projection,
         diag_direction_scaling=diag_direction_scaling,
+        policy_inner_mode=policy_inner_mode,
+        policy_inner_steps=policy_inner_steps,
+        policy_inner_iters=policy_inner_iters,
+        policy_inner_tol=policy_inner_tol,
+        policy_inner_min_iters=policy_inner_min_iters,
+        policy_inner_ridge=policy_inner_ridge,
     )
 
     print("Optimized trigger and policy obtained.")

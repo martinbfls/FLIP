@@ -119,6 +119,36 @@ DIAG_CONSTRAINT_TOL = 1e-8
 DIAG_SPAN_PROJECTION = True
 DIAG_DIRECTION_SCALING = True
 
+# --------------------------------------------------------------------------- #
+# Controlled inner-solve experiment (modules/federated_optimizing_trigger_policy/inner_solve.py)
+# -- these module-level defaults ("joint", the unchanged co-descent) are what
+# generate_cell/generate_single_cell/generate_minimal_campaign/generate_all_configs use UNLESS
+# overridden per-call. generate_inner_solve_comparison (below) is the dedicated entry point for
+# actually comparing modes: it generates one sibling cell PER variant in INNER_SOLVE_VARIANTS,
+# temporarily overriding these globals, and does not change what a normal campaign generates.
+# --------------------------------------------------------------------------- #
+POLICY_INNER_MODE = "joint"
+POLICY_INNER_STEPS = 1
+POLICY_INNER_ITERS = 200
+POLICY_INNER_TOL = 1e-8
+POLICY_INNER_MIN_ITERS = 10
+POLICY_INNER_RIDGE = 1e-6
+
+# The 5 comparison configurations from the diagnostics task's Section 12: baseline, two
+# multi_step depths, and two qp_pgd rigor levels -- (variant_tag, override dict) pairs, applied
+# on top of the POLICY_INNER_* defaults above (only the listed keys are overridden).
+INNER_SOLVE_VARIANTS = [
+    ("joint", {"policy_inner_mode": "joint"}),
+    ("multi_step5", {"policy_inner_mode": "multi_step", "policy_inner_steps": 5}),
+    ("multi_step20", {"policy_inner_mode": "multi_step", "policy_inner_steps": 20}),
+    ("qp_pgd200", {
+        "policy_inner_mode": "qp_pgd", "policy_inner_iters": 200, "policy_inner_tol": 1e-8,
+    }),
+    ("qp_pgd1000", {
+        "policy_inner_mode": "qp_pgd", "policy_inner_iters": 1000, "policy_inner_tol": 1e-10,
+    }),
+]
+
 
 def _toml_bool(x):
     return "true" if x else "false"
@@ -253,6 +283,15 @@ diag_constraint_tol = {diag_constraint_tol}
 diag_span_projection = {diag_span_projection}
 diag_direction_scaling = {diag_direction_scaling}
 
+# Controlled inner-solve experiment (modules/federated_optimizing_trigger_policy/inner_solve.py)
+# -- "joint" (default) is the unchanged co-descent; see that module's docstring for the others.
+policy_inner_mode = "{policy_inner_mode}"
+policy_inner_steps = {policy_inner_steps}
+policy_inner_iters = {policy_inner_iters}
+policy_inner_tol = {policy_inner_tol}
+policy_inner_min_iters = {policy_inner_min_iters}
+policy_inner_ridge = {policy_inner_ridge}
+
 [federated_optimizing_trigger_policy.expert_config]
 experts = 1
 min = 0
@@ -289,7 +328,16 @@ def cell_name(model_flag, dataset, seed, budget_target):
     return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/budget{budget_target}/seed{seed}"
 
 
-def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
+def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False,
+                   policy_inner_overrides=None, cell_tag_suffix=None):
+    '''
+    policy_inner_overrides: optional dict overriding any of policy_inner_mode/_steps/_iters/
+    _tol/_min_iters/_ridge for THIS cell only (on top of the POLICY_INNER_* module defaults,
+    "joint") -- used by generate_inner_solve_comparison, below, to generate one sibling cell
+    per inner-solve variant without touching the module defaults a normal campaign uses.
+    cell_tag_suffix: optional string appended to this cell's directory/tag, so several variants
+    of the SAME (model, dataset, seed, budget) don't overwrite each other's config.toml.
+    '''
     beta_local, gamma, beta_global, n_train = resolve_beta_gamma(
         budget_target, dataset, NUM_POISONED, NUM_HONESTS,
     )
@@ -299,7 +347,17 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
         if s_beta > 1 else "unsaturated -- lambda=beta justified (prop:budget-match)"
     lambda_poison_resolved = beta_global if LAMBDA_POISON == "beta" else float(LAMBDA_POISON)
 
+    policy_inner = dict(
+        policy_inner_mode=POLICY_INNER_MODE, policy_inner_steps=POLICY_INNER_STEPS,
+        policy_inner_iters=POLICY_INNER_ITERS, policy_inner_tol=POLICY_INNER_TOL,
+        policy_inner_min_iters=POLICY_INNER_MIN_ITERS, policy_inner_ridge=POLICY_INNER_RIDGE,
+    )
+    if policy_inner_overrides:
+        policy_inner.update(policy_inner_overrides)
+
     cell_tag = f"budget{budget_target}_seed{seed}"
+    if cell_tag_suffix:
+        cell_tag = f"{cell_tag}_{cell_tag_suffix}"
 
     if beta_local > 1:
         reason = (
@@ -322,6 +380,8 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
     milestones = MILESTONE.get(model_flag, [75, 125])
 
     cell_dir = EXP_BASE / cell_name(model_flag, dataset, seed, budget_target)
+    if cell_tag_suffix:
+        cell_dir = cell_dir / cell_tag_suffix
     train_expert_dir = EXP_BASE / f"train_expert/{model_flag}_1xs"
     policy_dir = cell_dir / "policy_opt"
     flips_dir = cell_dir / "policy_to_flips"
@@ -357,6 +417,12 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False):
             diag_constraint_tol=DIAG_CONSTRAINT_TOL,
             diag_span_projection=_toml_bool(DIAG_SPAN_PROJECTION),
             diag_direction_scaling=_toml_bool(DIAG_DIRECTION_SCALING),
+            policy_inner_mode=policy_inner["policy_inner_mode"],
+            policy_inner_steps=policy_inner["policy_inner_steps"],
+            policy_inner_iters=policy_inner["policy_inner_iters"],
+            policy_inner_tol=policy_inner["policy_inner_tol"],
+            policy_inner_min_iters=policy_inner["policy_inner_min_iters"],
+            policy_inner_ridge=policy_inner["policy_inner_ridge"],
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
             cell_dir=policy_dir, model_flag=model_flag, dataset=dataset,
@@ -438,6 +504,28 @@ def generate_all_configs(dry_run=False):
     return all_paths, refused
 
 
+def generate_inner_solve_comparison(dry_run=True):
+    """
+    Section 12 of the inner-solve diagnostics task: generates ONE cell (first model/dataset/
+    seed/budget, same as generate_single_cell) PER variant in INNER_SOLVE_VARIANTS -- baseline
+    "joint", multi_step at 5/20 inner steps, and qp_pgd at 200/1000 iterations -- each in its
+    own inner_<tag> subdirectory (via cell_tag_suffix) so they can be run and compared side by
+    side without overwriting each other. Does NOT touch the module-level POLICY_INNER_* defaults
+    (those stay "joint") -- each variant's overrides are passed in per-call via
+    policy_inner_overrides, exactly as generate_cell's own docstring describes.
+    """
+    all_paths, refused = [], []
+    for tag, overrides in INNER_SOLVE_VARIANTS:
+        paths, reason = generate_cell(
+            MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+            policy_inner_overrides=overrides, cell_tag_suffix=f"inner_{tag}",
+        )
+        all_paths += paths
+        if reason:
+            refused.append((MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason))
+    return all_paths, refused
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -447,13 +535,24 @@ if __name__ == "__main__":
         help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
              "preliminary campaign",
     )
+    parser.add_argument(
+        "--inner-solve-comparison", action="store_true",
+        help="one cell per policy_inner_mode variant (joint/multi_step5/multi_step20/"
+             "qp_pgd200/qp_pgd1000), same (model, dataset, seed, budget) as --single-cell, in "
+             "sibling inner_<tag> subdirectories -- for comparing the controlled inner-solve "
+             "experiment (modules/federated_optimizing_trigger_policy/inner_solve.py).",
+    )
     args = parser.parse_args()
-    assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
+    assert sum([args.minimal, args.single_cell, args.inner_solve_comparison]) <= 1, (
+        "pass at most one of --minimal/--single-cell/--inner-solve-comparison"
+    )
 
     if args.single_cell:
         gen_fn = generate_single_cell
     elif args.minimal:
         gen_fn = generate_minimal_campaign
+    elif args.inner_solve_comparison:
+        gen_fn = generate_inner_solve_comparison
     else:
         gen_fn = generate_all_configs
     paths, refused = gen_fn(dry_run=args.dry_run)
