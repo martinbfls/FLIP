@@ -179,7 +179,7 @@ DEP=""
 
 if [ "$RUN_EXPERT" = "1" ]; then
     TIME_PER_TASK="$EXPERT_TIME"
-    submit_job_pool_slurm EXPERT_JOBS "expert" "" || exit 1
+    submit_job_pool_slurm EXPERT_JOBS "joint_expert" "" || exit 1
     expert_barrier=$(submit_barrier_slurm "joint_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
     DEP="afterok:$expert_barrier"
     echo "[PHASE] EXPERT submitted (${#EXPERT_JOBS[@]} jobs) -> barrier $expert_barrier"
@@ -189,17 +189,17 @@ else
 fi
 
 TIME_PER_TASK="$GEN_TIME"
-submit_job_pool_slurm GEN_JOBS "gen" "$DEP" || exit 1
+submit_job_pool_slurm GEN_JOBS "joint_gen" "$DEP" || exit 1
 gen_barrier=$(submit_barrier_slurm "joint_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] GEN submitted (${#GEN_JOBS[@]} jobs) -> barrier $gen_barrier"
 
 TIME_PER_TASK="$FLIPS_TIME"
-submit_job_pool_slurm FLIPS_JOBS "flips" "afterok:$gen_barrier" || exit 1
+submit_job_pool_slurm FLIPS_JOBS "joint_flips" "afterok:$gen_barrier" || exit 1
 flips_barrier=$(submit_barrier_slurm "joint_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs) -> barrier $flips_barrier"
 
 TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm USER_JOBS "user" "afterok:$flips_barrier" || exit 1
+submit_job_pool_slurm USER_JOBS "joint_user" "afterok:$flips_barrier" || exit 1
 echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
 
 echo "[DONE] campaign submitted; job ids in $LOG_DIR/jobids_*.txt"

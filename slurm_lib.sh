@@ -37,7 +37,7 @@ set -u
 SLURM_PARTITION="${SLURM_PARTITION:-cypress_dgx}"
 # R&D Line / account required by this cluster. Run `slurmaccounts` to list
 # the accounts you may charge jobs to. Nothing can be submitted without it.
-SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
+SLURM_ACCOUNT="${SLURM_ACCOUNT:-power}"
 GPUS_PER_TASK="${GPUS_PER_TASK:-1}"          # GPUs per experiment
 # 8 x 16 = 128 = the whole node, leaving no room for the barrier or for
 # other users' jobs. 14 keeps 8 concurrent runs achievable (8 x 14 = 112).

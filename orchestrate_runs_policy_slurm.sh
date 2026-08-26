@@ -219,7 +219,7 @@ DEP=""
 
 if [ "$RUN_EXPERT" = "1" ]; then
     TIME_PER_TASK="$EXPERT_TIME"
-    submit_job_pool_slurm EXPERT_JOBS "expert" "" || exit 1
+    submit_job_pool_slurm EXPERT_JOBS "pol_expert" "" || exit 1
     expert_barrier=$(submit_barrier_slurm "pol_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
     DEP="afterok:$expert_barrier"
     echo "[PHASE] EXPERT submitted (${#EXPERT_JOBS[@]} jobs) -> barrier $expert_barrier"
@@ -229,7 +229,7 @@ else
 fi
 
 TIME_PER_TASK="$POLICY_TIME"
-submit_job_pool_slurm POLICY_JOBS "policy" "$DEP" || exit 1
+submit_job_pool_slurm POLICY_JOBS "pol_policy" "$DEP" || exit 1
 policy_barrier=$(submit_barrier_slurm "pol_barrier_policy" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] POLICY submitted (${#POLICY_JOBS[@]} jobs) -> barrier $policy_barrier"
 
@@ -238,13 +238,13 @@ echo "[PHASE] POLICY submitted (${#POLICY_JOBS[@]} jobs) -> barrier $policy_barr
 # walltime and memory instead, so these short jobs do not hold a full slot.
 TIME_PER_TASK="$FLIPS_TIME"
 MEM_PER_TASK="$FLIPS_MEM"
-submit_job_pool_slurm FLIPS_JOBS "flips" "afterok:$policy_barrier" || exit 1
+submit_job_pool_slurm FLIPS_JOBS "pol_flips" "afterok:$policy_barrier" || exit 1
 flips_barrier=$(submit_barrier_slurm "pol_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs) -> barrier $flips_barrier"
 
 TIME_PER_TASK="$USER_TIME"
 MEM_PER_TASK="${MEM_PER_TASK_USER:-32G}"
-submit_job_pool_slurm USER_JOBS "user" "afterok:$flips_barrier" || exit 1
+submit_job_pool_slurm USER_JOBS "pol_user" "afterok:$flips_barrier" || exit 1
 echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
 
 echo "[DONE] campaign submitted; job ids in $LOG_DIR/jobids_*.txt"
