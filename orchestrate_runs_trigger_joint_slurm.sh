@@ -23,12 +23,15 @@
 #        |
 #   [USER]    federated_train_user
 #
-# Sweep axes and config paths below are read DIRECTLY from
+# Sweep axes and config paths below MUST match
 # modules/federated_generate_labels_trigger_joint/gen_configs.py (the module
-# that actually writes these configs) instead of being duplicated here --
-# gen_configs.py has no env-var/CLI overrides of its own, so any hardcoded
-# copy of its constants silently drifts out of sync the first time someone
-# edits the grid there. Edit the grid in gen_configs.py; this script follows.
+# that actually writes these configs) -- gen_configs.py has no env-var/CLI
+# overrides of its own, so this grid is filled in BY HAND below and has to be
+# kept in sync manually every time the grid in gen_configs.py changes.
+# (Deliberately not read out of gen_configs.py via `python -c ...`: that
+# import pulls in torch/toml, which are only available once the conda env is
+# activated, and this script is meant to be runnable from a bare login shell
+# before that happens.)
 #
 # Usage:
 #   1. Generate the configs (from BASE_DIR):
@@ -57,52 +60,23 @@ FLIPS_TIME="${FLIPS_TIME:-02:00:00}"
 USER_TIME="${USER_TIME:-1-00:00:00}"
 
 # ---------------------------------------------------------------------------
-# Pull the sweep grid + directory layout straight out of gen_configs.py, as
-# one JSON blob, so this script can never disagree with the module that
-# actually wrote the configs on disk.
+# CAMPAIGN GRID -- fill in by hand, kept in sync with
+# modules/federated_generate_labels_trigger_joint/gen_configs.py. Values
+# below are that file's CURRENT defaults; re-copy them here whenever the
+# grid in gen_configs.py changes. All overridable from the environment.
 # ---------------------------------------------------------------------------
-PLAN_JSON=$(python - <<'PY'
-import json
-from pathlib import Path
+read -ra MODEL_FLAGS <<< "${MODEL_FLAGS:-r32p}"
+read -ra DATASETS    <<< "${DATASETS:-cifar}"
+read -ra AGG_METHODS <<< "${AGG_METHODS:-mean multikrum}"
+read -ra SEEDS       <<< "${SEEDS:-0}"
+read -ra BUDGETS     <<< "${BUDGETS:-150 300 500 1000 2000 2500 5000}"
 
-from modules.federated_generate_labels_trigger_joint import gen_configs as g
+NUM_POISONED="${NUM_POISONED:-3}"
+NUM_HONESTS="${NUM_HONESTS:-7}"
 
-exp_root = Path("experiments").resolve()
-exp_base_rel = str(g.EXP_BASE.relative_to(exp_root))
-
-print(json.dumps({
-    "model_flags": g.MODEL_FLAGS,
-    "datasets": g.DATASETS,
-    "agg_methods": g.AGG_METHODS,
-    "seeds": g.SEEDS,
-    "budgets": g.BUDGETS,
-    "num_poisoned": g.NUM_POISONED,
-    "num_honests": g.NUM_HONESTS,
-    "checkpoint_sampling": g.CHECKPOINT_SAMPLING,
-    "indirect_checkpoint_sampling": g.INDIRECT_MODULE_CHECKPOINT_SAMPLING,
-    "exp_base_rel": exp_base_rel,
-}))
-PY
-)
-
-read -ra MODEL_FLAGS <<< "$(python -c "import json,sys; print(' '.join(json.loads(sys.argv[1])['model_flags']))" "$PLAN_JSON")"
-read -ra DATASETS    <<< "$(python -c "import json,sys; print(' '.join(json.loads(sys.argv[1])['datasets']))" "$PLAN_JSON")"
-read -ra AGG_METHODS <<< "$(python -c "import json,sys; print(' '.join(json.loads(sys.argv[1])['agg_methods']))" "$PLAN_JSON")"
-read -ra SEEDS       <<< "$(python -c "import json,sys; print(' '.join(str(x) for x in json.loads(sys.argv[1])['seeds']))" "$PLAN_JSON")"
-read -ra BUDGETS     <<< "$(python -c "import json,sys; print(' '.join(str(x) for x in json.loads(sys.argv[1])['budgets']))" "$PLAN_JSON")"
-
-NUM_POISONED=$(python -c "import json,sys; print(json.loads(sys.argv[1])['num_poisoned'])" "$PLAN_JSON")
-NUM_HONESTS=$(python -c "import json,sys; print(json.loads(sys.argv[1])['num_honests'])" "$PLAN_JSON")
-CHECKPOINT_SAMPLING=$(python -c "import json,sys; print(json.loads(sys.argv[1])['checkpoint_sampling'])" "$PLAN_JSON")
-INDIRECT_CHECKPOINT_SAMPLING=$(python -c "import json,sys; print(json.loads(sys.argv[1])['indirect_checkpoint_sampling'])" "$PLAN_JSON")
-EXP_BASE_REL=$(python -c "import json,sys; print(json.loads(sys.argv[1])['exp_base_rel'])" "$PLAN_JSON")
-
-if [ "$CHECKPOINT_SAMPLING" != "$INDIRECT_CHECKPOINT_SAMPLING" ]; then
-    echo "[NOTE] gen_configs.py's CHECKPOINT_SAMPLING=$CHECKPOINT_SAMPLING differs from the" >&2
-    echo "[NOTE] sibling indirect module's default ($INDIRECT_CHECKPOINT_SAMPLING) -- an" >&2
-    echo "[NOTE] indirect-vs-joint comparison crosses this factor too. This is only a" >&2
-    echo "[NOTE] property of the already-generated configs; nothing to set here." >&2
-fi
+# gen_configs.py's EXP_BASE, relative to experiments/ (what run_experiment.py
+# expects: it prepends "experiments/" and appends "/config.toml" itself).
+EXP_BASE_REL="${EXP_BASE_REL:-federated_experiments/threat_model_direct_trigger_joint}"
 
 # ---------------------------------------------------------------------------
 # Helpers -- mirror gen_configs.py's cell_name()/directory layout exactly.
