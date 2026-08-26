@@ -54,10 +54,10 @@ source "$SCRIPT_DIR/slurm_lib.sh"
 RUN_EXPERT="${RUN_EXPERT:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
-EXPERT_TIME="${EXPERT_TIME:-1-00:00:00}"
+EXPERT_TIME="${EXPERT_TIME:-0-00:10:00}"
 GEN_TIME="${GEN_TIME:-1-00:00:00}"
-FLIPS_TIME="${FLIPS_TIME:-02:00:00}"
-USER_TIME="${USER_TIME:-1-00:00:00}"
+FLIPS_TIME="${FLIPS_TIME:-00:10:00}"
+USER_TIME="${USER_TIME:-0-01:00:00}"
 
 # ---------------------------------------------------------------------------
 # CAMPAIGN GRID -- fill in by hand, kept in sync with
@@ -68,7 +68,7 @@ USER_TIME="${USER_TIME:-1-00:00:00}"
 read -ra MODEL_FLAGS <<< "${MODEL_FLAGS:-r32p}"
 read -ra DATASETS    <<< "${DATASETS:-cifar}"
 read -ra AGG_METHODS <<< "${AGG_METHODS:-mean multikrum}"
-read -ra SEEDS       <<< "${SEEDS:-0}"
+read -ra SEEDS       <<< "${SEEDS:-0 1 2 3 4 5 6 7 8 9}"
 read -ra BUDGETS     <<< "${BUDGETS:-150 300 500 1000 2000 2500 5000}"
 
 NUM_POISONED="${NUM_POISONED:-3}"

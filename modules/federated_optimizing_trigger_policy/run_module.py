@@ -150,6 +150,7 @@ def _compute_step_policy(
     checkpoint_backward,
     lambda_bd,
     run_diag,
+    lambda_b2=1.0,
     diag_qp_iters=50,
     diag_qp_convergence=False,
     diag_qp_check_iters=(50, 200, 1000),
@@ -339,12 +340,14 @@ def _compute_step_policy(
             sq_err_qp = ((G_obj @ w_star - v.detach()) ** 2).sum()
             B2_qp_relaxed_k = (sq_err_qp / den_qp).detach()
 
-        # Diagnostic G (Section 8): grad_delta B2_k and grad_delta (lambda_bd*L_bd_k),
-        # measured SEPARATELY via non-accumulating, graph-preserving `torch.autograd.grad`
-        # calls -- BEFORE the real `step_loss.backward()` below, which is the (only) call
-        # allowed to touch delta.grad and, under checkpoint_backward, frees the graph.
+        # Diagnostic G (Section 8): grad_delta (lambda_b2*B2_k) and grad_delta (lambda_bd*L_bd_k)
+        # -- the ACTUAL weighted contributions as they appear in step_loss below (grad is
+        # linear, so this is just lambda_b2*grad(B2_k) under the hood) -- measured SEPARATELY
+        # via non-accumulating, graph-preserving `torch.autograd.grad` calls, BEFORE the real
+        # `step_loss.backward()` below, which is the (only) call allowed to touch delta.grad
+        # and, under checkpoint_backward, frees the graph.
         if run_diag and diag_gradient_balance and has_poison:
-            g_B2_norm, g_BD_norm = diag.gradient_balance(B2_k, L_bd_k, lambda_bd, delta)
+            g_B2_norm, g_BD_norm = diag.gradient_balance(lambda_b2 * B2_k, L_bd_k, lambda_bd, delta)
             if g_B2_norm is not None:
                 grad_B2_norm_sum = g_B2_norm if grad_B2_norm_sum is None else grad_B2_norm_sum + g_B2_norm
                 grad_BD_norm_sum = g_BD_norm if grad_BD_norm_sum is None else grad_BD_norm_sum + g_BD_norm
@@ -365,7 +368,7 @@ def _compute_step_policy(
             }
 
         if checkpoint_backward:
-            step_loss = (B2_k + lambda_bd * L_bd_k) / n_exp
+            step_loss = (lambda_b2 * B2_k + lambda_bd * L_bd_k) / n_exp
             step_loss.backward()
             B2_k, L_bd_k = B2_k.detach(), L_bd_k.detach()
             B2_rho_k, B2_v_k = B2_rho_k.detach(), B2_v_k.detach()
@@ -651,6 +654,7 @@ def optimize_trigger_policy_step(
     policy_inner_tol=1e-8,
     policy_inner_min_iters=10,
     policy_inner_ridge=1e-6,
+    lambda_b2=1.0,
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -859,6 +863,7 @@ def optimize_trigger_policy_step(
             diag_span_projection=diag_span_projection,
             diag_direction_scaling=diag_direction_scaling,
             precomputed=precomputed,
+            lambda_b2=lambda_b2,
         )
         B2, L_bd = result["B2"], result["L_bd"]
 
@@ -909,7 +914,7 @@ def optimize_trigger_policy_step(
             L_reg.backward()
         else:
             L_tot = (
-                B2
+                lambda_b2 * B2
                 + lambda_bd * L_bd
                 + lambda_penalty * L_pen
                 + lambda_delta * delta.norm()
@@ -1056,6 +1061,7 @@ def optimize_trigger_policy(
     policy_inner_tol=1e-8,
     policy_inner_min_iters=10,
     policy_inner_ridge=1e-6,
+    lambda_b2=1.0,
 ):
     valid_inner_modes = ("joint", "multi_step", "qp_pgd", "qp_pgd_reset")
     if policy_inner_mode not in valid_inner_modes:
@@ -1385,6 +1391,7 @@ def optimize_trigger_policy(
             policy_inner_tol=policy_inner_tol,
             policy_inner_min_iters=policy_inner_min_iters,
             policy_inner_ridge=policy_inner_ridge,
+            lambda_b2=lambda_b2,
         )
 
         del expert_models
@@ -1477,6 +1484,7 @@ def run(experiment_name, module_name, **kwargs):
     num_poisoned = args.get("num_poisoned", 5)
 
     lambda_bd = args.get("lambda_bd", 1.0)
+    lambda_b2 = args.get("lambda_b2", 1.0)
     lambda_penalty = args.get("lambda_penalty", 0.0)
     lambda_delta = args.get("lambda_delta", 0.0)
     lambda_tv = args.get("lambda_tv", 0.0)
@@ -1635,6 +1643,7 @@ def run(experiment_name, module_name, **kwargs):
         policy_inner_tol=policy_inner_tol,
         policy_inner_min_iters=policy_inner_min_iters,
         policy_inner_ridge=policy_inner_ridge,
+        lambda_b2=lambda_b2,
     )
 
     print("Optimized trigger and policy obtained.")

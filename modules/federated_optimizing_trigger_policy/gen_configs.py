@@ -21,6 +21,7 @@ beta_global/gamma/s_beta/lambda_poison), a cell with beta_local > 1 is refused o
 (lem:beta-bar: infeasible, no allocation of a global budget under gamma exists), and s_beta > 1
 is a warning (rem:saturated: lambda=beta is not theoretically justified there, still generated).
 """
+
 import argparse
 import os
 from pathlib import Path
@@ -33,14 +34,14 @@ import toml
 # --------------------------------------------------------------------------- #
 NUM_POISONED = 3
 NUM_HONESTS = 7
-SEEDS = [0]
+SEEDS = [1]
 # Target GLOBAL flip budgets, aligned with the other two generators' BUDGETS -- converted to
 # this module's own LOCAL beta below (beta_local = (budget/n_train) / gamma).
 BUDGETS_TARGET = [1500]
 AGG_METHODS = ["mean"]  # logged only -- (P^mean) has no agg_method of its own (mean
-                                   # aggregation is the (P^mean) formulation itself); kept as an
-                                   # axis purely so directory names/campaign size line up 1:1
-                                   # with the other two modules for comparison.
+# aggregation is the (P^mean) formulation itself); kept as an
+# axis purely so directory names/campaign size line up 1:1
+# with the other two modules for comparison.
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
@@ -48,7 +49,9 @@ TARGET_LABEL = 4
 
 N_TRAIN = {"cifar": 50000, "cifar_100": 50000, "svhn": 73257}
 
-LAMBDA_POISON = "beta"  # "beta" (A1-corrected: resolves to beta_global) or a numeric override
+LAMBDA_POISON = (
+    "beta"  # "beta" (A1-corrected: resolves to beta_global) or a numeric override
+)
 ALPHA_CKPT = 0.01
 NUM_CHCKPT = 4
 CHECKPOINT_ITERS = 50
@@ -65,26 +68,34 @@ EPOCHS_EXPERT = 20
 # `single_cell` mode (see generate_single_cell / --single-cell) fixes ALL of these to the
 # defaults below and sweeps only the main axes (SEEDS/BUDGETS_TARGET).
 # --------------------------------------------------------------------------- #
-EPSILON = 0.1         # L_infinity bound on the trigger delta -- larger allows a stronger/more
-                       # visible perturbation; too small can make the backdoor unreachable.
-LR_DELTA = 1e-2        # Adam learning rate for the trigger optimization.
-LR_POLICY = 1e-2       # Adam learning rate for the policy u optimization.
-LAMBDA_BD = 1.0        # weight of the backdoor-efficacy loss (kappa in the P^mean formula) --
-                       # higher pushes harder for backdoor success at the cost of the B2
-                       # alignment term.
-LAMBDA_DELTA = 0.0     # L2 norm penalty on delta ("lambda_trigger_l2") -- 0.0 (schema
-                       # default) leaves the trigger magnitude unregularized beyond the
-                       # epsilon clamp.
-NORMALIZATION = "rho"  # B2's denominator: "rho" (eq:rho, non-saturating) or "v" (legacy,
-                       # saturates once v leaves the reachable set). See schema for the tradeoff.
-DIAG_EVERY = 50        # frequency (in batches) of the QP diagnostic (B2_qp) against the
-                       # co-descended policy -- lower gives a tighter Danskin-gap read, at
-                       # the cost of solving the QP more often.
-N_STEPS = 20           # number of outer (retrain expert + optimize trigger/policy) steps.
-POLICY_EPOCHS = 20     # epochs of expert retraining PER outer step -- distinct from both
-                       # EPOCHS_EXPERT (the bootstrap expert above) and federated_train_user's
-                       # own epochs (unset in TRAIN_USER_TEMPLATE below, so it falls back to
-                       # modules/base_utils/util.py's DEFAULT_SGD_EPOCHS=200).
+EPSILON = 0.1  # L_infinity bound on the trigger delta -- larger allows a stronger/more
+# visible perturbation; too small can make the backdoor unreachable.
+LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization.
+LR_POLICY = 1e-2  # Adam learning rate for the policy u optimization.
+LAMBDA_BD = 1.0  # weight of the backdoor-efficacy loss (kappa in the P^mean formula) --
+# higher pushes harder for backdoor success at the cost of the B2
+# alignment term.
+LAMBDA_B2 = 1.0  # EXPERIMENTAL (diagnostics task, Experiment D): weight on B2 itself,
+# alongside LAMBDA_BD's weight on L_bd -- eq:P has no free coefficient
+# here (implicitly 1); raised in EXPERIMENT_VARIANTS below to counteract
+# a low grad_delta_ratio (delta's gradient dominated by L_bd, B2's own
+# signal to delta comparatively weak). 1.0 = unweighted, the original
+# behavior.
+LAMBDA_DELTA = 0.0  # L2 norm penalty on delta ("lambda_trigger_l2") -- 0.0 (schema
+# default) leaves the trigger magnitude unregularized beyond the
+# epsilon clamp.
+NORMALIZATION = (
+    "rho"  # B2's denominator: "rho" (eq:rho, non-saturating) or "v" (legacy,
+)
+# saturates once v leaves the reachable set). See schema for the tradeoff.
+DIAG_EVERY = 50  # frequency (in batches) of the QP diagnostic (B2_qp) against the
+# co-descended policy -- lower gives a tighter Danskin-gap read, at
+# the cost of solving the QP more often.
+N_STEPS = 1  # number of outer (retrain expert + optimize trigger/policy) steps.
+POLICY_EPOCHS = 20  # epochs of expert retraining PER outer step -- distinct from both
+# EPOCHS_EXPERT (the bootstrap expert above) and federated_train_user's
+# own epochs (unset in TRAIN_USER_TEMPLATE below, so it falls back to
+# modules/base_utils/util.py's DEFAULT_SGD_EPOCHS=200).
 
 # --------------------------------------------------------------------------- #
 # Diagnostics (modules/federated_optimizing_trigger_policy/diagnostics.py) -- every generated
@@ -134,19 +145,72 @@ POLICY_INNER_TOL = 1e-8
 POLICY_INNER_MIN_ITERS = 10
 POLICY_INNER_RIDGE = 1e-6
 
-# The 5 comparison configurations from the diagnostics task's Section 12: baseline, two
-# multi_step depths, and two qp_pgd rigor levels -- (variant_tag, override dict) pairs, applied
-# on top of the POLICY_INNER_* defaults above (only the listed keys are overridden).
+# Comparison configurations, extended after the follow-up diagnostics round (B2 >> B2_qp
+# persists even with the inner solve; grad_delta_ratio << 1 most batches; span geometry is
+# mostly favorable past batch 0): the ORIGINAL 5 (Experiments A/B/C -- baseline, two multi_step
+# depths, two qp_pgd rigor levels) plus Experiment D (lambda_b2, counteracting a low
+# grad_delta_ratio), Experiment E (two-timescale lr: u fast, delta slow), and the "decisive
+# combo" the analysis converged on -- an oracle-quality u (qp_pgd at 1000 iters) SO delta's own
+# gradient is evaluated against a near-exact conditional optimum, combined with D+E so delta
+# cannot simply out-run it again. (variant_tag, override dict) pairs, applied on top of the
+# POLICY_INNER_*/LAMBDA_B2/LR_DELTA/LR_POLICY module defaults above (only the listed keys are
+# overridden per variant).
 INNER_SOLVE_VARIANTS = [
     ("joint", {"policy_inner_mode": "joint"}),
     ("multi_step5", {"policy_inner_mode": "multi_step", "policy_inner_steps": 5}),
     ("multi_step20", {"policy_inner_mode": "multi_step", "policy_inner_steps": 20}),
-    ("qp_pgd200", {
-        "policy_inner_mode": "qp_pgd", "policy_inner_iters": 200, "policy_inner_tol": 1e-8,
-    }),
-    ("qp_pgd1000", {
-        "policy_inner_mode": "qp_pgd", "policy_inner_iters": 1000, "policy_inner_tol": 1e-10,
-    }),
+    (
+        "qp_pgd200",
+        {
+            "policy_inner_mode": "qp_pgd",
+            "policy_inner_iters": 200,
+            "policy_inner_tol": 1e-8,
+        },
+    ),
+    (
+        "qp_pgd1000",
+        {
+            "policy_inner_mode": "qp_pgd",
+            "policy_inner_iters": 1000,
+            "policy_inner_tol": 1e-10,
+        },
+    ),
+    # Experiment D (isolated): joint co-descent, but B2 weighted up so delta's gradient is not
+    # dominated by L_bd alone (see grad_delta_ratio in diagnostics.jsonl).
+    ("lambda_b2_10", {"policy_inner_mode": "joint", "lambda_b2": 10.0}),
+    ("lambda_b2_100", {"policy_inner_mode": "joint", "lambda_b2": 100.0}),
+    # Experiment E (isolated): two-timescale learning rates -- u fast, delta slow -- still
+    # "joint" co-descent (no inner solve), to isolate the lr effect from the inner-solve one.
+    (
+        "two_timescale",
+        {
+            "policy_inner_mode": "joint",
+            "lr_delta": 1e-3,
+            "lr_policy": 1e-2,
+        },
+    ),
+    (
+        "two_timescale_aggressive",
+        {
+            "policy_inner_mode": "joint",
+            "lr_delta": 3e-4,
+            "lr_policy": 3e-2,
+        },
+    ),
+    # The decisive combo: near-exact u (qp_pgd, 1000 iters) + B2 upweighted (D) + delta slowed
+    # down relative to u (E) -- if the attack STILL fails here, per the analysis, the bottleneck
+    # is no longer u's optimization but the geometry of the reachable gradient set itself.
+    (
+        "decisive_combo",
+        {
+            "policy_inner_mode": "qp_pgd",
+            "policy_inner_iters": 1000,
+            "policy_inner_tol": 1e-10,
+            "lambda_b2": 10.0,
+            "lr_delta": 1e-3,
+            "lr_policy": 1e-2,
+        },
+    ),
 ]
 
 
@@ -160,7 +224,9 @@ MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
 
 CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 
-EXP_BASE = Path("experiments/federated_experiments/threat_model_expert_policy").resolve()
+EXP_BASE = Path(
+    "experiments/federated_experiments/threat_model_expert_policy"
+).resolve()
 
 MODULE_NAME = "federated_optimizing_trigger_policy"
 
@@ -175,7 +241,9 @@ def validate_config(path: Path):
     exp_toml = toml.load(path)
     for module_name, module_config in exp_toml.items():
         schema_path = Path("schemas") / f"{module_name}.toml"
-        assert schema_path.exists(), f"Malformed module! Schema {schema_path} does not exist."
+        assert schema_path.exists(), (
+            f"Malformed module! Schema {schema_path} does not exist."
+        )
         schema = toml.load(schema_path)
         optionals = list(schema.get("OPTIONAL", {}).keys())
 
@@ -204,9 +272,11 @@ def resolve_beta_gamma(budget_target, dataset, num_poisoned, num_honests):
     gamma = num_poisoned / (num_poisoned + num_honests)
     beta_theory_global = budget_target / n_train
     beta_local = beta_theory_global / gamma
-    beta_global = gamma * beta_local  # == beta_theory_global, recomputed via the module's own
-                                       # formula rather than reused directly, so this function
-                                       # exercises the SAME algebra run_module.py does (A1/A2).
+    beta_global = (
+        gamma * beta_local
+    )  # == beta_theory_global, recomputed via the module's own
+    # formula rather than reused directly, so this function
+    # exercises the SAME algebra run_module.py does (A1/A2).
     return beta_local, gamma, beta_global, n_train
 
 
@@ -243,6 +313,7 @@ output_dir_trigger = "{cell_dir}/trigger"
 output_dir_policy = "{cell_dir}/policy"
 device = "cuda"
 lambda_bd = {lambda_bd}
+lambda_b2 = {lambda_b2}
 lambda_penalty = 0.0
 lambda_delta = {lambda_delta}
 lambda_tv = 0.0
@@ -328,32 +399,54 @@ def cell_name(model_flag, dataset, seed, budget_target):
     return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/budget{budget_target}/seed{seed}"
 
 
-def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False,
-                   policy_inner_overrides=None, cell_tag_suffix=None):
-    '''
-    policy_inner_overrides: optional dict overriding any of policy_inner_mode/_steps/_iters/
-    _tol/_min_iters/_ridge for THIS cell only (on top of the POLICY_INNER_* module defaults,
-    "joint") -- used by generate_inner_solve_comparison, below, to generate one sibling cell
-    per inner-solve variant without touching the module defaults a normal campaign uses.
+def generate_cell(
+    model_flag,
+    dataset,
+    seed,
+    budget_target,
+    dry_run=False,
+    overrides=None,
+    cell_tag_suffix=None,
+):
+    """
+    overrides: optional dict overriding any of policy_inner_mode/_steps/_iters/_tol/_min_iters/
+    _ridge, lambda_b2, lr_delta, lr_policy for THIS cell only (on top of the module-level
+    defaults below) -- used by generate_inner_solve_comparison to generate one sibling cell per
+    experiment variant (Sections 12/Experiments A-E of the diagnostics task) without touching
+    the defaults a normal campaign uses.
     cell_tag_suffix: optional string appended to this cell's directory/tag, so several variants
     of the SAME (model, dataset, seed, budget) don't overwrite each other's config.toml.
-    '''
+    """
     beta_local, gamma, beta_global, n_train = resolve_beta_gamma(
-        budget_target, dataset, NUM_POISONED, NUM_HONESTS,
+        budget_target,
+        dataset,
+        NUM_POISONED,
+        NUM_HONESTS,
     )
     pi_min_approx = 1.0 / 10  # CIFAR-family: 10 balanced classes: min_y(pi_y) ~= 0.1
     s_beta = beta_global / (gamma * pi_min_approx)
-    s_beta_regime = "SATURATED (rem:saturated) -- lambda=beta not theoretically justified" \
-        if s_beta > 1 else "unsaturated -- lambda=beta justified (prop:budget-match)"
-    lambda_poison_resolved = beta_global if LAMBDA_POISON == "beta" else float(LAMBDA_POISON)
-
-    policy_inner = dict(
-        policy_inner_mode=POLICY_INNER_MODE, policy_inner_steps=POLICY_INNER_STEPS,
-        policy_inner_iters=POLICY_INNER_ITERS, policy_inner_tol=POLICY_INNER_TOL,
-        policy_inner_min_iters=POLICY_INNER_MIN_ITERS, policy_inner_ridge=POLICY_INNER_RIDGE,
+    s_beta_regime = (
+        "SATURATED (rem:saturated) -- lambda=beta not theoretically justified"
+        if s_beta > 1
+        else "unsaturated -- lambda=beta justified (prop:budget-match)"
     )
-    if policy_inner_overrides:
-        policy_inner.update(policy_inner_overrides)
+    lambda_poison_resolved = (
+        beta_global if LAMBDA_POISON == "beta" else float(LAMBDA_POISON)
+    )
+
+    cell_config = dict(
+        policy_inner_mode=POLICY_INNER_MODE,
+        policy_inner_steps=POLICY_INNER_STEPS,
+        policy_inner_iters=POLICY_INNER_ITERS,
+        policy_inner_tol=POLICY_INNER_TOL,
+        policy_inner_min_iters=POLICY_INNER_MIN_ITERS,
+        policy_inner_ridge=POLICY_INNER_RIDGE,
+        lambda_b2=LAMBDA_B2,
+        lr_delta=LR_DELTA,
+        lr_policy=LR_POLICY,
+    )
+    if overrides:
+        cell_config.update(overrides)
 
     cell_tag = f"budget{budget_target}_seed{seed}"
     if cell_tag_suffix:
@@ -366,7 +459,9 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False,
             f"implies beta_global={beta_global:.6f} > gamma={gamma:.6f}, no allocation exists. "
             "Lower budget_target, raise num_poisoned (increases gamma), or lower num_honests."
         )
-        print(f"REFUSED [{model_flag}/{dataset}/budget{budget_target}/seed{seed}]: {reason}")
+        print(
+            f"REFUSED [{model_flag}/{dataset}/budget{budget_target}/seed{seed}]: {reason}"
+        )
         return [], reason
 
     if s_beta > 1:
@@ -388,24 +483,51 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False,
 
     configs = {
         train_expert_dir / "config.toml": TRAIN_EXPERT_TEMPLATE.format(
-            cluster_root=CLUSTER_ROOT, model_flag=model_flag, dataset=dataset,
-            source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            checkpoint_iters=CHECKPOINT_ITERS, epochs=EPOCHS_EXPERT, lr=lr, wd=wd,
+            cluster_root=CLUSTER_ROOT,
+            model_flag=model_flag,
+            dataset=dataset,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            checkpoint_iters=CHECKPOINT_ITERS,
+            epochs=EPOCHS_EXPERT,
+            lr=lr,
+            wd=wd,
             milestones=milestones,
         ),
         policy_dir / "config.toml": POLICY_TEMPLATE.format(
-            gamma=gamma, num_poisoned=NUM_POISONED, num_honests=NUM_HONESTS,
-            beta_local=beta_local, beta_global=beta_global, s_beta=s_beta,
-            s_beta_regime=s_beta_regime, lambda_poison=LAMBDA_POISON,
+            gamma=gamma,
+            num_poisoned=NUM_POISONED,
+            num_honests=NUM_HONESTS,
+            beta_local=beta_local,
+            beta_global=beta_global,
+            s_beta=s_beta,
+            s_beta_regime=s_beta_regime,
+            lambda_poison=LAMBDA_POISON,
             lambda_poison_resolved=lambda_poison_resolved,
-            dataset=dataset, model_flag=model_flag, source_label=SOURCE_LABEL,
-            target_label=TARGET_LABEL, lr=lr, wd=wd, milestones=milestones,
-            cluster_root=CLUSTER_ROOT, cell_tag=cell_tag, cell_dir=policy_dir,
-            lambda_bd=LAMBDA_BD, lambda_delta=LAMBDA_DELTA, epsilon=EPSILON,
-            lr_delta=LR_DELTA, lr_policy=LR_POLICY,
-            n_steps=N_STEPS, epochs=POLICY_EPOCHS, alpha_ckpt=ALPHA_CKPT, num_chckpt=NUM_CHCKPT,
-            normalization=NORMALIZATION, diag_every=DIAG_EVERY,
-            diag_qp_iters=DIAG_QP_ITERS, diag_qp_convergence=_toml_bool(DIAG_QP_CONVERGENCE),
+            dataset=dataset,
+            model_flag=model_flag,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            lr=lr,
+            wd=wd,
+            milestones=milestones,
+            cluster_root=CLUSTER_ROOT,
+            cell_tag=cell_tag,
+            cell_dir=policy_dir,
+            lambda_bd=LAMBDA_BD,
+            lambda_b2=cell_config["lambda_b2"],
+            lambda_delta=LAMBDA_DELTA,
+            epsilon=EPSILON,
+            lr_delta=cell_config["lr_delta"],
+            lr_policy=cell_config["lr_policy"],
+            n_steps=N_STEPS,
+            epochs=POLICY_EPOCHS,
+            alpha_ckpt=ALPHA_CKPT,
+            num_chckpt=NUM_CHCKPT,
+            normalization=NORMALIZATION,
+            diag_every=DIAG_EVERY,
+            diag_qp_iters=DIAG_QP_ITERS,
+            diag_qp_convergence=_toml_bool(DIAG_QP_CONVERGENCE),
             diag_qp_check_iters=DIAG_QP_CHECK_ITERS,
             diag_policy_nnz_threshold=DIAG_POLICY_NNZ_THRESHOLD,
             diag_policy_topk=DIAG_POLICY_TOPK,
@@ -417,16 +539,20 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False,
             diag_constraint_tol=DIAG_CONSTRAINT_TOL,
             diag_span_projection=_toml_bool(DIAG_SPAN_PROJECTION),
             diag_direction_scaling=_toml_bool(DIAG_DIRECTION_SCALING),
-            policy_inner_mode=policy_inner["policy_inner_mode"],
-            policy_inner_steps=policy_inner["policy_inner_steps"],
-            policy_inner_iters=policy_inner["policy_inner_iters"],
-            policy_inner_tol=policy_inner["policy_inner_tol"],
-            policy_inner_min_iters=policy_inner["policy_inner_min_iters"],
-            policy_inner_ridge=policy_inner["policy_inner_ridge"],
+            policy_inner_mode=cell_config["policy_inner_mode"],
+            policy_inner_steps=cell_config["policy_inner_steps"],
+            policy_inner_iters=cell_config["policy_inner_iters"],
+            policy_inner_tol=cell_config["policy_inner_tol"],
+            policy_inner_min_iters=cell_config["policy_inner_min_iters"],
+            policy_inner_ridge=cell_config["policy_inner_ridge"],
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
-            cell_dir=policy_dir, model_flag=model_flag, dataset=dataset,
-            num_poisoned=NUM_POISONED, num_honests=NUM_HONESTS, flips_dir=flips_dir,
+            cell_dir=policy_dir,
+            model_flag=model_flag,
+            dataset=dataset,
+            num_poisoned=NUM_POISONED,
+            num_honests=NUM_HONESTS,
+            flips_dir=flips_dir,
         ),
     }
 
@@ -440,10 +566,18 @@ def generate_cell(model_flag, dataset, seed, budget_target, dry_run=False,
     predicted_budget = round(beta_local * NUM_POISONED * n_train / n_w)
     train_user_dir = cell_dir / f"train_user_{predicted_budget}"
     configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
-        flips_dir=flips_dir, train_user_dir=train_user_dir, model_flag=model_flag,
-        dataset=dataset, source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-        budget=predicted_budget, num_honests=NUM_HONESTS, num_poisoned=NUM_POISONED,
-        lr=lr, wd=wd, milestones=milestones,
+        flips_dir=flips_dir,
+        train_user_dir=train_user_dir,
+        model_flag=model_flag,
+        dataset=dataset,
+        source_label=SOURCE_LABEL,
+        target_label=TARGET_LABEL,
+        budget=predicted_budget,
+        num_honests=NUM_HONESTS,
+        num_poisoned=NUM_POISONED,
+        lr=lr,
+        wd=wd,
+        milestones=milestones,
     )
 
     paths = []
@@ -466,9 +600,17 @@ def generate_single_cell(dry_run=True):
     at REGULARIZATION_GRID's defaults -- the minimal preliminary campaign used to sanity check
     the chain before spending a real sweep's compute."""
     paths, reason = generate_cell(
-        MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+        MODEL_FLAGS[0],
+        DATASETS[0],
+        SEEDS[0],
+        BUDGETS_TARGET[0],
+        dry_run=dry_run,
     )
-    refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
+    refused = (
+        [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)]
+        if reason
+        else []
+    )
     return paths, refused
 
 
@@ -481,11 +623,17 @@ def generate_minimal_campaign(dry_run=True):
             for budget_target in BUDGETS_TARGET[:3]:
                 for seed in SEEDS[:3]:
                     paths, reason = generate_cell(
-                        model_flag, dataset, seed, budget_target, dry_run=dry_run,
+                        model_flag,
+                        dataset,
+                        seed,
+                        budget_target,
+                        dry_run=dry_run,
                     )
                     all_paths += paths
                     if reason:
-                        refused.append((model_flag, dataset, budget_target, seed, reason))
+                        refused.append(
+                            (model_flag, dataset, budget_target, seed, reason)
+                        )
     return all_paths, refused
 
 
@@ -496,51 +644,72 @@ def generate_all_configs(dry_run=False):
             for budget_target in BUDGETS_TARGET:
                 for seed in SEEDS:
                     paths, reason = generate_cell(
-                        model_flag, dataset, seed, budget_target, dry_run=dry_run,
+                        model_flag,
+                        dataset,
+                        seed,
+                        budget_target,
+                        dry_run=dry_run,
                     )
                     all_paths += paths
                     if reason:
-                        refused.append((model_flag, dataset, budget_target, seed, reason))
+                        refused.append(
+                            (model_flag, dataset, budget_target, seed, reason)
+                        )
     return all_paths, refused
 
 
 def generate_inner_solve_comparison(dry_run=True):
     """
-    Section 12 of the inner-solve diagnostics task: generates ONE cell (first model/dataset/
-    seed/budget, same as generate_single_cell) PER variant in INNER_SOLVE_VARIANTS -- baseline
-    "joint", multi_step at 5/20 inner steps, and qp_pgd at 200/1000 iterations -- each in its
-    own inner_<tag> subdirectory (via cell_tag_suffix) so they can be run and compared side by
-    side without overwriting each other. Does NOT touch the module-level POLICY_INNER_* defaults
-    (those stay "joint") -- each variant's overrides are passed in per-call via
-    policy_inner_overrides, exactly as generate_cell's own docstring describes.
+    Generates ONE cell (first model/dataset/seed/budget, same as generate_single_cell) PER
+    variant in INNER_SOLVE_VARIANTS -- baseline "joint", multi_step at 5/20 inner steps, qp_pgd
+    at 200/1000 iterations (Experiments A/B/C), lambda_b2 at 10/100 (Experiment D),
+    two-timescale lr at two aggressiveness levels (Experiment E), and the "decisive combo"
+    (qp_pgd 1000 + lambda_b2=10 + slowed-down delta) -- each in its own inner_<tag>
+    subdirectory (via cell_tag_suffix) so they can be run and compared side by side without
+    overwriting each other. Does NOT touch the module-level POLICY_INNER_*/LAMBDA_B2/LR_DELTA/
+    LR_POLICY defaults (those stay at the baseline) -- each variant's overrides are passed in
+    per-call via `overrides`, exactly as generate_cell's own docstring describes.
     """
     all_paths, refused = [], []
     for tag, overrides in INNER_SOLVE_VARIANTS:
         paths, reason = generate_cell(
-            MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
-            policy_inner_overrides=overrides, cell_tag_suffix=f"inner_{tag}",
+            MODEL_FLAGS[0],
+            DATASETS[0],
+            SEEDS[0],
+            BUDGETS_TARGET[0],
+            dry_run=dry_run,
+            overrides=overrides,
+            cell_tag_suffix=f"inner_{tag}",
         )
         all_paths += paths
         if reason:
-            refused.append((MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason))
+            refused.append(
+                (MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)
+            )
     return all_paths, refused
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--minimal", action="store_true", help="B3 minimal campaign only")
     parser.add_argument(
-        "--single-cell", action="store_true",
-        help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
-             "preliminary campaign",
+        "--minimal", action="store_true", help="B3 minimal campaign only"
     )
     parser.add_argument(
-        "--inner-solve-comparison", action="store_true",
-        help="one cell per policy_inner_mode variant (joint/multi_step5/multi_step20/"
-             "qp_pgd200/qp_pgd1000), same (model, dataset, seed, budget) as --single-cell, in "
-             "sibling inner_<tag> subdirectories -- for comparing the controlled inner-solve "
-             "experiment (modules/federated_optimizing_trigger_policy/inner_solve.py).",
+        "--single-cell",
+        action="store_true",
+        help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
+        "preliminary campaign",
+    )
+    parser.add_argument(
+        "--inner-solve-comparison",
+        action="store_true",
+        help="one cell per experiment variant (see INNER_SOLVE_VARIANTS: joint/multi_step5/20/"
+        "qp_pgd200/1000/lambda_b2_10/100/two_timescale[_aggressive]/decisive_combo), same "
+        "(model, dataset, seed, budget) as --single-cell, in sibling inner_<tag> "
+        "subdirectories -- for comparing the controlled inner-solve experiment "
+        "(modules/federated_optimizing_trigger_policy/inner_solve.py) and the lambda_b2/"
+        "two-timescale-lr follow-up experiments.",
     )
     args = parser.parse_args()
     assert sum([args.minimal, args.single_cell, args.inner_solve_comparison]) <= 1, (
@@ -562,9 +731,13 @@ if __name__ == "__main__":
         for p in paths:
             print(f"  {p}")
     else:
-        print(f"\n{MODULE_NAME}: {len(paths)} config files written and schema-validated.")
+        print(
+            f"\n{MODULE_NAME}: {len(paths)} config files written and schema-validated."
+        )
 
     if refused:
         print(f"\n{len(refused)} cell(s) REFUSED (beta_local > 1, lem:beta-bar):")
         for model_flag, dataset, budget_target, seed, reason in refused:
-            print(f"  [{model_flag}/{dataset}/budget{budget_target}/seed{seed}] {reason}")
+            print(
+                f"  [{model_flag}/{dataset}/budget{budget_target}/seed{seed}] {reason}"
+            )

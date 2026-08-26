@@ -63,6 +63,7 @@ device = "string: {cpu, cuda}. Device used for optimization. Defaults to cuda if
 # default to 0.
 ###
 lambda_bd = "float: [0, +infty). Weight for L_bd (kappa in the P^mean formula: weight of the backdoor loss on triggered examples). Defaults to 1.0."
+lambda_b2 = "float: [0, +infty). Weight for B2 (the matching term) in the trigger's own loss, alongside lambda_bd's weight on L_bd -- eq:P itself has NO free coefficient on B2 (fixed at 1), so this is an EXPERIMENTAL knob (diagnostics task, Experiment D): if grad_delta_ratio = ||grad_delta B2|| / ||grad_delta L_bd|| stays << 1 (see diagnostics.py), delta is effectively optimizing L_bd alone and u is chasing a trigger it has little influence over -- raising lambda_b2 counteracts that. Also scales the grad_delta_B2_norm diagnostic (Diagnostic G) to reflect the ACTUAL weighted contribution. Defaults to 1.0 (exactly the original, unweighted B2 term -- no behavior change)."
 lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu. Defaults to 0.0."
 lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta. Defaults to 0.0."
 lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta. Defaults to 0.0."
