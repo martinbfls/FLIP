@@ -40,8 +40,8 @@ from modules.federated_optimizing_trigger.utils import init_delta
 NUM_POISONED = 3
 NUM_HONESTS = 7
 SEEDS = [0]
-BUDGETS = [1500]
-AGG_METHODS = ["mean"]
+BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
+AGG_METHODS = ["mean", "multikrum"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
