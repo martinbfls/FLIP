@@ -302,16 +302,48 @@ def oneshot_coupling_diagnostic(contexts, u_init, beta, pairs, pi, n_iters=200, 
     B2_per_checkpoint_mean (== what B2_qp already reports, recomputed here independently as a
     consistency check), B2_coupled, oneshot_gap_absolute, oneshot_gap_relative,
     coupled_actual_iters, coupled_converged.
+
+    Etape 0bis.1 (follow-up task -- "the decisive comparison that's missing"): the three
+    quantities the decision hinges on -- J(ubar) [B2_coupled], B2_current (the CO-DESCENDED
+    policy, `u_init`), and mean_k(B2_QP,k) [B2_per_checkpoint_mean] -- reported on the EXACT
+    SAME window, in TWO units: RAW (mean_k ||G_k@u - v_k||^2, no normalization at all -- what
+    the existing den-based B2/B2_qp/B2_per_checkpoint_mean/B2_coupled fields are NOT: those
+    divide by each checkpoint's OWN den, rho^2 or ||v_k||^2 depending on `normalization`, so
+    B2_current_continuous elsewhere is evaluated on a SINGLE representative checkpoint only,
+    not this whole window -- an apples-to-oranges comparison this fixes) and ||v||^2-WINDOW-
+    normalized (divided by the SAME shared denominator, v_sq_window_mean = mean_k(||v_k||^2),
+    for all three -- so they sit on a directly comparable scale, independent of `normalization`
+    and of which single checkpoint a diagnostic happens to have picked as representative).
+
+    Etape 0bis.2 (follow-up task -- "is the gap drift or noise?"): per_checkpoint_u_star tags
+    each u*_k by its checkpoint id (contexts' own "k"), so an offline reader (see
+    prelim/analyze_oneshot_gap_diagnostics.py) can group u*_k observations by checkpoint id
+    ACROSS MANY diagnostic batches and separate the pairwise cosine into INTRA-checkpoint (same
+    theta_k, different minibatch -- estimation noise on G/v) vs. INTER-checkpoint (different
+    theta_k -- genuine trajectory drift). This function itself only ever sees ONE batch's
+    window, so it cannot do that separation -- it only supplies the tagged raw material.
     '''
     u_star_per_k = []
     b2_per_k = []
+    sq_err_ustar_per_k = []
+    sq_err_current_per_k = []
+    v_sq_per_k = []
     for ctx in contexts:
         c_k = (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy().astype(np.float64)
         u_star_k, _, _ = project_gradient_descent_local(
             ctx["Q_obj"], c_k, u_init, beta, ctx["pairs_k"], pi, n_iters=n_iters, ridge=ridge,
         )
         u_star_per_k.append(u_star_k)
-        b2_per_k.append(diag.b2_value(ctx["G_obj"], u_star_k, ctx["v"], ctx["den"])[0])
+        b2_val, Gu_star = diag.b2_value(ctx["G_obj"], u_star_k, ctx["v"], ctx["den"])
+        b2_per_k.append(b2_val)
+        sq_err_ustar_per_k.append(((Gu_star - ctx["v"]) ** 2).sum().item())
+
+        u_current_t = torch.as_tensor(
+            diag.as_numpy(u_init), dtype=ctx["G_obj"].dtype, device=ctx["G_obj"].device,
+        )
+        Gu_current = ctx["G_obj"] @ u_current_t
+        sq_err_current_per_k.append(((Gu_current - ctx["v"]) ** 2).sum().item())
+        v_sq_per_k.append(ctx["v"].norm().item() ** 2)
 
     cosine_stats = pairwise_cosine_stats(u_star_per_k)
     b2_per_checkpoint_mean = float(np.mean(b2_per_k))
@@ -327,6 +359,17 @@ def oneshot_coupling_diagnostic(contexts, u_init, beta, pairs, pi, n_iters=200, 
     gap_abs = b2_coupled - b2_per_checkpoint_mean
     gap_rel = gap_abs / max(abs(b2_per_checkpoint_mean), eps)
 
+    # 0bis.1: raw + shared-||v||^2-window-normalized versions of the three quantities.
+    v_sq_window_mean = float(np.mean(v_sq_per_k))
+    sq_err_coupled_per_k = [
+        ((ctx["G_obj"] @ torch.as_tensor(diag.as_numpy(ubar), dtype=ctx["G_obj"].dtype,
+                                          device=ctx["G_obj"].device) - ctx["v"]) ** 2).sum().item()
+        for ctx in contexts
+    ]
+    b2_current_raw = float(np.mean(sq_err_current_per_k))
+    b2_per_checkpoint_mean_raw = float(np.mean(sq_err_ustar_per_k))
+    b2_coupled_raw = float(np.mean(sq_err_coupled_per_k))
+
     return {
         "oneshot_window_size": len(contexts),
         "u_star_pairwise_cosine_mean": cosine_stats["mean"],
@@ -338,6 +381,19 @@ def oneshot_coupling_diagnostic(contexts, u_init, beta, pairs, pi, n_iters=200, 
         "oneshot_gap_relative": gap_rel,
         "coupled_actual_iters": actual_iters,
         "coupled_converged": converged,
+        # 0bis.1
+        "v_sq_window_mean": v_sq_window_mean,
+        "B2_current_window_raw": b2_current_raw,
+        "B2_current_window_v2norm": b2_current_raw / max(v_sq_window_mean, eps),
+        "B2_per_checkpoint_mean_raw": b2_per_checkpoint_mean_raw,
+        "B2_per_checkpoint_mean_v2norm": b2_per_checkpoint_mean_raw / max(v_sq_window_mean, eps),
+        "B2_coupled_raw": b2_coupled_raw,
+        "B2_coupled_v2norm": b2_coupled_raw / max(v_sq_window_mean, eps),
+        # 0bis.2
+        "per_checkpoint_u_star": {
+            str(ctx["k"]): diag.as_numpy(u_star_k).tolist()
+            for ctx, u_star_k in zip(contexts, u_star_per_k)
+        },
     }
 
 

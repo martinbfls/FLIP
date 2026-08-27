@@ -293,6 +293,55 @@ def test_oneshot_coupling_diagnostic_disagreeing_checkpoints_positive_gap():
           result["B2_coupled"] >= result["B2_per_checkpoint_mean"] - 1e-9)
 
 
+# --------------------------------------------------------------------------#
+# Etape 0bis.1/0bis.2 (follow-up task): raw/||v||^2-window-normalized B2, and per-checkpoint
+# u* tagging for offline intra/inter-checkpoint cosine decomposition.
+# --------------------------------------------------------------------------#
+
+def test_oneshot_coupling_diagnostic_window_normalized_fields():
+    ctx_a = _directional_context(pair_idx=0, seed=40)
+    ctx_b = _directional_context(pair_idx=2, seed=41)
+    u_current = np.array([0.01, 0.0, 0.0, 0.0])
+    result = isolve.oneshot_coupling_diagnostic(
+        [ctx_a, ctx_b], u_current, BETA, PAIRS, PI, n_iters=300,
+    )
+
+    check("v_sq_window_mean == mean of the two contexts' own ||v_k||^2",
+          abs(result["v_sq_window_mean"]
+              - np.mean([ctx_a["v"].norm().item() ** 2, ctx_b["v"].norm().item() ** 2])) < 1e-9)
+
+    for prefix in ("B2_current_window", "B2_per_checkpoint_mean", "B2_coupled"):
+        raw_key = f"{prefix}_raw" if prefix != "B2_current_window" else "B2_current_window_raw"
+        norm_key = f"{prefix}_v2norm" if prefix != "B2_current_window" else "B2_current_window_v2norm"
+        check(f"{norm_key} == {raw_key} / v_sq_window_mean (shared denominator, not per-checkpoint)",
+              abs(result[norm_key] - result[raw_key] / result["v_sq_window_mean"]) < 1e-9,
+              f"{norm_key}={result[norm_key]}, {raw_key}={result[raw_key]}")
+
+    check("all three raw B2 quantities are non-negative (they are mean squared residuals)",
+          result["B2_current_window_raw"] >= 0
+          and result["B2_per_checkpoint_mean_raw"] >= 0
+          and result["B2_coupled_raw"] >= 0)
+
+
+def test_oneshot_coupling_diagnostic_per_checkpoint_u_star_tagging():
+    ctx_a = _directional_context(pair_idx=0, seed=50)
+    ctx_b = _directional_context(pair_idx=2, seed=51)
+    ctx_a["k"], ctx_b["k"] = 7, 12  # distinct, arbitrary checkpoint ids
+    result = isolve.oneshot_coupling_diagnostic(
+        [ctx_a, ctx_b], np.zeros(len(PAIRS)), BETA, PAIRS, PI, n_iters=300,
+    )
+    tagged = result["per_checkpoint_u_star"]
+    check("per_checkpoint_u_star has one entry per context, keyed by checkpoint id",
+          set(tagged.keys()) == {"7", "12"}, f"keys={list(tagged.keys())}")
+    check("each tagged u* has the right dimensionality (P pairs)",
+          all(len(v) == len(PAIRS) for v in tagged.values()))
+    # ctx_a favors pair_idx=0, ctx_b favors pair_idx=2 -- the tagged u*_k should reflect that.
+    check("checkpoint 7's u* concentrates on pair 0 (its own directional context)",
+          tagged["7"][0] > tagged["7"][2])
+    check("checkpoint 12's u* concentrates on pair 2 (its own directional context)",
+          tagged["12"][2] > tagged["12"][0])
+
+
 if __name__ == "__main__":
     test_aggregate_qp_is_weighted_mean_not_single_checkpoint()
     test_aggregate_b2_matches_mean_of_per_checkpoint_b2()
@@ -304,6 +353,8 @@ if __name__ == "__main__":
     test_pairwise_cosine_stats_identical_and_orthogonal()
     test_oneshot_coupling_diagnostic_identical_checkpoints_zero_gap()
     test_oneshot_coupling_diagnostic_disagreeing_checkpoints_positive_gap()
+    test_oneshot_coupling_diagnostic_window_normalized_fields()
+    test_oneshot_coupling_diagnostic_per_checkpoint_u_star_tagging()
 
     n_fail = sum(1 for _, ok, _ in _results if not ok)
     print(f"\n{len(_results) - n_fail}/{len(_results)} checks passed.")

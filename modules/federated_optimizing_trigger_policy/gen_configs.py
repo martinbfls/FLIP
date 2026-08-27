@@ -47,6 +47,15 @@ MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
 TARGET_LABEL = 4
 
+# expert_config's own epoch range (min, max) -- the pool sample_checkpoints draws from. Default
+# is the FULL trajectory (epochs 1..20); Etape 0bis.2 (follow-up diagnostics task) uses a
+# restricted [mid, end] window (generate_oneshot_gap_audit_restricted_window below) to test
+# whether the one-shot gap is driven by trajectory drift (columns of Gbar were measured at
+# cosine ~0.07-0.09 between the first checkpoint and later ones, vs. ~0.84 between the last two)
+# rather than by minibatch/estimation noise at fixed theta_k.
+EXPERT_MIN = 0
+EXPERT_MAX = 20
+
 N_TRAIN = {"cifar": 50000, "cifar_100": 50000, "svhn": 73257}
 
 LAMBDA_POISON = (
@@ -370,8 +379,8 @@ policy_inner_ridge = {policy_inner_ridge}
 
 [federated_optimizing_trigger_policy.expert_config]
 experts = 1
-min = 0
-max = 20
+min = {expert_min}
+max = {expert_max}
 trajectories = [50, 100, 150, 200]
 """
 
@@ -452,6 +461,8 @@ def generate_cell(
         diag_oneshot_gap=DIAG_ONESHOT_GAP,
         diag_qp_iters=DIAG_QP_ITERS,
         diag_every=DIAG_EVERY,
+        expert_min=EXPERT_MIN,
+        expert_max=EXPERT_MAX,
     )
     if overrides:
         cell_config.update(overrides)
@@ -554,6 +565,8 @@ def generate_cell(
             policy_inner_tol=cell_config["policy_inner_tol"],
             policy_inner_min_iters=cell_config["policy_inner_min_iters"],
             policy_inner_ridge=cell_config["policy_inner_ridge"],
+            expert_min=cell_config["expert_min"],
+            expert_max=cell_config["expert_max"],
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
             cell_dir=policy_dir,
@@ -677,15 +690,46 @@ def generate_oneshot_gap_audit(dry_run=True):
       (2) how much the independent per-checkpoint QP optima u*_k actually agree
           (u_star_pairwise_cosine_mean/min/max);
       (3) the one-shot gap J(ubar) - mean_k(B2_qp,k) (oneshot_gap_absolute/relative).
-    diag_qp_iters is raised (500, vs. the campaign default 50) so the per-checkpoint AND coupled
-    solves are both closer to convergence -- this audit's whole point is to measure a genuine
-    gap, not solver noise. diag_every is lowered (5, vs. the campaign default 50) so a short
-    diagnostic run (see N_STEPS) still produces several audited batches.
+    diag_qp_iters is raised (2000, vs. the campaign default 50 and the first audit's 500 --
+    that run's log showed coupled_converged=false on 39/39 diagnostic batches, so 500 was not
+    enough for the COUPLED solve specifically; this audit's whole point is to measure a genuine
+    gap, not solver under-convergence) so the per-checkpoint AND coupled solves are both closer
+    to convergence. diag_every is lowered (5, vs. the campaign default 50) so a short diagnostic
+    run (see N_STEPS) still produces several audited batches. Also now emits, per diagnostic
+    batch (inner_solve.py's oneshot_coupling_diagnostic, extended for Etape 0bis): raw AND
+    ||v||^2-window-normalized B2_current/B2_per_checkpoint_mean/B2_coupled on the SAME window
+    (0bis.1), and per-checkpoint-tagged u*_k (0bis.2 -- feed the resulting diagnostics.jsonl to
+    prelim/analyze_oneshot_gap_diagnostics.py for the full breakdown, including the
+    intra-vs-inter-checkpoint cosine decomposition).
     """
     paths, reason = generate_cell(
         MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
-        overrides={"diag_oneshot_gap": True, "diag_qp_iters": 500, "diag_every": 5},
+        overrides={"diag_oneshot_gap": True, "diag_qp_iters": 2000, "diag_every": 5},
         cell_tag_suffix="oneshot_gap_audit",
+    )
+    refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
+    return paths, refused
+
+
+def generate_oneshot_gap_audit_restricted_window(dry_run=True):
+    """
+    Etape 0bis.2's follow-up test: identical to generate_oneshot_gap_audit, but restricts
+    expert_config's epoch range to the LATTER half of the trajectory (EXPERT_MAX//2..
+    EXPERT_MAX, vs. the full 0..EXPERT_MAX) -- earlier measurements found columns of Gbar at
+    cosine ~0.07-0.09 between the first checkpoint and later ones, vs. ~0.84 between the last
+    two, so this window should have much LESS trajectory drift. Compare this run's
+    oneshot_gap_relative/u_star_pairwise_cosine_mean (via the SAME analyze_oneshot_gap_
+    diagnostics.py script) against the full-window audit's: if the gap shrinks substantially
+    here, drift (not minibatch noise) was the dominant driver on the full window.
+    """
+    mid_epoch = EXPERT_MAX // 2
+    paths, reason = generate_cell(
+        MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+        overrides={
+            "diag_oneshot_gap": True, "diag_qp_iters": 2000, "diag_every": 5,
+            "expert_min": mid_epoch, "expert_max": EXPERT_MAX,
+        },
+        cell_tag_suffix="oneshot_gap_audit_restricted",
     )
     refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
     return paths, refused
@@ -747,18 +791,29 @@ if __name__ == "__main__":
     parser.add_argument(
         "--oneshot-gap-audit",
         action="store_true",
-        help="Etape 0 of the 'switch to the exact QP solver' task: one cell with "
-        "diag_oneshot_gap=true (diag_qp_iters=500, diag_every=5) -- logs, per diagnostic "
-        "batch, the pairwise cosine similarity between independent per-checkpoint QP optima "
-        "and the one-shot gap between the coupled ubar and the mean per-checkpoint optimum. "
-        "See generate_oneshot_gap_audit's docstring.",
+        help="Etape 0/0bis of the 'switch to the exact QP solver' task: one cell with "
+        "diag_oneshot_gap=true (diag_qp_iters=2000, diag_every=5) over the FULL checkpoint "
+        "trajectory -- logs, per diagnostic batch, raw/||v||^2-window-normalized "
+        "B2_current/B2_per_checkpoint_mean/B2_coupled (0bis.1), per-checkpoint-tagged QP "
+        "optima for intra/inter-checkpoint cosine decomposition (0bis.2), and the one-shot gap "
+        "(absolute+relative). Feed the resulting diagnostics.jsonl to "
+        "prelim/analyze_oneshot_gap_diagnostics.py. See generate_oneshot_gap_audit's docstring.",
+    )
+    parser.add_argument(
+        "--oneshot-gap-audit-restricted",
+        action="store_true",
+        help="Etape 0bis.2's follow-up test: identical to --oneshot-gap-audit but restricted "
+        "to the LATTER half of the checkpoint trajectory (expert_config's epoch range), to "
+        "test whether the one-shot gap shrinks once trajectory drift is reduced. See "
+        "generate_oneshot_gap_audit_restricted_window's docstring.",
     )
     args = parser.parse_args()
     assert sum([
         args.minimal, args.single_cell, args.inner_solve_comparison, args.oneshot_gap_audit,
+        args.oneshot_gap_audit_restricted,
     ]) <= 1, (
         "pass at most one of --minimal/--single-cell/--inner-solve-comparison/"
-        "--oneshot-gap-audit"
+        "--oneshot-gap-audit/--oneshot-gap-audit-restricted"
     )
 
     if args.single_cell:
@@ -769,6 +824,8 @@ if __name__ == "__main__":
         gen_fn = generate_inner_solve_comparison
     elif args.oneshot_gap_audit:
         gen_fn = generate_oneshot_gap_audit
+    elif args.oneshot_gap_audit_restricted:
+        gen_fn = generate_oneshot_gap_audit_restricted_window
     else:
         gen_fn = generate_all_configs
     paths, refused = gen_fn(dry_run=args.dry_run)
