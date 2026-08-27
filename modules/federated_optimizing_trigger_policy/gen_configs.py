@@ -142,6 +142,10 @@ DIAG_ONESHOT_GAP = False  # Etape 0 audit ("switch to the exact QP solver" task)
                           # (K+1 extra QP solves per diagnostic batch) -- OFF by default for
                           # normal campaigns; see generate_oneshot_gap_audit below for a
                           # dedicated single-cell run with this turned on.
+DIAG_M_SWEEP = False              # Etape 1a.1: see generate_qp_m_sweep_audit below.
+DIAG_M_SWEEP_VALUES = [1, 2, 5, 10, 20]
+DIAG_SPLIT_HALF = False            # Etape 2: see generate_qp_split_half_audit below.
+DIAG_SPLIT_HALF_RIDGE_VALUES = [1e-6, 1e-4, 1e-2, 1e-1]
 
 # --------------------------------------------------------------------------- #
 # Controlled inner-solve experiment (modules/federated_optimizing_trigger_policy/inner_solve.py)
@@ -377,6 +381,10 @@ diag_constraint_tol = {diag_constraint_tol}
 diag_span_projection = {diag_span_projection}
 diag_direction_scaling = {diag_direction_scaling}
 diag_oneshot_gap = {diag_oneshot_gap}
+diag_m_sweep = {diag_m_sweep}
+diag_m_sweep_values = {diag_m_sweep_values}
+diag_split_half = {diag_split_half}
+diag_split_half_ridge_values = {diag_split_half_ridge_values}
 
 # Controlled inner-solve experiment (modules/federated_optimizing_trigger_policy/inner_solve.py)
 # -- "joint" (default) is the unchanged co-descent; see that module's docstring for the others.
@@ -484,6 +492,10 @@ def generate_cell(
         lr_delta=LR_DELTA,
         lr_policy=LR_POLICY,
         diag_oneshot_gap=DIAG_ONESHOT_GAP,
+        diag_m_sweep=DIAG_M_SWEEP,
+        diag_m_sweep_values=DIAG_M_SWEEP_VALUES,
+        diag_split_half=DIAG_SPLIT_HALF,
+        diag_split_half_ridge_values=DIAG_SPLIT_HALF_RIDGE_VALUES,
         diag_qp_iters=DIAG_QP_ITERS,
         diag_every=DIAG_EVERY,
         expert_min=EXPERT_MIN,
@@ -587,6 +599,10 @@ def generate_cell(
             diag_span_projection=_toml_bool(DIAG_SPAN_PROJECTION),
             diag_direction_scaling=_toml_bool(DIAG_DIRECTION_SCALING),
             diag_oneshot_gap=_toml_bool(cell_config["diag_oneshot_gap"]),
+            diag_m_sweep=_toml_bool(cell_config["diag_m_sweep"]),
+            diag_m_sweep_values=cell_config["diag_m_sweep_values"],
+            diag_split_half=_toml_bool(cell_config["diag_split_half"]),
+            diag_split_half_ridge_values=cell_config["diag_split_half_ridge_values"],
             policy_inner_mode=cell_config["policy_inner_mode"],
             policy_inner_steps=cell_config["policy_inner_steps"],
             policy_inner_iters=cell_config["policy_inner_iters"],
@@ -737,6 +753,63 @@ def generate_oneshot_gap_audit(dry_run=True):
         MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
         overrides={"diag_oneshot_gap": True, "diag_qp_iters": 2000, "diag_every": 5},
         cell_tag_suffix="oneshot_gap_audit",
+    )
+    refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
+    return paths, refused
+
+
+def generate_qp_m_sweep_audit(dry_run=True):
+    """
+    Etape 1a.1/1a.2 of the "solveur QP couple" follow-up task: a single cell with
+    policy_solver="qp" (qp_batches_per_checkpoint=1, so PRODUCTION behavior is unaffected) and
+    diag_m_sweep=true (diag_m_sweep_values=[1,2,5,10,20]) -- once enough per-checkpoint history
+    has accumulated, each diagnostic batch's "inner_solve" event carries an "m_sweep" field:
+    {"checkpoint": k, "cosine_by_m": {...}}. Feed the resulting diagnostics.jsonl to
+    prelim/analyze_oneshot_gap_diagnostics.py (it now also summarizes these) for the
+    cos(u*(m)) vs. m curve and where it plateaus (Etape 1a.1). qp_conditioning_diagnostic
+    (lambda_min/lambda_max/condition_number, Etape 1a.2) is already logged every diagnostic
+    batch under production policy_solver="qp" (qp_lambda_min/max/condition_number in
+    diagnostics.jsonl) -- no separate run needed for that half.
+
+    diag_qp_iters=2000 (not the campaign default 50) so qp_pgd_solve's own convergence is not
+    itself the bottleneck being measured; diag_every=5 for enough diagnosed batches from a
+    short run.
+    """
+    paths, reason = generate_cell(
+        MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+        overrides={
+            "policy_solver": "qp", "qp_batches_per_checkpoint": 1,
+            "diag_m_sweep": True, "diag_m_sweep_values": [1, 2, 5, 10, 20],
+            "diag_qp_iters": 2000, "diag_every": 5,
+        },
+        cell_tag_suffix="qp_m_sweep_audit",
+    )
+    refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
+    return paths, refused
+
+
+def generate_qp_split_half_audit(dry_run=True):
+    """
+    Etape 2 of the "solveur QP couple" follow-up task: a single cell with diag_split_half=true
+    (diag_split_half_ridge_values=[1e-6,1e-4,1e-2,1e-1]) -- on each diagnostic batch, splits
+    class_samples_raw into two independent halves, solves the QP on one half, and evaluates B2
+    on both (inner_solve.split_half_overfitting_check), for each ridge value. Read the resulting
+    diagnostics.jsonl's diag_record["split_half"] = {ridge: {b2_train, b2_holdout}} directly (no
+    separate analysis script needed -- 4 ridge values x a handful of diagnostic batches is
+    already a small, directly-readable table): the ridge with b2_holdout closest to (and not
+    much larger than) b2_train is what qp_ridge should be set to in production.
+
+    diag_qp_iters left at the module default (this audit is about G/Q's overfitting, not QP
+    convergence); diag_every=5 for enough diagnosed batches from a short run.
+    """
+    paths, reason = generate_cell(
+        MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+        overrides={
+            "diag_split_half": True,
+            "diag_split_half_ridge_values": [1e-6, 1e-4, 1e-2, 1e-1],
+            "diag_every": 5,
+        },
+        cell_tag_suffix="qp_split_half_audit",
     )
     refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
     return paths, refused
@@ -903,13 +976,31 @@ if __name__ == "__main__":
         "test whether the one-shot gap shrinks once trajectory drift is reduced. See "
         "generate_oneshot_gap_audit_restricted_window's docstring.",
     )
+    parser.add_argument(
+        "--qp-m-sweep-audit",
+        action="store_true",
+        help="Etape 1a.1/1a.2 of the 'solveur QP couple' follow-up task: one cell with "
+        "policy_solver='qp' (qp_batches_per_checkpoint=1 -- production behavior unaffected) "
+        "and diag_m_sweep=true -- logs cos(u*(m)) vs. m per checkpoint once enough history has "
+        "accumulated. Feed the resulting diagnostics.jsonl to "
+        "prelim/analyze_oneshot_gap_diagnostics.py. See generate_qp_m_sweep_audit's docstring.",
+    )
+    parser.add_argument(
+        "--qp-split-half-audit",
+        action="store_true",
+        help="Etape 2 of the 'solveur QP couple' follow-up task: one cell with "
+        "diag_split_half=true -- logs B2_train vs B2_holdout swept over "
+        "diag_split_half_ridge_values, directly in diagnostics.jsonl. See "
+        "generate_qp_split_half_audit's docstring.",
+    )
     args = parser.parse_args()
     assert sum([
         args.minimal, args.single_cell, args.inner_solve_comparison, args.oneshot_gap_audit,
-        args.oneshot_gap_audit_restricted,
+        args.oneshot_gap_audit_restricted, args.qp_m_sweep_audit, args.qp_split_half_audit,
     ]) <= 1, (
         "pass at most one of --minimal/--single-cell/--inner-solve-comparison/"
-        "--oneshot-gap-audit/--oneshot-gap-audit-restricted"
+        "--oneshot-gap-audit/--oneshot-gap-audit-restricted/--qp-m-sweep-audit/"
+        "--qp-split-half-audit"
     )
 
     if args.single_cell:
@@ -922,6 +1013,10 @@ if __name__ == "__main__":
         gen_fn = generate_oneshot_gap_audit
     elif args.oneshot_gap_audit_restricted:
         gen_fn = generate_oneshot_gap_audit_restricted_window
+    elif args.qp_m_sweep_audit:
+        gen_fn = generate_qp_m_sweep_audit
+    elif args.qp_split_half_audit:
+        gen_fn = generate_qp_split_half_audit
     else:
         gen_fn = generate_all_configs
     paths, refused = gen_fn(dry_run=args.dry_run)

@@ -166,6 +166,8 @@ def _compute_step_policy(
     diag_span_projection=True,
     diag_direction_scaling=True,
     diag_oneshot_gap=False,
+    diag_split_half=False,
+    diag_split_half_ridge_values=(1e-6, 1e-4, 1e-2, 1e-1),
     precomputed=None,
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
@@ -447,6 +449,25 @@ def _compute_step_policy(
                 )
             )
 
+        # Etape 2 (split-half overfitting check, see inner_solve.split_half_overfitting_check's
+        # docstring): re-derives G/Q for diag_ctx's checkpoint from two INDEPENDENT halves of
+        # class_samples_raw, solves the QP on one half, and evaluates B2 on both -- a QP
+        # exploiting sampling noise in G shows B2_holdout >> B2_train; a real signal shows
+        # B2_holdout ~= B2_train. Swept over diag_split_half_ridge_values so the ridge
+        # minimizing B2_holdout can be read off and used as qp_ridge in production. Expensive
+        # (2 extra compute_expected_flip_gradients calls per ridge value) and opt-in, only on
+        # this already-diagnostic batch.
+        if diag_split_half:
+            split_half_result = inner_solve.split_half_overfitting_check(
+                diag_ctx["model"], loss_fn, class_samples_raw, n_classes, pi, dataset_flag,
+                model_flag, gamma, beta, beta_global, diag_ctx["v"], beta,
+                diag_ctx["pairs_k"], diag_split_half_ridge_values,
+            )
+            diag_record["split_half"] = {
+                str(ridge): {"b2_train": b2_train, "b2_holdout": b2_holdout}
+                for ridge, (b2_train, b2_holdout) in split_half_result.items()
+            }
+
     return {
         "B2": B2, "L_bd": L_bd, "lambda_effective": lambda_effective,
         "lambda_effective_ratio": lambda_effective_ratio,
@@ -697,6 +718,8 @@ def optimize_trigger_policy_step(
     policy_inner_ridge=1e-6,
     lambda_b2=1.0,
     diag_oneshot_gap=False,
+    diag_split_half=False,
+    diag_split_half_ridge_values=(1e-6, 1e-4, 1e-2, 1e-1),
     policy_solver="descent",
     qp_batches_per_checkpoint=1,
     qp_ridge=1e-3,
@@ -990,6 +1013,8 @@ def optimize_trigger_policy_step(
             precomputed=precomputed,
             lambda_b2=lambda_b2,
             diag_oneshot_gap=diag_oneshot_gap,
+            diag_split_half=diag_split_half,
+            diag_split_half_ridge_values=diag_split_half_ridge_values,
         )
         B2, L_bd = result["B2"], result["L_bd"]
 
@@ -1190,6 +1215,8 @@ def optimize_trigger_policy(
     policy_inner_ridge=1e-6,
     lambda_b2=1.0,
     diag_oneshot_gap=False,
+    diag_split_half=False,
+    diag_split_half_ridge_values=(1e-6, 1e-4, 1e-2, 1e-1),
     policy_solver="descent",
     qp_batches_per_checkpoint=1,
     qp_ridge=1e-3,
@@ -1541,6 +1568,8 @@ def optimize_trigger_policy(
             policy_inner_ridge=policy_inner_ridge,
             lambda_b2=lambda_b2,
             diag_oneshot_gap=diag_oneshot_gap,
+            diag_split_half=diag_split_half,
+            diag_split_half_ridge_values=diag_split_half_ridge_values,
             policy_solver=policy_solver,
             qp_batches_per_checkpoint=qp_batches_per_checkpoint,
             qp_ridge=qp_ridge,
@@ -1640,11 +1669,20 @@ def run(experiment_name, module_name, **kwargs):
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_b2 = args.get("lambda_b2", 1.0)
     diag_oneshot_gap = args.get("diag_oneshot_gap", False)
+    # Etape 2 (split-half overfitting check): diag_split_half=true re-derives G/Q for the
+    # diagnostic checkpoint from two independent halves of class_samples_raw and reports
+    # B2_train vs B2_holdout swept over diag_split_half_ridge_values -- see
+    # inner_solve.split_half_overfitting_check's docstring. Piggybacks on the SAME diagnostic
+    # batch as diag_oneshot_gap/diag_qp_convergence rather than needing a separate script.
+    diag_split_half = args.get("diag_split_half", False)
+    diag_split_half_ridge_values = args.get(
+        "diag_split_half_ridge_values", [1e-6, 1e-4, 1e-2, 1e-1]
+    )
     # Etape 1b ("switch to the exact QP solver" follow-up task): policy_solver="qp" replaces u
     # every batch with the exact QP optimum (rem:solver's solver (a)), detached, giving delta
     # the true Danskin hypergradient -- see optimize_trigger_policy's startup log for the full
     # explanation. qp_ridge's default (1e-3) is PROVISIONAL: Etape 2's split-half holdout sweep
-    # (see prelim/qp_split_half_ridge_sweep.py) is what should set the real default once run.
+    # (diag_split_half=true) is what should set the real default once run.
     policy_solver = args.get("policy_solver", "descent")
     qp_batches_per_checkpoint = args.get("qp_batches_per_checkpoint", 1)
     qp_ridge = args.get("qp_ridge", 1e-3)
@@ -1810,6 +1848,8 @@ def run(experiment_name, module_name, **kwargs):
         policy_inner_ridge=policy_inner_ridge,
         lambda_b2=lambda_b2,
         diag_oneshot_gap=diag_oneshot_gap,
+        diag_split_half=diag_split_half,
+        diag_split_half_ridge_values=diag_split_half_ridge_values,
         policy_solver=policy_solver,
         qp_batches_per_checkpoint=qp_batches_per_checkpoint,
         qp_ridge=qp_ridge,

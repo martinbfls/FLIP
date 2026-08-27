@@ -203,18 +203,78 @@ def summarize_0bis3(records, min_b2_qp=1e-4):
         )
 
 
+def load_m_sweep_records(path):
+    """Etape 1a.1: 'inner_solve' events (policy_solver='qp') carrying an 'm_sweep' field --
+    see run_module.py's diag_m_sweep wiring / inner_solve.m_sweep_cosine's docstring."""
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if r.get("event") == "inner_solve" and "m_sweep" in r:
+                records.append(r)
+    return records
+
+
+def summarize_m_sweep(records):
+    print("\n=== 1a.1 -- cos(u*(m)) vs. u*(max(m)), per checkpoint, median over observations ===")
+    if not records:
+        print("[no m_sweep records found -- rerun with policy_solver='qp' and diag_m_sweep=true "
+              "(gen_configs.py --qp-m-sweep-audit), and long enough for history to accumulate "
+              "(need >= max(diag_m_sweep_values) batches touching the SAME checkpoint).]")
+        return
+
+    by_m = {}
+    for r in records:
+        for m_str, cos in r["m_sweep"]["cosine_by_m"].items():
+            if cos is not None:
+                by_m.setdefault(int(m_str), []).append(cos)
+
+    print(f"{'m':>6} {'n_obs':>7} {'median_cos':>12} {'min':>8} {'max':>8}")
+    for m in sorted(by_m):
+        vals = by_m[m]
+        print(f"{m:>6} {len(vals):>7} {np.median(vals):>12.4f} {np.min(vals):>8.4f} {np.max(vals):>8.4f}")
+
+    ordered_m = sorted(by_m)
+    if len(ordered_m) >= 2:
+        plateau_m, prev_m = ordered_m[-1], ordered_m[-2]
+        plateau_val = np.median(by_m[plateau_m])
+        step_gain = plateau_val - np.median(by_m[prev_m])
+        print(f"\n  largest-m median cosine = {plateau_val:.4f} (m={plateau_m}); "
+              f"last step's gain over m={prev_m} was {step_gain:+.4f}.")
+        if plateau_val > 0.98:
+            print("  -> plateau near 1: the residual disagreement (Diagnostic 0bis.2) is "
+                  "essentially all MINIBATCH/ESTIMATION NOISE, fully averaged out by this m.")
+        else:
+            print(f"  -> plateau strictly below 1 ({plateau_val:.4f}): this residual IS "
+                  "trajectory drift (prop:oneshot-gap net of noise), not an averaging artifact.")
+        print("  Use the SMALLEST m where the step-to-step gain is already small as "
+              "qp_batches_per_checkpoint in production.")
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         print("Usage: python prelim/analyze_oneshot_gap_diagnostics.py path/to/diagnostics.jsonl [min_b2_qp]")
         sys.exit(1)
     min_b2_qp = float(sys.argv[2]) if len(sys.argv) == 3 else 1e-4
-    records = load_records(sys.argv[1])
-    if not records:
-        print("No oneshot-gap diagnostic records found (diag_oneshot_gap must be true).")
+    path = sys.argv[1]
+
+    records = load_records(path)
+    m_sweep_records = load_m_sweep_records(path)
+    if not records and not m_sweep_records:
+        print("No oneshot-gap or m-sweep diagnostic records found (diag_oneshot_gap or "
+              "diag_m_sweep must be true).")
         sys.exit(1)
-    summarize_0bis1(records)
-    summarize_0bis2(records)
-    summarize_0bis3(records, min_b2_qp=min_b2_qp)
+
+    if records:
+        summarize_0bis1(records)
+        summarize_0bis2(records)
+        summarize_0bis3(records, min_b2_qp=min_b2_qp)
+    else:
+        print("[no diag_oneshot_gap records in this log -- skipping 0bis.1/0bis.2/0bis.3]")
+    summarize_m_sweep(m_sweep_records)
 
 
 if __name__ == "__main__":
