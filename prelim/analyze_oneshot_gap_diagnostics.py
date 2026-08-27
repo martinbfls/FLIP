@@ -89,6 +89,25 @@ def summarize_0bis1(records):
     print(f"  B2_QP_mean   raw={med([r[2] for r in rows]):.6g}  v2norm={med([r[5] for r in rows]):.6g}")
     print(f"  B2_coupled   raw={med([r[3] for r in rows]):.6g}  v2norm={med([r[6] for r in rows]):.6g}")
 
+    n_coupled_beats_current = sum(1 for r in rows if r[6] < r[4])
+    print(
+        f"\n  B2_coupled(v2n) < B2_current(v2n) in {n_coupled_beats_current}/{len(rows)} batches "
+        "-- the decisive comparison: does the coupled ubar, on the SAME window, actually beat "
+        "the current co-descended policy?"
+    )
+
+    if all("coupled_converged" in r for r in records):
+        n_converged = sum(1 for r in records if r["coupled_converged"])
+        iters = [r["coupled_actual_iters"] for r in records]
+        print(
+            f"  coupled QP solver converged on {n_converged}/{len(records)} batches "
+            f"(actual_iters median={np.median(iters):.0f}, max={np.max(iters)}) -- if this is "
+            "well below len(records) and/or actual_iters is pinned at the max_iters budget "
+            "on most batches, B2_coupled above is likely an OVERESTIMATE (the true, converged "
+            "J(ubar) is <= what's reported here); it would only strengthen a 'B2_coupled beats "
+            "B2_current' conclusion, never weaken it."
+        )
+
 
 def summarize_0bis2(records):
     print("\n=== 0bis.2 -- intra- vs inter-checkpoint cosine of u*_k ===")

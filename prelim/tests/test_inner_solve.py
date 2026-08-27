@@ -342,6 +342,132 @@ def test_oneshot_coupling_diagnostic_per_checkpoint_u_star_tagging():
           tagged["12"][2] > tagged["12"][0])
 
 
+# --------------------------------------------------------------------------#
+# Etape 1a/1b (follow-up task): history-averaged (Q,c), m-sweep cosine, conditioning,
+# convergence trace, NNLS cone projection, four-term decomposition.
+# --------------------------------------------------------------------------#
+
+def test_push_context_history_caps_at_m_and_averages():
+    ctx = _directional_context(pair_idx=0, seed=60)
+    history = {}
+    # 3 observations with DIFFERENT v (so c differs each time), m=2 -- only the last 2 kept.
+    for i in range(3):
+        ctx_i = dict(ctx)
+        ctx_i["v"] = ctx["v"] * (i + 1)  # v1, 2v1, 3v1
+        isolve.push_context_history(history, [ctx_i], m=2)
+
+    buf = history[ctx["k"]]
+    check("history capped at m=2 entries", len(buf) == 2)
+    c_expected_last_two_mean = np.mean([
+        (ctx["G_obj"].T @ (ctx["v"] * 2)).detach().cpu().numpy(),
+        (ctx["G_obj"].T @ (ctx["v"] * 3)).detach().cpu().numpy(),
+    ], axis=0)
+    c_actual_mean = np.mean([e[0] for e in buf], axis=0)
+    check("averaged c matches the mean of the LAST 2 (not all 3) observations",
+          np.allclose(c_actual_mean, c_expected_last_two_mean, atol=1e-8))
+
+
+def test_aggregate_qp_from_history_matches_aggregate_qp_with_single_observation():
+    ctx1 = _make_context(seed=61, den=1.0)
+    ctx2 = _make_context(seed=62, den=2.0)
+    contexts = [ctx1, ctx2]
+    history = {}
+    isolve.push_context_history(history, contexts, m=5)
+
+    Q_a, c_a, pairs_a = isolve.aggregate_qp(contexts)
+    Q_b, c_b, pairs_b = isolve.aggregate_qp_from_history(contexts, history)
+    check("Q unaffected by history (checkpoint-fixed)", np.allclose(Q_a, Q_b))
+    check("c matches aggregate_qp with only one observation in history",
+          np.allclose(c_a, c_b, atol=1e-8))
+
+
+def test_m_sweep_cosine_plateaus_at_1_for_noise_free_history():
+    ctx = _directional_context(pair_idx=0, seed=63)
+    # Identical c every batch (no noise at all) -- cosine should be exactly 1 for every m.
+    c_k = (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy().astype(np.float64)
+    c_history = [c_k.copy() for _ in range(25)]
+    u_star_by_m, cosine_by_m = isolve.m_sweep_cosine(
+        c_history, ctx["Q_obj"], BETA, PAIRS, PI, [1, 2, 5, 10, 20], n_iters=300,
+    )
+    check("noise-free history: cosine is ~1 for every m",
+          all(abs(c - 1.0) < 1e-6 for c in cosine_by_m.values()),
+          f"cosine_by_m={cosine_by_m}")
+
+
+def test_m_sweep_cosine_improves_toward_reference_with_noisy_history():
+    ctx = _directional_context(pair_idx=0, seed=64)
+    c_true = (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy().astype(np.float64)
+    rng = np.random.RandomState(0)
+    c_history = [c_true + rng.normal(scale=0.5, size=c_true.shape) for _ in range(25)]
+    _, cosine_by_m = isolve.m_sweep_cosine(
+        c_history, ctx["Q_obj"], BETA, PAIRS, PI, [1, 20], n_iters=300,
+    )
+    check("m_sweep_cosine requires >= max(m_values) observations",
+          isinstance(cosine_by_m[1], float) and isinstance(cosine_by_m[20], float))
+
+    try:
+        isolve.m_sweep_cosine(c_history[:3], ctx["Q_obj"], BETA, PAIRS, PI, [1, 20], n_iters=50)
+        check("m_sweep_cosine raises with too few observations", False)
+    except ValueError:
+        check("m_sweep_cosine raises with too few observations", True)
+
+
+def test_qp_conditioning_diagnostic():
+    Q = np.diag([1.0, 4.0, 9.0])
+    result = isolve.qp_conditioning_diagnostic(Q, ridge=0.0)
+    check("lambda_min matches the smallest diagonal entry", abs(result["lambda_min"] - 1.0) < 1e-9)
+    check("lambda_max matches the largest diagonal entry", abs(result["lambda_max"] - 9.0) < 1e-9)
+    check("condition_number == lambda_max/lambda_min", abs(result["condition_number"] - 9.0) < 1e-9)
+
+
+def test_qp_pgd_solve_with_trace_reports_plateauing_decrement():
+    ctx1 = _make_context(seed=65, den=1.0)
+    ctx2 = _make_context(seed=66, den=1.5)
+    Q_agg, c_agg, pairs_agg = isolve.aggregate_qp([ctx1, ctx2])
+    u_star, obj_decrement, trace = isolve.qp_pgd_solve_with_trace(
+        Q_agg, c_agg, np.zeros(len(PAIRS)), BETA, pairs_agg, PI, max_iters=500, trace_last_n=100,
+    )
+    check("trace has trace_last_n entries", len(trace) == 100)
+    check("obj_decrement over the last 100 iters is small (near-converged on this easy problem)",
+          abs(obj_decrement) < 1e-3, f"obj_decrement={obj_decrement}")
+    check("u_star is feasible", isolve.check_feasible(u_star, BETA, pairs_agg, PI))
+
+
+def test_nnls_cone_projection_no_worse_than_qp_and_feasible_nonneg():
+    ctx = _directional_context(pair_idx=0, seed=67)
+    alpha_tilde_sq, u_nnls = isolve.nnls_cone_projection(ctx["G_obj"], ctx["v"], ctx["den"])
+    check("NNLS solution is nonnegative (u>=0, no other constraint)",
+          bool((u_nnls >= -1e-9).all()))
+
+    u_qp, _, _ = isolve.project_gradient_descent_local(
+        ctx["Q_obj"], (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy(), np.zeros(len(PAIRS)),
+        BETA, PAIRS, PI, n_iters=300,
+    )
+    b2_qp_val, _ = isolve.diag.b2_value(ctx["G_obj"], u_qp, ctx["v"], ctx["den"])
+    check("alpha_tilde^2 (cone-only, no budget) <= B2_qp (cone AND budget) -- fewer "
+          "constraints can only do at least as well",
+          alpha_tilde_sq <= b2_qp_val + 1e-6, f"alpha_tilde_sq={alpha_tilde_sq}, B2_qp={b2_qp_val}")
+
+
+def test_four_term_decomposition_orders_the_four_terms():
+    ctx = _directional_context(pair_idx=0, seed=68)
+    u_qp, _, _ = isolve.project_gradient_descent_local(
+        ctx["Q_obj"], (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy(), np.zeros(len(PAIRS)),
+        BETA, PAIRS, PI, n_iters=300,
+    )
+    u_current = np.zeros(len(PAIRS))  # a deliberately bad "current" policy (never moved)
+    result = isolve.four_term_decomposition(
+        ctx["G_obj"], ctx["v"], ctx["den"], u_current, u_qp, ctx["rho_k"],
+    )
+    check("B2_span <= alpha_tilde^2 (fewer constraints do at least as well)",
+          result["B2_span_over_den"] <= result["alpha_tilde_sq"] + 1e-6,
+          f"{result}")
+    check("alpha_tilde^2 <= B2_QP (fewer constraints do at least as well)",
+          result["alpha_tilde_sq"] <= result["B2_QP_over_den"] + 1e-6, f"{result}")
+    check("B2_current (never moved from 0) is at least as bad as B2_QP",
+          result["B2_current_over_den"] >= result["B2_QP_over_den"] - 1e-9, f"{result}")
+
+
 if __name__ == "__main__":
     test_aggregate_qp_is_weighted_mean_not_single_checkpoint()
     test_aggregate_b2_matches_mean_of_per_checkpoint_b2()
@@ -355,6 +481,14 @@ if __name__ == "__main__":
     test_oneshot_coupling_diagnostic_disagreeing_checkpoints_positive_gap()
     test_oneshot_coupling_diagnostic_window_normalized_fields()
     test_oneshot_coupling_diagnostic_per_checkpoint_u_star_tagging()
+    test_push_context_history_caps_at_m_and_averages()
+    test_aggregate_qp_from_history_matches_aggregate_qp_with_single_observation()
+    test_m_sweep_cosine_plateaus_at_1_for_noise_free_history()
+    test_m_sweep_cosine_improves_toward_reference_with_noisy_history()
+    test_qp_conditioning_diagnostic()
+    test_qp_pgd_solve_with_trace_reports_plateauing_decrement()
+    test_nnls_cone_projection_no_worse_than_qp_and_feasible_nonneg()
+    test_four_term_decomposition_orders_the_four_terms()
 
     n_fail = sum(1 for _, ok, _ in _results if not ok)
     print(f"\n{len(_results) - n_fail}/{len(_results)} checks passed.")

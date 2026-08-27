@@ -562,6 +562,15 @@ def _build_diag_record(
         record["discretization_gap_current_relative"] = gap_rel
         record["current_u_minus_u_discrete_l1"] = float(np.abs(u_np - u_discrete).sum())
         record["current_u_minus_u_discrete_l2"] = float(np.linalg.norm(u_np - u_discrete))
+        # Etape 3 (follow-up task): requested vs. REALIZED mass/direction count under rounding.
+        current_mass_requested = float(u_np.sum())
+        record["current_mass_requested"] = current_mass_requested
+        record["current_mass_realized"] = float(u_discrete.sum())
+        record["current_mass_realized_fraction"] = (
+            float(u_discrete.sum()) / current_mass_requested if current_mass_requested > 1e-12 else None
+        )
+        record["current_nnz_requested"] = int((np.abs(u_np) > diag_policy_nnz_threshold).sum())
+        record["current_nnz_after_rounding"] = int((n_realized_current > 0).sum())
 
         if w_pg is not None and diag_ctx["B2_qp"] is not None:
             u_qp_discrete, n_realized_qp = diag.discretize_policy(
@@ -572,10 +581,17 @@ def _build_diag_record(
             gap_abs, gap_rel = diag.discretization_gap(diag_ctx["B2_qp"], B2_qp_discrete)
             record["discretization_gap_qp_absolute"] = gap_abs
             record["discretization_gap_qp_relative"] = gap_rel
-            record["qp_u_minus_u_discrete_l1"] = float(np.abs(w_pg.detach().cpu().numpy() - u_qp_discrete).sum())
-            record["qp_u_minus_u_discrete_l2"] = float(
-                np.linalg.norm(w_pg.detach().cpu().numpy() - u_qp_discrete)
+            w_pg_np = w_pg.detach().cpu().numpy()
+            record["qp_u_minus_u_discrete_l1"] = float(np.abs(w_pg_np - u_qp_discrete).sum())
+            record["qp_u_minus_u_discrete_l2"] = float(np.linalg.norm(w_pg_np - u_qp_discrete))
+            qp_mass_requested = float(w_pg_np.sum())
+            record["qp_mass_requested"] = qp_mass_requested
+            record["qp_mass_realized"] = float(u_qp_discrete.sum())
+            record["qp_mass_realized_fraction"] = (
+                float(u_qp_discrete.sum()) / qp_mass_requested if qp_mass_requested > 1e-12 else None
             )
+            record["qp_nnz_requested"] = int((np.abs(w_pg_np) > diag_policy_nnz_threshold).sum())
+            record["qp_nnz_after_rounding"] = int((n_realized_qp > 0).sum())
 
     # Diagnostic A.2.1: solver-convergence sweep -- only when explicitly enabled (expensive at
     # the largest check_iters value), only on this already-diagnostic batch. Every check_iters
@@ -600,6 +616,12 @@ def _build_diag_record(
     # see qp_global_budget_active/qp_any_class_cap_active above for which constraint).
     if diag_span_projection and diag_ctx["c_np"] is not None:
         record.update(diag.span_projection(G_obj, diag_ctx["Q_obj"], diag_ctx["c_np"], v, den))
+        # Etape 4 (follow-up task): alpha_tilde^2 = min_{u>=0} B2(u), NO budget/class caps --
+        # separates the cost of the CONE (positivity) from the cost of the BUDGET (already
+        # measured by B2_qp_continuous relative to this): B2_span <= alpha_tilde^2 <=
+        # B2_qp_continuous <= B2_current_continuous is the four-term decomposition's ordering.
+        alpha_tilde_sq, _ = inner_solve.nnls_cone_projection(G_obj, v, den)
+        record["alpha_tilde_sq"] = alpha_tilde_sq
 
     # Diagnostic D: actual vs. predicted gradient shift -- expensive (materializes flips and
     # runs real forward/backward passes), only when explicitly requested for this batch.
@@ -675,6 +697,11 @@ def optimize_trigger_policy_step(
     policy_inner_ridge=1e-6,
     lambda_b2=1.0,
     diag_oneshot_gap=False,
+    policy_solver="descent",
+    qp_batches_per_checkpoint=1,
+    qp_ridge=1e-3,
+    diag_m_sweep=False,
+    diag_m_sweep_values=(1, 2, 5, 10, 20),
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -730,6 +757,10 @@ def optimize_trigger_policy_step(
     # more of `expert_models` over the course of this call (up to len(expert_models), each
     # entry computed at most once) instead of being capped at num_chckpt for the whole call.
     flip_grad_cache = {}
+    # Etape 1b (policy_solver="qp"): per-checkpoint (c_k, den_k) history, see
+    # inner_solve.push_context_history's docstring -- persists across this call's batches
+    # exactly like flip_grad_cache, reset once these checkpoints are replaced.
+    qp_c_history = {}
 
     total_steps = len(loader)
     pbar = make_pbar(
@@ -774,7 +805,7 @@ def optimize_trigger_policy_step(
         # two independently-randomized ones.
         precomputed, inner_record = None, None
         u_for_delta_update = u
-        if policy_inner_mode != "joint":
+        if policy_solver == "qp" or policy_inner_mode != "joint":
             x_raw_b, y_b = move_to_device(batch, device)
             x_clean_b = raw_to_preprocess(x_raw_b, dataset_flag=dataset_flag, model_flag=model_flag)
             mask_b, y_poison_b, has_poison_b, lam_eff_b, lam_eff_ratio_b = _build_poison_mask(
@@ -796,7 +827,64 @@ def optimize_trigger_policy_step(
             Q_agg, c_agg, pairs_agg = inner_solve.aggregate_qp(contexts)
             B2_before_inner = inner_solve.aggregate_b2(u, contexts)
 
-            if policy_inner_mode == "multi_step":
+            qp_conditioning = None
+            m_sweep_result = None
+            if policy_solver == "qp":
+                # Etape 1b: THE production switch -- takes priority over policy_inner_mode
+                # entirely (that key stays available for the earlier, still-supported
+                # multi_step/qp_pgd/qp_pgd_reset comparison experiments below, unaffected when
+                # policy_solver is left at its default "descent"). c (and den) are averaged
+                # over qp_batches_per_checkpoint batches per checkpoint (Q itself needs no
+                # such averaging -- see inner_solve.py's history-section docstring), using
+                # qp_ridge (a SEPARATE, more conservative default than policy_inner_ridge --
+                # see run()'s docstring: Etape 2's split-half sweep is what should set this).
+                # Etape 1a.1: when diag_m_sweep is on, the history buffer is kept LONGER than
+                # qp_batches_per_checkpoint (up to max(diag_m_sweep_values)) so the sweep below
+                # can look back further; the PRODUCTION solve still only ever averages the last
+                # qp_batches_per_checkpoint entries (the `m=` argument to
+                # aggregate_qp_from_history), so diag_m_sweep never changes production behavior.
+                history_cap = qp_batches_per_checkpoint
+                if diag_m_sweep:
+                    history_cap = max(history_cap, max(diag_m_sweep_values))
+                inner_solve.push_context_history(qp_c_history, contexts, history_cap)
+                Q_hist, c_hist, pairs_hist = inner_solve.aggregate_qp_from_history(
+                    contexts, qp_c_history, m=qp_batches_per_checkpoint,
+                )
+                qp_conditioning = inner_solve.qp_conditioning_diagnostic(Q_hist, ridge=qp_ridge)
+                u_star, actual_iters, obj_start, obj_end, converged = inner_solve.qp_pgd_solve(
+                    Q_hist, c_hist, u.detach(), beta, pairs_hist, pi,
+                    max_iters=policy_inner_iters, tol=policy_inner_tol,
+                    min_iters=policy_inner_min_iters, ridge=qp_ridge,
+                )
+                with torch.no_grad():
+                    u.copy_(u_star.to(dtype=u.dtype, device=u.device))
+                inner_metrics = {
+                    "actual_iters": actual_iters, "obj_start": obj_start, "obj_end": obj_end,
+                    "obj_decrement": obj_start - obj_end, "converged": converged,
+                }
+
+                # Etape 1a.1: m-sweep diagnostic -- reports, for whichever checkpoint(s) in
+                # this batch's window already have enough history, cos(u*(m)) vs. u*(max(m))
+                # for each m in diag_m_sweep_values. Read the resulting curve per
+                # inner_solve.m_sweep_cosine's docstring (where it plateaus = the m to use;
+                # the plateau value itself separates noise from drift).
+                m_sweep_result = None
+                if run_diag and diag_m_sweep:
+                    max_m = max(diag_m_sweep_values)
+                    for ctx in contexts:
+                        buf = qp_c_history.get(ctx["k"], [])
+                        if len(buf) >= max_m:
+                            c_hist_list = [e[0] for e in buf]
+                            _, cosine_by_m = inner_solve.m_sweep_cosine(
+                                c_hist_list, ctx["Q_obj"], beta, ctx["pairs_k"], pi,
+                                diag_m_sweep_values, ridge=qp_ridge,
+                            )
+                            m_sweep_result = {
+                                "checkpoint": ctx["k"],
+                                "cosine_by_m": {str(m): c for m, c in cosine_by_m.items()},
+                            }
+                            break
+            elif policy_inner_mode == "multi_step":
                 inner_metrics = inner_solve.multi_step_update(
                     u, Q_agg, c_agg, beta, pairs_agg, pi, optimizer_policy, policy_inner_steps,
                 )
@@ -826,7 +914,7 @@ def optimize_trigger_policy_step(
             feasible = inner_solve.check_feasible(u_after, beta, pairs_agg, pi, diag_constraint_tol)
 
             inner_record = {
-                "policy_inner_mode": policy_inner_mode,
+                "policy_inner_mode": "qp (policy_solver)" if policy_solver == "qp" else policy_inner_mode,
                 "policy_inner_actual_iters": inner_metrics["actual_iters"],
                 "policy_inner_obj_start": inner_metrics["obj_start"],
                 "policy_inner_obj_end": inner_metrics["obj_end"],
@@ -839,7 +927,24 @@ def optimize_trigger_policy_step(
                 "policy_sum_before_inner": float(u_before.sum().item()),
                 "policy_sum_after_inner": float(u_after.sum().item()),
                 "policy_inner_feasible": feasible,
+                # Etape 1b's required per-step log fields.
+                "policy_qp_budget_fraction": float(u_after.sum().item()) / beta if beta else None,
+                "policy_qp_nnz": int((u_after.abs() > diag_constraint_tol).sum().item()),
+                "policy_qp_cosine_Au_v": (
+                    float(torch.nn.functional.cosine_similarity(
+                        (contexts[0]["G_obj"] @ u_after.to(dtype=contexts[0]["G_obj"].dtype)).reshape(1, -1),
+                        contexts[0]["v"].reshape(1, -1), eps=1e-8,
+                    ).item()) if policy_solver == "qp" else None
+                ),
             }
+            if qp_conditioning is not None:
+                inner_record["qp_lambda_min"] = qp_conditioning["lambda_min"]
+                inner_record["qp_lambda_max"] = qp_conditioning["lambda_max"]
+                inner_record["qp_condition_number"] = qp_conditioning["condition_number"]
+                inner_record["qp_ridge_used"] = qp_ridge
+                inner_record["qp_batches_per_checkpoint_used"] = qp_batches_per_checkpoint
+            if m_sweep_result is not None:
+                inner_record["m_sweep"] = m_sweep_result
 
             # Section 9: cross-check against the EXISTING single-checkpoint QP diagnostic
             # (B2_qp, from _compute_step_policy's own run_diag branch) -- solves the SAME
@@ -944,17 +1049,18 @@ def optimize_trigger_policy_step(
             L_tot.backward()
 
         optimizer_delta.step()
-        if policy_inner_mode == "joint":
-            # Non-"joint" modes already updated (and projected) u themselves, above, via the
-            # inner solve -- an extra optimizer_policy.step() here would be a SECOND, unintended
-            # update on top of it (Section 6): u_for_delta_update was u.detach() for this
-            # backward, so u.grad was never touched by it anyway, but skip the step explicitly
-            # rather than rely on that.
+        if policy_solver == "descent" and policy_inner_mode == "joint":
+            # Neither policy_solver="qp" nor a non-"joint" policy_inner_mode ever reaches here:
+            # both already updated (and projected) u themselves, above, via the inner solve --
+            # an extra optimizer_policy.step() would be a SECOND, unintended update on top of it
+            # (Section 6/Etape 1b): u_for_delta_update was u.detach() for this backward, so
+            # u.grad was never touched by it anyway, but skip the step explicitly rather than
+            # rely on that.
             optimizer_policy.step()
 
         with torch.no_grad():
             delta.clamp_(-epsilon, epsilon)
-            if policy_inner_mode == "joint":
+            if policy_solver == "descent" and policy_inner_mode == "joint":
                 u.copy_(project_policy_budget(u, beta, pairs, pi))
 
         hinge_window.append(L_pen.item() > 0)
@@ -1084,13 +1190,33 @@ def optimize_trigger_policy(
     policy_inner_ridge=1e-6,
     lambda_b2=1.0,
     diag_oneshot_gap=False,
+    policy_solver="descent",
+    qp_batches_per_checkpoint=1,
+    qp_ridge=1e-3,
+    diag_m_sweep=False,
+    diag_m_sweep_values=(1, 2, 5, 10, 20),
 ):
+    valid_solvers = ("descent", "qp")
+    if policy_solver not in valid_solvers:
+        raise ValueError(f"policy_solver={policy_solver!r} not in {valid_solvers}.")
     valid_inner_modes = ("joint", "multi_step", "qp_pgd", "qp_pgd_reset")
     if policy_inner_mode not in valid_inner_modes:
         raise ValueError(
             f"policy_inner_mode={policy_inner_mode!r} not in {valid_inner_modes}."
         )
-    if policy_inner_mode != "joint":
+    if policy_solver == "qp":
+        print(
+            f"[policy_solver] running with policy_solver='qp' (rem:solver's solver (a)): u is "
+            "REPLACED every batch by the exact QP optimum over U_loc, on Q/c aggregated over "
+            f"qp_batches_per_checkpoint={qp_batches_per_checkpoint} minibatches per checkpoint "
+            f"(ridge={qp_ridge}), then DETACHED before delta's own update -- delta's gradient "
+            "is prop:danskin's true hypergradient of V(delta)=min_u J(delta,u), not the "
+            "co-descent's approximation. optimizer_policy is never stepped in this mode. "
+            "policy_inner_mode is ignored while policy_solver='qp' (it still governs the "
+            "separate multi_step/qp_pgd/qp_pgd_reset comparison experiments when "
+            "policy_solver='descent', the default)."
+        )
+    elif policy_inner_mode != "joint":
         print(
             f"[policy_inner_mode] running with policy_inner_mode={policy_inner_mode!r} -- u is "
             "pushed toward its conditional optimum u*(delta) BEFORE delta's own update each "
@@ -1415,6 +1541,11 @@ def optimize_trigger_policy(
             policy_inner_ridge=policy_inner_ridge,
             lambda_b2=lambda_b2,
             diag_oneshot_gap=diag_oneshot_gap,
+            policy_solver=policy_solver,
+            qp_batches_per_checkpoint=qp_batches_per_checkpoint,
+            qp_ridge=qp_ridge,
+            diag_m_sweep=diag_m_sweep,
+            diag_m_sweep_values=diag_m_sweep_values,
         )
 
         del expert_models
@@ -1509,6 +1640,16 @@ def run(experiment_name, module_name, **kwargs):
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_b2 = args.get("lambda_b2", 1.0)
     diag_oneshot_gap = args.get("diag_oneshot_gap", False)
+    # Etape 1b ("switch to the exact QP solver" follow-up task): policy_solver="qp" replaces u
+    # every batch with the exact QP optimum (rem:solver's solver (a)), detached, giving delta
+    # the true Danskin hypergradient -- see optimize_trigger_policy's startup log for the full
+    # explanation. qp_ridge's default (1e-3) is PROVISIONAL: Etape 2's split-half holdout sweep
+    # (see prelim/qp_split_half_ridge_sweep.py) is what should set the real default once run.
+    policy_solver = args.get("policy_solver", "descent")
+    qp_batches_per_checkpoint = args.get("qp_batches_per_checkpoint", 1)
+    qp_ridge = args.get("qp_ridge", 1e-3)
+    diag_m_sweep = args.get("diag_m_sweep", False)
+    diag_m_sweep_values = args.get("diag_m_sweep_values", [1, 2, 5, 10, 20])
     lambda_penalty = args.get("lambda_penalty", 0.0)
     lambda_delta = args.get("lambda_delta", 0.0)
     lambda_tv = args.get("lambda_tv", 0.0)
@@ -1669,6 +1810,11 @@ def run(experiment_name, module_name, **kwargs):
         policy_inner_ridge=policy_inner_ridge,
         lambda_b2=lambda_b2,
         diag_oneshot_gap=diag_oneshot_gap,
+        policy_solver=policy_solver,
+        qp_batches_per_checkpoint=qp_batches_per_checkpoint,
+        qp_ridge=qp_ridge,
+        diag_m_sweep=diag_m_sweep,
+        diag_m_sweep_values=diag_m_sweep_values,
     )
 
     print("Optimized trigger and policy obtained.")

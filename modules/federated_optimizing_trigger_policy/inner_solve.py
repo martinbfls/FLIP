@@ -448,3 +448,305 @@ def multi_step_update(u, Q_agg, c_agg, beta, pairs, pi, optimizer_policy, k_step
         "actual_iters": k_steps, "obj_start": obj_start, "obj_end": obj_end,
         "obj_decrement": obj_start - obj_end, "converged": None,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Etape 1a/1b (follow-up task: "solveur QP couple, etapes 1 a 5") -- per-checkpoint history of
+# (c_k, den_k), used both to answer 1a.1 (how much does aggregating over m batches change u*,
+# and where does it plateau) and to drive policy_solver="qp" in production (1b: qp_batches_per_
+# checkpoint = the m to use, chosen from 1a.1's measurement).
+#
+# G_k/Q_k are CHECKPOINT-FIXED: `get_or_build_flip_grad_cache_entry` builds them once per
+# checkpoint from `class_samples_raw`, itself fixed for the whole run -- they never vary batch
+# to batch for the same checkpoint. All of the batch-to-batch noise 0bis.2 measured therefore
+# lives in v_k (hence c_k = G_k^T @ v_k) and, under normalization="v", in den_k too. Averaging
+# these SMALL (P-dim / scalar) quantities over m observations is mathematically IDENTICAL to
+# averaging v_k itself first (linearity: G_k^T @ mean_b(v_b) == mean_b(G_k^T @ v_b), since G_k
+# does not depend on b) but far cheaper: v_k is (D,), D = model parameter count (~1e5-1e6); c_k
+# is (P,), P = number of (y,c) pairs (~90). Q itself never needs aggregating -- it already has
+# no batch-to-batch noise to average out.
+# --------------------------------------------------------------------------- #
+
+def push_context_history(history, contexts, m):
+    '''
+    Mutates `history` (dict checkpoint_id -> list of (c_k: (P,) ndarray, den_k: float)) in
+    place: appends this batch's (c_k, den_k) for every checkpoint in `contexts`, capping each
+    checkpoint's list at the last `m` entries (oldest dropped first). Call once per batch,
+    before solving, so the solve below sees the just-updated history.
+    '''
+    for ctx in contexts:
+        c_k = (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy().astype(np.float64)
+        buf = history.setdefault(ctx["k"], [])
+        buf.append((c_k, ctx["den"]))
+        if len(buf) > m:
+            del buf[0]
+
+
+def aggregate_qp_from_history(contexts, history, m=None):
+    '''
+    Etape 1b: the coupled QP's (Q, c) exactly as `aggregate_qp`, EXCEPT c (and den) are the
+    MEAN over each checkpoint's history (`push_context_history`) instead of this single batch's
+    observation. Q needs no such averaging (see this section's docstring). Falls back to the
+    current batch's own (c, den) for a checkpoint with empty history (should not happen if
+    `push_context_history` was already called on `contexts` this batch, but kept as a safety
+    net for m=0/misuse).
+
+    `m`: if given, only the LAST `m` entries of each checkpoint's history are averaged (the
+    buffer itself, filled by `push_context_history`, may be kept LONGER than the production
+    `qp_batches_per_checkpoint` so the same history can also serve `m_sweep_cosine`'s diagnostic
+    sweep over larger m values -- pass the production m here to use only that many, regardless
+    of how much longer history happens to be retained). None (default) uses the WHOLE buffer.
+    '''
+    K = len(contexts)
+    pairs = contexts[0]["pairs_k"]
+    Q_sum = np.zeros_like(contexts[0]["Q_obj"], dtype=np.float64)
+    c_sum = np.zeros(Q_sum.shape[0], dtype=np.float64)
+    for ctx in contexts:
+        buf = history.get(ctx["k"])
+        if buf:
+            entries = buf[-m:] if m else buf
+            c_bar = np.mean([e[0] for e in entries], axis=0)
+            den_bar = float(np.mean([e[1] for e in entries]))
+        else:
+            c_bar = (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy().astype(np.float64)
+            den_bar = ctx["den"]
+        Q_sum += ctx["Q_obj"] / den_bar
+        c_sum += c_bar / den_bar
+    return Q_sum / K, c_sum / K, pairs
+
+
+def m_sweep_cosine(c_history, Q, beta, pairs, pi, m_values, ridge=1e-6, n_iters=500):
+    '''
+    Etape 1a.1: for ONE checkpoint's Q (fixed, see this section's docstring) and a
+    chronological list of its per-batch c observations, solves the QP at c averaged over the
+    LAST m observations, for each m in `m_values`, and reports each u*(m)'s cosine similarity
+    to u*(max(m_values)) (the most-averaged, best available reference).
+
+    Read the resulting curve as follows: the m where the cosine plateaus is the m to actually
+    use in production (qp_batches_per_checkpoint) -- averaging further buys nothing. The
+    plateau's cosine value separates the two hypotheses `intra ~ inter` (Diagnostic 0bis.2)
+    could not distinguish alone: if it tends to 1, ALL of the residual disagreement was
+    estimation noise on v_k, now averaged away; if it plateaus strictly below 1, that residual
+    IS trajectory drift (prop:oneshot-gap net of noise), not an artifact of insufficient
+    averaging.
+
+    Args:
+        c_history: list of (P,) arrays, one per batch this checkpoint appeared in, in
+            chronological order. Must have length >= max(m_values).
+        Q: (P,P) float64 ndarray, this checkpoint's own Q_obj (unaggregated -- see docstring).
+        m_values: iterable of ints, e.g. [1, 2, 5, 10, 20].
+
+    Returns (u_star_by_m: {m: (P,) ndarray}, cosine_by_m: {m: float or None}).
+    '''
+    m_values = sorted(set(m_values))
+    max_m = max(m_values)
+    if len(c_history) < max_m:
+        raise ValueError(
+            f"m_sweep_cosine needs >= max(m_values)={max_m} observations, got {len(c_history)}."
+        )
+    u_star_by_m = {}
+    for m in m_values:
+        c_agg = np.mean(c_history[-m:], axis=0)
+        u_star, _, _ = project_gradient_descent_local(
+            Q, c_agg, np.zeros(Q.shape[0]), beta, pairs, pi, n_iters=n_iters, ridge=ridge,
+        )
+        u_star_by_m[m] = diag.as_numpy(u_star)
+
+    reference = u_star_by_m[max_m]
+    ref_norm = np.linalg.norm(reference)
+    cosine_by_m = {}
+    for m in m_values:
+        a = u_star_by_m[m]
+        denom = np.linalg.norm(a) * ref_norm
+        cosine_by_m[m] = float(np.dot(a, reference) / denom) if denom > 1e-12 else None
+    return u_star_by_m, cosine_by_m
+
+
+def qp_conditioning_diagnostic(Q, ridge=1e-6):
+    '''Etape 1a.2: lambda_min/lambda_max/condition number of Q+ridge*I -- checks whether a
+    non-converging coupled solve (qp_pgd_solve's `converged=False`) is a conditioning problem,
+    as opposed to simply needing more iterations.'''
+    P = Q.shape[0]
+    Q_reg = Q + ridge * np.eye(P)
+    eigvals = np.linalg.eigvalsh(Q_reg)
+    lambda_min = float(eigvals.min())
+    lambda_max = float(eigvals.max())
+    return {
+        "lambda_min": lambda_min, "lambda_max": lambda_max,
+        "condition_number": lambda_max / max(lambda_min, 1e-300),
+    }
+
+
+def qp_pgd_solve_with_trace(Q, c, u_init, beta, pairs, pi, max_iters=200, ridge=1e-6, trace_last_n=100):
+    '''
+    Etape 1a.2: runs `qp_pgd_solve`'s exact algorithm for the FULL `max_iters` budget (no early
+    stop -- unlike `qp_pgd_solve`, this is for measuring convergence itself, so stopping early
+    would hide the answer), recording the objective value at each of the LAST `trace_last_n`
+    iterations. Returns (u_star, obj_decrement_last_n, obj_trace_last_n) -- obj_decrement_last_n
+    = obj[-trace_last_n] - obj[-1]; small relative to obj[-1] means the solve had already
+    plateaued well before max_iters (non-convergence, if any, is then a conditioning/step-size
+    issue, not merely "not enough iterations"); still shrinking means max_iters itself was the
+    binding constraint.
+    '''
+    P = Q.shape[0]
+    Q_reg = Q + ridge * np.eye(P)
+    L = float(np.linalg.eigvalsh(Q_reg).max())
+    lr = 1.0 / max(L, ridge)
+
+    w_np = np.asarray(
+        u_init.detach().cpu().numpy() if torch.is_tensor(u_init) else u_init, dtype=np.float64,
+    ).copy()
+
+    def obj(w):
+        return 0.5 * float(w @ Q_reg @ w) - float(c @ w)
+
+    trace = []
+    w_t = torch.as_tensor(w_np)
+    for i in range(max_iters):
+        grad = Q_reg @ w_np - c
+        w_np = w_np - lr * grad
+        w_t = project_policy_budget(torch.as_tensor(w_np), beta, pairs, pi)
+        w_np = w_t.detach().cpu().numpy().astype(np.float64)
+        if i >= max_iters - trace_last_n:
+            trace.append(obj(w_np))
+
+    obj_decrement_last_n = (trace[0] - trace[-1]) if len(trace) >= 2 else 0.0
+    return w_t, obj_decrement_last_n, trace
+
+
+# --------------------------------------------------------------------------- #
+# Etape 2 (follow-up task) -- split-half overfitting check: does the QP exploit estimation
+# error in G_k (built from a FINITE class_samples_raw sample) rather than genuine signal?
+# --------------------------------------------------------------------------- #
+
+def split_half_overfitting_check(
+    model, loss_fn, class_samples_raw, n_classes, pi, dataset_flag, model_flag, gamma, beta,
+    beta_global, v, beta_local_for_solve, pairs_hint, ridge_values, n_iters=500, seed=0,
+):
+    '''
+    Etape 2: splits `class_samples_raw` (the per-class sample compute_expected_flip_gradients
+    is built from) into two INDEPENDENT halves, builds G_1/Q_1 (train) and G_2/Q_2 (holdout)
+    for the SAME checkpoint from each half, solves the QP on (Q_1, c_1) -> u*_1, and evaluates
+    B2 of u*_1 under BOTH (Q_1, c_1) (train) and (Q_2, c_2) (holdout) -- a QP that is only
+    exploiting estimation noise in G_1 shows B2_holdout >> B2_train; a QP that has found a real
+    signal shows B2_holdout ~= B2_train.
+
+    Swept over `ridge_values`: returns {ridge: (b2_train, b2_holdout)}, so the caller can find
+    the ridge minimizing B2_holdout -- that value is what `qp_ridge` should default to under
+    policy_solver="qp" once measured (see the module docstring / run_module.py's `run()`).
+
+    NOTE: needs `class_samples_raw` to have >= 2 samples per class (halved evenly, remainder
+    dropped) -- raises if smaller than that.
+    '''
+    from modules.federated_optimizing_trigger.utils import compute_expected_flip_gradients
+
+    rng = np.random.RandomState(seed)
+    half_1, half_2 = {}, {}
+    for y, x in class_samples_raw.items():
+        n = x.shape[0]
+        if n < 2:
+            raise ValueError(f"class {y} has only {n} sample(s) -- split_half needs >= 2.")
+        idx = rng.permutation(n)
+        half = n // 2
+        half_1[y] = x[idx[:half]]
+        half_2[y] = x[idx[half:2 * half]]
+
+    params = list(model.parameters())
+    G_1, Q_1, pairs_1 = compute_expected_flip_gradients(
+        model, loss_fn, half_1, n_classes, pi, dataset_flag=dataset_flag, model_flag=model_flag,
+        params=params,
+    )
+    G_2, Q_2, pairs_2 = compute_expected_flip_gradients(
+        model, loss_fn, half_2, n_classes, pi, dataset_flag=dataset_flag, model_flag=model_flag,
+        params=params,
+    )
+    assert pairs_1 == pairs_2 == pairs_hint, "split halves disagree on which pairs are present"
+
+    # Same gamma/pi_y rescaling _compute_step_policy/get_or_build_flip_grad_cache_entry apply --
+    # duplicated here (not imported) because that helper also fills flip_grad_cache as a
+    # side effect, which this diagnostic must NOT touch.
+    scale = torch.tensor(
+        [gamma / pi[y] for (y, c) in pairs_1], device=G_1.device, dtype=G_1.dtype,
+    )
+    G_obj_1 = G_1 * scale
+    G_obj_2 = G_2 * scale
+    scale_np = scale.detach().cpu().numpy().astype(np.float64)
+    Q_obj_1 = np.outer(scale_np, scale_np) * Q_1
+    Q_obj_2 = np.outer(scale_np, scale_np) * Q_2
+
+    c_1 = (G_obj_1.T @ v).detach().cpu().numpy().astype(np.float64)
+    den = float(v.detach().norm().item() ** 2 + 1e-8)
+
+    results = {}
+    for ridge in ridge_values:
+        u_star, _, _ = project_gradient_descent_local(
+            Q_obj_1, c_1, np.zeros(len(pairs_1)), beta, pairs_1, pi, n_iters=n_iters, ridge=ridge,
+        )
+        b2_train, _ = diag.b2_value(G_obj_1, u_star, v, den)
+        b2_holdout, _ = diag.b2_value(G_obj_2, u_star, v, den)
+        results[ridge] = (b2_train, b2_holdout)
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Etape 4 (follow-up task) -- four-term decomposition: B2_span (subspace-only), alpha_tilde^2
+# (subspace + positivity, NNLS without a budget), B2_QP (subspace + positivity + budget),
+# B2_current (what the running algorithm actually achieves). Separates the cost of the CONE
+# (u>=0) from the cost of the BUDGET, which the existing span/QP diagnostics (diagnostics.py)
+# conflate.
+# --------------------------------------------------------------------------- #
+
+def nnls_cone_projection(G_obj, v, den, max_iters=500, ridge=1e-6, tol=1e-10):
+    '''
+    Etape 4 -- alpha_tilde^2 = min_{u>=0} ||G_obj @ u - v||^2 / den: the SAME projected-gradient
+    scheme as `qp_pgd_solve`, but projecting only onto the nonnegative orthant (u>=0, NO budget,
+    NO per-class caps) -- separates the cost of requiring u>=0 (the CONE) from the cost of the
+    budget/class-cap constraints (already measured by B2_qp/B2_QP relative to this).
+
+    Returns (alpha_tilde_sq: float, u_nnls: (P,) ndarray).
+    '''
+    P = G_obj.shape[1]
+    Q = (G_obj.T @ G_obj).detach().cpu().numpy().astype(np.float64)
+    c = (G_obj.T @ v).detach().cpu().numpy().astype(np.float64)
+    Q_reg = Q + ridge * np.eye(P)
+    L = float(np.linalg.eigvalsh(Q_reg).max())
+    lr = 1.0 / max(L, ridge)
+
+    w = np.zeros(P, dtype=np.float64)
+    prev_obj = 0.5 * float(w @ Q_reg @ w) - float(c @ w)
+    for _ in range(max_iters):
+        grad = Q_reg @ w - c
+        w = np.clip(w - lr * grad, 0.0, None)
+        cur_obj = 0.5 * float(w @ Q_reg @ w) - float(c @ w)
+        if abs(prev_obj - cur_obj) < tol * max(abs(prev_obj), 1e-12):
+            prev_obj = cur_obj
+            break
+        prev_obj = cur_obj
+
+    alpha_tilde_sq, _ = diag.b2_value(G_obj, w, v, den)
+    return alpha_tilde_sq, w
+
+
+def four_term_decomposition(G_obj, v, den, u_current, u_qp, rho, span_result=None):
+    '''
+    Etape 4: assembles the four-row table (all in the SAME /den units already used elsewhere --
+    den = rho^2+eps under normalization="rho", the default):
+      B2_span   / den  -- geometric ceiling, no constraint at all (span(G_obj) only)
+      alpha_tilde^2     -- + positivity (u>=0), still no budget
+      B2_QP     / den  -- + budget/class caps (U_loc) -- what B2_qp already reports
+      B2_current/ den  -- what the running algorithm actually achieves
+    `span_result`, if given, reuses an already-computed diagnostics.span_projection(...) dict
+    (same G_obj/v/den) instead of recomputing it.
+    '''
+    if span_result is None:
+        span_result = diag.span_projection(G_obj, (G_obj.T @ G_obj).detach().cpu().numpy(),
+                                            (G_obj.T @ v).detach().cpu().numpy(), v, den)
+    alpha_tilde_sq, u_nnls = nnls_cone_projection(G_obj, v, den)
+    b2_qp, _ = diag.b2_value(G_obj, u_qp, v, den)
+    b2_current, _ = diag.b2_value(G_obj, u_current, v, den)
+    return {
+        "B2_span_over_den": span_result["B2_span"],
+        "alpha_tilde_sq": alpha_tilde_sq,
+        "B2_QP_over_den": b2_qp,
+        "B2_current_over_den": b2_current,
+    }

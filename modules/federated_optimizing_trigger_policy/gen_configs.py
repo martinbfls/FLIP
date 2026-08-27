@@ -158,6 +158,16 @@ POLICY_INNER_TOL = 1e-8
 POLICY_INNER_MIN_ITERS = 10
 POLICY_INNER_RIDGE = 1e-6
 
+# --------------------------------------------------------------------------- #
+# The exact QP solver (rem:solver's solver (a)) -- adopted after Etape 0's diagnostics (see
+# schemas/federated_optimizing_trigger_policy.toml's policy_solver entry for the full
+# justification). "descent" (default) is the unchanged co-descent; run_policy_campaign.sh's
+# SOLVERS axis sweeps {descent, qp} as the primary factor of interest.
+# --------------------------------------------------------------------------- #
+POLICY_SOLVER = "descent"
+QP_BATCHES_PER_CHECKPOINT = 1  # set from Etape 1a.1's m-sweep measurement once run
+QP_RIDGE = 1e-3                # PROVISIONAL -- Etape 2's split-half holdout sweep should set this
+
 # Comparison configurations, extended after the follow-up diagnostics round (B2 >> B2_qp
 # persists even with the inner solve; grad_delta_ratio << 1 most batches; span geometry is
 # mostly favorable past batch 0): the ORIGINAL 5 (Experiments A/B/C -- baseline, two multi_step
@@ -377,6 +387,13 @@ policy_inner_tol = {policy_inner_tol}
 policy_inner_min_iters = {policy_inner_min_iters}
 policy_inner_ridge = {policy_inner_ridge}
 
+# The exact QP solver (rem:solver's solver (a)) -- "descent" (default) leaves the co-descent
+# (and any policy_inner_mode variant above) untouched. See inner_solve.py's history-section
+# docstring / this run's own startup log for what "qp" actually does.
+policy_solver = "{policy_solver}"
+qp_batches_per_checkpoint = {qp_batches_per_checkpoint}
+qp_ridge = {qp_ridge}
+
 [federated_optimizing_trigger_policy.expert_config]
 experts = 1
 min = {expert_min}
@@ -437,6 +454,14 @@ def generate_cell(
         NUM_POISONED,
         NUM_HONESTS,
     )
+    if overrides and "beta_local" in overrides:
+        # run_policy_campaign.sh's BETAS axis sweeps the LOCAL rate directly (0.033/0.10/0.33),
+        # not a target GLOBAL budget to convert -- bypass resolve_beta_gamma's budget_target ->
+        # beta_local conversion for this cell; gamma/n_train are unaffected (they depend only on
+        # num_poisoned/num_honests/dataset, not on beta), so only beta_local/beta_global/
+        # s_beta are recomputed from the override, via the SAME formula resolve_beta_gamma uses.
+        beta_local = overrides["beta_local"]
+        beta_global = gamma * beta_local
     pi_min_approx = 1.0 / 10  # CIFAR-family: 10 balanced classes: min_y(pi_y) ~= 0.1
     s_beta = beta_global / (gamma * pi_min_approx)
     s_beta_regime = (
@@ -463,6 +488,9 @@ def generate_cell(
         diag_every=DIAG_EVERY,
         expert_min=EXPERT_MIN,
         expert_max=EXPERT_MAX,
+        policy_solver=POLICY_SOLVER,
+        qp_batches_per_checkpoint=QP_BATCHES_PER_CHECKPOINT,
+        qp_ridge=QP_RIDGE,
     )
     if overrides:
         cell_config.update(overrides)
@@ -567,6 +595,9 @@ def generate_cell(
             policy_inner_ridge=cell_config["policy_inner_ridge"],
             expert_min=cell_config["expert_min"],
             expert_max=cell_config["expert_max"],
+            policy_solver=cell_config["policy_solver"],
+            qp_batches_per_checkpoint=cell_config["qp_batches_per_checkpoint"],
+            qp_ridge=cell_config["qp_ridge"],
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
             cell_dir=policy_dir,
@@ -733,6 +764,71 @@ def generate_oneshot_gap_audit_restricted_window(dry_run=True):
     )
     refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
     return paths, refused
+
+
+def generate_policy_solver_campaign(
+    solvers=("descent", "qp"), seeds=(0, 1, 2), betas=(0.033, 0.10, 0.33),
+    aggs=("mean", "trmean"), model_flag=None, dataset=None, dry_run=True,
+):
+    """
+    Etape 6.1 (follow-up task: "solveur QP couple, campagne en une commande") -- one cell per
+    (solver, seed, beta_local, agg) combination, `beta_local` swept DIRECTLY (bypassing
+    resolve_beta_gamma's budget_target conversion -- see generate_cell's "beta_local" override).
+    A budget_target is still needed for cell_name()/directory naming and the derived
+    train_user budget; it is set to round(beta_local * gamma * n_train), i.e. the GLOBAL budget
+    this beta_local actually implies, purely for consistent directory naming with the rest of
+    the module's conventions (NOT re-converted back to beta_local -- the override above already
+    fixed beta_local exactly).
+
+    Experts are SHARED across every cell regardless of (solver, agg): generate_cell always
+    writes train_expert_dir at EXP_BASE/train_expert/<model>_1xs, independent of
+    cell_tag_suffix, so all cells naturally point at the SAME expert-checkpoint location --
+    train_expert only needs to run ONCE (see scripts/run_policy_campaign.sh's RUN_EXPERT).
+
+    `aggs` is LOGGING-ONLY (same convention as this file's own AGG_METHODS/module docstring):
+    federated_optimizing_trigger_policy implements (P^mean), mean aggregation only -- a real
+    trimmed-mean variant is NOT implemented anywhere in this module (modules/
+    federated_optimizing_trigger/utils.py is read-only, and implementing one would be a
+    functional algorithm change out of scope for a campaign launcher). Cells differing only in
+    `agg` are functionally IDENTICAL runs under a different directory name -- kept as an axis
+    only so the grid size/layout matches what a real trimmed-mean variant would need once (if)
+    implemented.
+
+    Returns (cells: list of dicts with solver/seed/beta_local/agg/beta_global/s_beta/paths,
+    refused: list of (solver, seed, beta_local, agg, reason) for infeasible cells).
+    """
+    model_flag = model_flag or MODEL_FLAGS[0]
+    dataset = dataset or DATASETS[0]
+    gamma = NUM_POISONED / (NUM_POISONED + NUM_HONESTS)
+    n_train = N_TRAIN[dataset]
+
+    cells, refused = [], []
+    for solver in solvers:
+        for seed in seeds:
+            for beta_local in betas:
+                for agg in aggs:
+                    beta_global = gamma * beta_local
+                    budget_target_for_naming = round(beta_local * gamma * n_train)
+                    overrides = {
+                        "beta_local": beta_local,
+                        "policy_solver": solver,
+                        "qp_batches_per_checkpoint": QP_BATCHES_PER_CHECKPOINT,
+                        "qp_ridge": QP_RIDGE,
+                    }
+                    paths, reason = generate_cell(
+                        model_flag, dataset, seed, budget_target_for_naming, dry_run=dry_run,
+                        overrides=overrides, cell_tag_suffix=f"{solver}_{agg}",
+                    )
+                    pi_min_approx = 1.0 / 10
+                    s_beta = beta_global / (gamma * pi_min_approx)
+                    cell = {
+                        "solver": solver, "seed": seed, "beta_local": beta_local, "agg": agg,
+                        "beta_global": beta_global, "s_beta": s_beta, "paths": paths,
+                    }
+                    cells.append(cell)
+                    if reason:
+                        refused.append((solver, seed, beta_local, agg, reason))
+    return cells, refused
 
 
 def generate_inner_solve_comparison(dry_run=True):
