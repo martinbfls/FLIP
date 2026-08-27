@@ -53,7 +53,27 @@ read -ra AGGS    <<< "${AGGS:-mean trmean}"
 
 MODEL_FLAG="${MODEL_FLAG:-r32p}"
 DATASET="${DATASET:-cifar}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# PYTHON_BIN resolution: gen_configs.py needs `toml` (schema validation) -- a bare `python3` on
+# the login node's default PATH is frequently a system interpreter without it, even though the
+# project's own conda env (slurm_lib.sh's CONDA_ENV, used inside every submitted job) has it.
+# Prefer an explicit PYTHON_BIN; otherwise fall back to that conda env's interpreter (checked
+# for `toml` before use) rather than failing on whatever `python3` happens to resolve to here.
+if [ -n "${PYTHON_BIN:-}" ]; then
+    : # explicit override wins, no detection needed
+elif command -v python3 >/dev/null 2>&1 && python3 -c "import toml" >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+elif [ -x "${CONDA_ENV:-/shared/data1/Projects/DLWP/j1067582/martin/FLIP/envs/flip_x86_64}/bin/python" ]; then
+    PYTHON_BIN="${CONDA_ENV:-/shared/data1/Projects/DLWP/j1067582/martin/FLIP/envs/flip_x86_64}/bin/python"
+    echo "[NOTE] python3 lacks 'toml' -- using $PYTHON_BIN instead (set PYTHON_BIN to override)."
+else
+    PYTHON_BIN="python3"
+fi
+if ! "$PYTHON_BIN" -c "import toml" >/dev/null 2>&1; then
+    echo "[ABORT] $PYTHON_BIN has no 'toml' module -- activate the project's conda env (e.g." >&2
+    echo "        'conda activate flip_x86_64') or set PYTHON_BIN to an interpreter that has it." >&2
+    exit 1
+fi
 
 echo "[NOTE] AGGS (${AGGS[*]}) is a LOGGING-ONLY axis (same convention as"
 echo "[NOTE] gen_configs.py's own AGG_METHODS): federated_optimizing_trigger_policy implements"
@@ -295,6 +315,22 @@ TIME_PER_TASK="$USER_TIME"
 MEM_PER_TASK="${MEM_PER_TASK_USER:-32G}"
 submit_job_pool_slurm USER_JOBS "camp_user" "$DEP" || exit 1
 echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
+user_barrier=$(submit_barrier_slurm "camp_barrier_user" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 
-echo "[DONE] campaign submitted; job ids in $LOG_DIR/jobids_*.txt"
-echo "[NEXT] once complete: python scripts/collect_policy_campaign.py <campaign_exp_base>"
+# ---------------------------------------------------------------------------
+# Step 4 (Etape 6.3, automatic): once every USER job has completed, collect_policy_campaign.py
+# runs by itself -- this is what makes the whole campaign (submit -> wait -> collect) a single
+# command instead of a submit-then-remember-to-collect-later manual step.
+# ---------------------------------------------------------------------------
+CAMPAIGN_EXP_BASE="$BASE_DIR/experiments/federated_experiments/threat_model_expert_policy"
+TIME_PER_TASK="00:15:00"
+MEM_PER_TASK="8G"
+GPUS_PER_TASK="0"
+CPUS_PER_TASK="1"
+collect_jobid=$(submit_job_slurm \
+    "python scripts/collect_policy_campaign.py $CAMPAIGN_EXP_BASE" \
+    "camp_collect" "afterok:$user_barrier") || exit 1
+echo "[PHASE] COLLECT submitted (job $collect_jobid, after all USER jobs) -> $CAMPAIGN_EXP_BASE/{campaign_results.csv,report.md}"
+
+echo "[DONE] campaign submitted end-to-end; job ids in $LOG_DIR/jobids_*.txt"
+echo "[NEXT] nothing further needed -- report.md lands in $CAMPAIGN_EXP_BASE once camp_collect finishes."

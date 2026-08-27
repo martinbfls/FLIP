@@ -169,8 +169,16 @@ POLICY_INNER_RIDGE = 1e-6
 # SOLVERS axis sweeps {descent, qp} as the primary factor of interest.
 # --------------------------------------------------------------------------- #
 POLICY_SOLVER = "descent"
-QP_BATCHES_PER_CHECKPOINT = 1  # set from Etape 1a.1's m-sweep measurement once run
-QP_RIDGE = 1e-3                # PROVISIONAL -- Etape 2's split-half holdout sweep should set this
+# Etape 1a.1's m-sweep audit (qp_m_sweep_audit, real cluster run): cos(u*(m)) vs. u*(max(m)=20)
+# had not flattened out by m=10 (median 0.927, still +0.073 short of m=20's 1.000) -- 20 is the
+# smallest m where the step-to-step gain becomes small in that run; a shorter history would
+# still be averaging away real minibatch/estimation noise, not yet at the plateau.
+QP_BATCHES_PER_CHECKPOINT = 20
+# Etape 2's split-half holdout sweep (qp_split_half_audit, real cluster run): b2_holdout was
+# within ~5-25% of b2_train across ALL of 1e-6/1e-4/1e-2/1e-1 with no visible ridge-dependence
+# in that range (no conditioning problem at these values) -- 1e-3 is kept as-is, nothing in the
+# sweep argues for moving it.
+QP_RIDGE = 1e-3
 
 # Comparison configurations, extended after the follow-up diagnostics round (B2 >> B2_qp
 # persists even with the inner solve; grad_delta_ratio << 1 most batches; span geometry is
