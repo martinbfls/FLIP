@@ -219,6 +219,14 @@ fi
 # Step 3: resume support -- a cell whose FINAL artifact (train_user's output) already exists is
 # dropped from all three job lists (policy/flips/user), so a re-run of this script only submits
 # what is actually missing.
+#
+# NOTE: output_dir for the train_user config is THE SAME DIRECTORY config.toml itself was just
+# written into (see gen_configs.py's TRAIN_USER_TEMPLATE: output_dir = "{train_user_dir}",
+# and the config is written to train_user_dir/config.toml) -- so "output_dir is non-empty" is
+# true the instant config generation runs, on every cell, on every invocation, whether or not
+# the job ever executed. The actual completion signal federated_train_user writes is
+# paccs.npy/caccs.npy (np.save'd only at the very end of its run -- also what
+# collect_policy_campaign.py itself reads) -- check for those specifically, not "any file".
 # ---------------------------------------------------------------------------
 filter_done() {
     local -n jobs_ref=$1
@@ -229,7 +237,7 @@ filter_done() {
         cfg_rel="${cfg_rel#python run_experiment.py }"
         out_dir=$(grep -E '^\s*output_dir\s*=' "experiments/${cfg_rel}/config.toml" 2>/dev/null \
             | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
-        if [ -n "$out_dir" ] && [ -d "$out_dir" ] && [ -n "$(ls -A "$out_dir" 2>/dev/null)" ]; then
+        if [ -n "$out_dir" ] && [ -f "$out_dir/paccs.npy" ] && [ -f "$out_dir/caccs.npy" ]; then
             continue
         fi
         kept+=("$job")
