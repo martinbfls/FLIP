@@ -165,6 +165,7 @@ def _compute_step_policy(
     diag_constraint_tol=1e-8,
     diag_span_projection=True,
     diag_direction_scaling=True,
+    diag_oneshot_gap=False,
     precomputed=None,
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
@@ -428,6 +429,24 @@ def _compute_step_policy(
             diag_constraint_tol, diag_span_projection, diag_direction_scaling,
         )
 
+        # Etape 0 (one-shot coupling audit, see inner_solve.py's oneshot_coupling_diagnostic
+        # docstring): the existing B2_qp above is the MEAN of independent PER-CHECKPOINT QP
+        # optima (u*_k solved separately for each k in sampled_k) -- NOT the single, coupled
+        # ubar eq:qp's one-shot attack actually needs. Expensive (K+1 extra QP solves) and
+        # opt-in -- only computed on this already-diagnostic batch, and only when explicitly
+        # requested.
+        if diag_oneshot_gap:
+            contexts = inner_solve.build_inner_context(
+                expert_models, sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison,
+                delta.detach(), loss_fn, dataset_flag, model_flag, n_classes, flip_grad_cache,
+                class_samples_raw, pi, gamma, beta, beta_global, normalization, device,
+            )
+            diag_record.update(
+                inner_solve.oneshot_coupling_diagnostic(
+                    contexts, u.detach(), beta, pairs, pi, n_iters=diag_qp_iters,
+                )
+            )
+
     return {
         "B2": B2, "L_bd": L_bd, "lambda_effective": lambda_effective,
         "lambda_effective_ratio": lambda_effective_ratio,
@@ -655,6 +674,7 @@ def optimize_trigger_policy_step(
     policy_inner_min_iters=10,
     policy_inner_ridge=1e-6,
     lambda_b2=1.0,
+    diag_oneshot_gap=False,
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -864,6 +884,7 @@ def optimize_trigger_policy_step(
             diag_direction_scaling=diag_direction_scaling,
             precomputed=precomputed,
             lambda_b2=lambda_b2,
+            diag_oneshot_gap=diag_oneshot_gap,
         )
         B2, L_bd = result["B2"], result["L_bd"]
 
@@ -1062,6 +1083,7 @@ def optimize_trigger_policy(
     policy_inner_min_iters=10,
     policy_inner_ridge=1e-6,
     lambda_b2=1.0,
+    diag_oneshot_gap=False,
 ):
     valid_inner_modes = ("joint", "multi_step", "qp_pgd", "qp_pgd_reset")
     if policy_inner_mode not in valid_inner_modes:
@@ -1392,6 +1414,7 @@ def optimize_trigger_policy(
             policy_inner_min_iters=policy_inner_min_iters,
             policy_inner_ridge=policy_inner_ridge,
             lambda_b2=lambda_b2,
+            diag_oneshot_gap=diag_oneshot_gap,
         )
 
         del expert_models
@@ -1485,6 +1508,7 @@ def run(experiment_name, module_name, **kwargs):
 
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_b2 = args.get("lambda_b2", 1.0)
+    diag_oneshot_gap = args.get("diag_oneshot_gap", False)
     lambda_penalty = args.get("lambda_penalty", 0.0)
     lambda_delta = args.get("lambda_delta", 0.0)
     lambda_tv = args.get("lambda_tv", 0.0)
@@ -1644,6 +1668,7 @@ def run(experiment_name, module_name, **kwargs):
         policy_inner_min_iters=policy_inner_min_iters,
         policy_inner_ridge=policy_inner_ridge,
         lambda_b2=lambda_b2,
+        diag_oneshot_gap=diag_oneshot_gap,
     )
 
     print("Optimized trigger and policy obtained.")

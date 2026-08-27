@@ -45,7 +45,9 @@ from modules.federated_optimizing_trigger.utils import (
     compute_batch_gradients, compute_expected_flip_gradients,
     raw_to_preprocess, raw_to_trigger_preprocess,
 )
-from modules.federated_optimizing_trigger_policy.utils import project_policy_budget
+from modules.federated_optimizing_trigger_policy.utils import (
+    project_policy_budget, project_gradient_descent_local,
+)
 from modules.federated_optimizing_trigger_policy import diagnostics as diag
 
 _EPS_DEN = 1e-8
@@ -236,6 +238,107 @@ def qp_pgd_solve(Q, c, u_init, beta, pairs, pi, max_iters=200, tol=1e-8, min_ite
             prev_obj = cur_obj
 
     return w_t, actual_iters, obj_start, prev_obj, converged
+
+
+def pairwise_cosine_stats(u_list, eps=1e-8):
+    '''
+    cos(u_i, u_j) for every pair i<j in `u_list` -- Etape 0 (one-shot coupling audit), Question
+    2: how much do the independent per-checkpoint QP optima u*_k actually agree with each
+    other? A low mean/min cosine here means a single shared ubar necessarily compromises badly
+    on SOME checkpoints (they disagree on which direction to flip), independent of how well any
+    per-checkpoint solver converges.
+
+    Returns {"mean", "min", "max", "pairs": [((i, j), cos), ...]} -- None fields if fewer than
+    2 policies are given (nothing to pair).
+    '''
+    n = len(u_list)
+    if n < 2:
+        return {"mean": None, "min": None, "max": None, "pairs": []}
+    arrs = [diag.as_numpy(u) for u in u_list]
+    pairs_out = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = arrs[i], arrs[j]
+            denom = (np.linalg.norm(a) * np.linalg.norm(b))
+            cos = float(np.dot(a, b) / denom) if denom > eps else None
+            pairs_out.append(((i, j), cos))
+    vals = [c for _, c in pairs_out if c is not None]
+    return {
+        "mean": float(np.mean(vals)) if vals else None,
+        "min": float(np.min(vals)) if vals else None,
+        "max": float(np.max(vals)) if vals else None,
+        "pairs": pairs_out,
+    }
+
+
+def oneshot_coupling_diagnostic(contexts, u_init, beta, pairs, pi, n_iters=200, ridge=1e-6):
+    '''
+    Etape 0 of the "switch to the exact QP solver" task -- audits whether a SINGLE, coupled
+    ubar (eq:qp: Q = mean_k(Q_k/den_k), c = mean_k(c_k/den_k), exactly `aggregate_qp` below)
+    can serve the whole `contexts` window at once, or whether the checkpoints disagree enough
+    that per-checkpoint optima and the coupled optimum diverge materially.
+
+    For each checkpoint in `contexts`, solves ITS OWN independent QP via
+    `project_gradient_descent_local` -- the SAME function `_compute_step_policy`'s existing
+    B2_qp diagnostic already uses (not a new solver, so this is a fair, apples-to-apples
+    per-checkpoint baseline) -- giving u*_k. Then:
+      1. pairwise_cosine_stats(u*_k list) -- Question 2: how much do the u*_k actually agree?
+      2. solves the COUPLED one-shot QP (`aggregate_qp` + `qp_pgd_solve`) -> ubar.
+      3. oneshot_gap = J(ubar) - mean_k(B2 at u*_k) -- prop:oneshot-gap (Question 3): how much
+         WORSE the single shared policy is, on this window, than the (unrealistic, since it
+         cannot be materialized as one policy) average of each checkpoint's own best response.
+
+    NOTE ON SCOPE: `contexts` is whatever window is passed in -- in run_module.py's usage this
+    is `sampled_k`, ONE BATCH's small (num_chckpt-sized) sample of checkpoints, redrawn every
+    batch (see optimize_trigger_policy_step's P3 comment) -- NOT eq:qp's full [k_0, K]
+    trajectory window. Solving the coupled QP over every checkpoint in the run at every
+    diagnostic batch would be prohibitively expensive and defeats the point of the existing
+    checkpoint subsampling; this diagnostic answers "do checkpoints already disagree within a
+    single small sample", a necessary (not sufficient) condition for full-trajectory coupling
+    to make sense. A stronger, full-window version would need aggregating this same
+    computation across many diagnostic batches/checkpoints outside this function's scope.
+
+    Returns a dict: oneshot_window_size, u_star_pairwise_cosine_mean/min/max,
+    B2_per_checkpoint_mean (== what B2_qp already reports, recomputed here independently as a
+    consistency check), B2_coupled, oneshot_gap_absolute, oneshot_gap_relative,
+    coupled_actual_iters, coupled_converged.
+    '''
+    u_star_per_k = []
+    b2_per_k = []
+    for ctx in contexts:
+        c_k = (ctx["G_obj"].T @ ctx["v"]).detach().cpu().numpy().astype(np.float64)
+        u_star_k, _, _ = project_gradient_descent_local(
+            ctx["Q_obj"], c_k, u_init, beta, ctx["pairs_k"], pi, n_iters=n_iters, ridge=ridge,
+        )
+        u_star_per_k.append(u_star_k)
+        b2_per_k.append(diag.b2_value(ctx["G_obj"], u_star_k, ctx["v"], ctx["den"])[0])
+
+    cosine_stats = pairwise_cosine_stats(u_star_per_k)
+    b2_per_checkpoint_mean = float(np.mean(b2_per_k))
+
+    Q_agg, c_agg, pairs_agg = aggregate_qp(contexts)
+    ubar, actual_iters, _, _, converged = qp_pgd_solve(
+        Q_agg, c_agg, u_init, beta, pairs_agg, pi,
+        max_iters=n_iters, tol=1e-12, min_iters=n_iters, ridge=ridge,
+    )
+    b2_coupled = aggregate_b2(ubar, contexts)
+
+    eps = 1e-8
+    gap_abs = b2_coupled - b2_per_checkpoint_mean
+    gap_rel = gap_abs / max(abs(b2_per_checkpoint_mean), eps)
+
+    return {
+        "oneshot_window_size": len(contexts),
+        "u_star_pairwise_cosine_mean": cosine_stats["mean"],
+        "u_star_pairwise_cosine_min": cosine_stats["min"],
+        "u_star_pairwise_cosine_max": cosine_stats["max"],
+        "B2_per_checkpoint_mean": b2_per_checkpoint_mean,
+        "B2_coupled": b2_coupled,
+        "oneshot_gap_absolute": gap_abs,
+        "oneshot_gap_relative": gap_rel,
+        "coupled_actual_iters": actual_iters,
+        "coupled_converged": converged,
+    }
 
 
 def check_feasible(u, beta, pairs, pi, tol=1e-8):

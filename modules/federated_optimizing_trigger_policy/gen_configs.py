@@ -129,6 +129,10 @@ DIAG_ACTUAL_GRADIENT_EVERY = 0
 DIAG_CONSTRAINT_TOL = 1e-8
 DIAG_SPAN_PROJECTION = True
 DIAG_DIRECTION_SCALING = True
+DIAG_ONESHOT_GAP = False  # Etape 0 audit ("switch to the exact QP solver" task): EXPENSIVE
+                          # (K+1 extra QP solves per diagnostic batch) -- OFF by default for
+                          # normal campaigns; see generate_oneshot_gap_audit below for a
+                          # dedicated single-cell run with this turned on.
 
 # --------------------------------------------------------------------------- #
 # Controlled inner-solve experiment (modules/federated_optimizing_trigger_policy/inner_solve.py)
@@ -353,6 +357,7 @@ diag_actual_gradient_every = {diag_actual_gradient_every}
 diag_constraint_tol = {diag_constraint_tol}
 diag_span_projection = {diag_span_projection}
 diag_direction_scaling = {diag_direction_scaling}
+diag_oneshot_gap = {diag_oneshot_gap}
 
 # Controlled inner-solve experiment (modules/federated_optimizing_trigger_policy/inner_solve.py)
 # -- "joint" (default) is the unchanged co-descent; see that module's docstring for the others.
@@ -444,6 +449,9 @@ def generate_cell(
         lambda_b2=LAMBDA_B2,
         lr_delta=LR_DELTA,
         lr_policy=LR_POLICY,
+        diag_oneshot_gap=DIAG_ONESHOT_GAP,
+        diag_qp_iters=DIAG_QP_ITERS,
+        diag_every=DIAG_EVERY,
     )
     if overrides:
         cell_config.update(overrides)
@@ -525,8 +533,8 @@ def generate_cell(
             alpha_ckpt=ALPHA_CKPT,
             num_chckpt=NUM_CHCKPT,
             normalization=NORMALIZATION,
-            diag_every=DIAG_EVERY,
-            diag_qp_iters=DIAG_QP_ITERS,
+            diag_every=cell_config["diag_every"],
+            diag_qp_iters=cell_config["diag_qp_iters"],
             diag_qp_convergence=_toml_bool(DIAG_QP_CONVERGENCE),
             diag_qp_check_iters=DIAG_QP_CHECK_ITERS,
             diag_policy_nnz_threshold=DIAG_POLICY_NNZ_THRESHOLD,
@@ -539,6 +547,7 @@ def generate_cell(
             diag_constraint_tol=DIAG_CONSTRAINT_TOL,
             diag_span_projection=_toml_bool(DIAG_SPAN_PROJECTION),
             diag_direction_scaling=_toml_bool(DIAG_DIRECTION_SCALING),
+            diag_oneshot_gap=_toml_bool(cell_config["diag_oneshot_gap"]),
             policy_inner_mode=cell_config["policy_inner_mode"],
             policy_inner_steps=cell_config["policy_inner_steps"],
             policy_inner_iters=cell_config["policy_inner_iters"],
@@ -658,6 +667,30 @@ def generate_all_configs(dry_run=False):
     return all_paths, refused
 
 
+def generate_oneshot_gap_audit(dry_run=True):
+    """
+    Etape 0 of the "switch to the exact QP solver" task: a single cell (first model/dataset/
+    seed/budget, same as generate_single_cell) with diag_oneshot_gap turned ON -- answers,
+    directly from the resulting diagnostics.jsonl, whether:
+      (1) the existing B2_qp is per-checkpoint or already coupled (it is per-checkpoint --
+          established by code inspection, not this run, see the written report);
+      (2) how much the independent per-checkpoint QP optima u*_k actually agree
+          (u_star_pairwise_cosine_mean/min/max);
+      (3) the one-shot gap J(ubar) - mean_k(B2_qp,k) (oneshot_gap_absolute/relative).
+    diag_qp_iters is raised (500, vs. the campaign default 50) so the per-checkpoint AND coupled
+    solves are both closer to convergence -- this audit's whole point is to measure a genuine
+    gap, not solver noise. diag_every is lowered (5, vs. the campaign default 50) so a short
+    diagnostic run (see N_STEPS) still produces several audited batches.
+    """
+    paths, reason = generate_cell(
+        MODEL_FLAGS[0], DATASETS[0], SEEDS[0], BUDGETS_TARGET[0], dry_run=dry_run,
+        overrides={"diag_oneshot_gap": True, "diag_qp_iters": 500, "diag_every": 5},
+        cell_tag_suffix="oneshot_gap_audit",
+    )
+    refused = [(MODEL_FLAGS[0], DATASETS[0], BUDGETS_TARGET[0], SEEDS[0], reason)] if reason else []
+    return paths, refused
+
+
 def generate_inner_solve_comparison(dry_run=True):
     """
     Generates ONE cell (first model/dataset/seed/budget, same as generate_single_cell) PER
@@ -711,9 +744,21 @@ if __name__ == "__main__":
         "(modules/federated_optimizing_trigger_policy/inner_solve.py) and the lambda_b2/"
         "two-timescale-lr follow-up experiments.",
     )
+    parser.add_argument(
+        "--oneshot-gap-audit",
+        action="store_true",
+        help="Etape 0 of the 'switch to the exact QP solver' task: one cell with "
+        "diag_oneshot_gap=true (diag_qp_iters=500, diag_every=5) -- logs, per diagnostic "
+        "batch, the pairwise cosine similarity between independent per-checkpoint QP optima "
+        "and the one-shot gap between the coupled ubar and the mean per-checkpoint optimum. "
+        "See generate_oneshot_gap_audit's docstring.",
+    )
     args = parser.parse_args()
-    assert sum([args.minimal, args.single_cell, args.inner_solve_comparison]) <= 1, (
-        "pass at most one of --minimal/--single-cell/--inner-solve-comparison"
+    assert sum([
+        args.minimal, args.single_cell, args.inner_solve_comparison, args.oneshot_gap_audit,
+    ]) <= 1, (
+        "pass at most one of --minimal/--single-cell/--inner-solve-comparison/"
+        "--oneshot-gap-audit"
     )
 
     if args.single_cell:
@@ -722,6 +767,8 @@ if __name__ == "__main__":
         gen_fn = generate_minimal_campaign
     elif args.inner_solve_comparison:
         gen_fn = generate_inner_solve_comparison
+    elif args.oneshot_gap_audit:
+        gen_fn = generate_oneshot_gap_audit
     else:
         gen_fn = generate_all_configs
     paths, refused = gen_fn(dry_run=args.dry_run)

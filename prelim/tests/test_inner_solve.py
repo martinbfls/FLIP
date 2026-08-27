@@ -45,6 +45,24 @@ def _make_context(seed, D=10, den=1.0):
     }
 
 
+def _directional_context(pair_idx, seed, D=6, strength=5.0, den=1.0):
+    '''A context deliberately built so its OWN QP optimum concentrates mass on `pair_idx`
+    (v is aligned almost entirely with that one column of G) -- used to build checkpoints that
+    genuinely DISAGREE on which pair to flip, for test_oneshot_coupling_diagnostic_disagreement.'''
+    rng = np.random.RandomState(seed)
+    G_np = rng.normal(scale=0.01, size=(D, len(PAIRS)))
+    v_np = np.zeros(D)
+    v_np[0] = 1.0
+    G_np[:, pair_idx] = strength * v_np
+    G = torch.tensor(G_np, dtype=torch.float64)
+    v = torch.tensor(v_np, dtype=torch.float64)
+    Q_obj = (G_np.T @ G_np).astype(np.float64)
+    return {
+        "k": seed, "G_obj": G, "Q_obj": Q_obj, "pairs_k": PAIRS, "rho_k": 1.0, "v": v,
+        "den": den,
+    }
+
+
 # --------------------------------------------------------------------------#
 # E. Multi-checkpoint aggregation: the QP built from >1 checkpoints must be the DEN-weighted
 # mean over ALL of them, not an arbitrary single one.
@@ -213,6 +231,68 @@ def test_multi_step_update_improves_and_feasible():
     check("u is feasible after multi_step_update", isolve.check_feasible(u.detach(), BETA, pairs_agg, PI))
 
 
+# --------------------------------------------------------------------------#
+# Etape 0 (one-shot coupling audit): pairwise_cosine_stats and oneshot_coupling_diagnostic.
+# --------------------------------------------------------------------------#
+
+def test_pairwise_cosine_stats_identical_and_orthogonal():
+    a = np.array([1.0, 2.0, 3.0])
+    check("identical vectors -> cosine 1.0",
+          abs(isolve.pairwise_cosine_stats([a, a.copy()])["mean"] - 1.0) < 1e-9)
+
+    b = np.array([1.0, 0.0])
+    c = np.array([0.0, 1.0])
+    stats = isolve.pairwise_cosine_stats([b, c])
+    check("orthogonal vectors -> cosine 0.0", abs(stats["mean"]) < 1e-9, f"got {stats['mean']}")
+
+    stats_single = isolve.pairwise_cosine_stats([a])
+    check("fewer than 2 policies -> None fields, no crash", stats_single["mean"] is None)
+
+
+def test_oneshot_coupling_diagnostic_identical_checkpoints_zero_gap():
+    # _directional_context (not _make_context) -- guarantees a non-degenerate (nonzero) QP
+    # optimum: a random G/v pair can easily have c = G^T v with no positive component, in which
+    # case the correct optimum IS u*=0 and cosine is undefined (nothing to compare direction
+    # against) -- not a bug, just not what this test wants to exercise.
+    ctx = _directional_context(pair_idx=0, seed=20)
+    # Two independent context objects but with the IDENTICAL (G, v, den) -- checkpoints that
+    # agree perfectly should show cosine ~= 1 and ~zero one-shot gap (the coupled ubar and the
+    # per-checkpoint optima coincide when there is nothing to disagree about).
+    ctx_copy = {**ctx, "k": 21}
+    result = isolve.oneshot_coupling_diagnostic(
+        [ctx, ctx_copy], np.zeros(len(PAIRS)), BETA, PAIRS, PI, n_iters=300,
+    )
+    check("identical checkpoints: u*_k pairwise cosine ~= 1",
+          abs(result["u_star_pairwise_cosine_mean"] - 1.0) < 1e-3,
+          f"cosine_mean={result['u_star_pairwise_cosine_mean']}")
+    check("identical checkpoints: one-shot gap ~= 0",
+          abs(result["oneshot_gap_absolute"]) < 1e-3,
+          f"gap_absolute={result['oneshot_gap_absolute']}")
+    check("oneshot_window_size reports the number of contexts passed in",
+          result["oneshot_window_size"] == 2)
+
+
+def test_oneshot_coupling_diagnostic_disagreeing_checkpoints_positive_gap():
+    # Two checkpoints deliberately built to WANT different pairs flipped (pair 0 vs pair 2,
+    # different source classes so neither is capped by the other's per-class budget) -- a
+    # single shared ubar must compromise, so the gap should be clearly positive and the
+    # per-checkpoint optima should NOT agree (cosine well below 1).
+    ctx_a = _directional_context(pair_idx=0, seed=30)
+    ctx_b = _directional_context(pair_idx=2, seed=31)
+    result = isolve.oneshot_coupling_diagnostic(
+        [ctx_a, ctx_b], np.zeros(len(PAIRS)), BETA, PAIRS, PI, n_iters=300,
+    )
+    check("disagreeing checkpoints: u*_k pairwise cosine well below 1",
+          result["u_star_pairwise_cosine_mean"] < 0.5,
+          f"cosine_mean={result['u_star_pairwise_cosine_mean']}")
+    check("disagreeing checkpoints: one-shot gap is clearly positive (a shared ubar must compromise)",
+          result["oneshot_gap_absolute"] > 1e-3,
+          f"gap_absolute={result['oneshot_gap_absolute']:.6f}")
+    check("disagreeing checkpoints: B2_coupled >= B2_per_checkpoint_mean (coupling can only hurt, "
+          "never help, relative to each checkpoint's own independent optimum)",
+          result["B2_coupled"] >= result["B2_per_checkpoint_mean"] - 1e-9)
+
+
 if __name__ == "__main__":
     test_aggregate_qp_is_weighted_mean_not_single_checkpoint()
     test_aggregate_b2_matches_mean_of_per_checkpoint_b2()
@@ -221,6 +301,9 @@ if __name__ == "__main__":
     test_warm_start_and_cold_start_converge_to_the_same_point()
     test_check_feasible()
     test_multi_step_update_improves_and_feasible()
+    test_pairwise_cosine_stats_identical_and_orthogonal()
+    test_oneshot_coupling_diagnostic_identical_checkpoints_zero_gap()
+    test_oneshot_coupling_diagnostic_disagreeing_checkpoints_positive_gap()
 
     n_fail = sum(1 for _, ok, _ in _results if not ok)
     print(f"\n{len(_results) - n_fail}/{len(_results)} checks passed.")
