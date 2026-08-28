@@ -120,6 +120,13 @@ def _build_poison_mask(y, n_b, source_label, target_label, lambda_poison):
         mask[keep] = True
         y_poison[mask] = target_label
 
+    # Recomputed AFTER subsampling, not reused from the pre-subsample `mask.sum()>0` above:
+    # when target_count==0 (lambda_poison < 1/(2*n_b), e.g. lambda_poison~0.015 against
+    # batch_size_trigger=256 rounds to 0 source rows kept), the pre-subsample `has_poison` was
+    # still True even though the final `mask` below is empty -- v would then be identically 0
+    # (no poisoned rows to build mu_p from) while has_poison claimed otherwise, silently
+    # pulling u toward 0 on these batches (see run_module.py's module-level bug note, task 2).
+    has_poison = bool(mask.sum().item() > 0)
     lambda_effective = mask.sum().item() / n_b if n_b > 0 else 0.0
     lambda_effective_ratio = lambda_effective / lambda_poison if lambda_poison > 0 else 0.0
     return mask, y_poison, has_poison, lambda_effective, lambda_effective_ratio
@@ -241,6 +248,14 @@ def _compute_step_policy(
         )
         lambda_effective = precomputed["lambda_effective"]
         lambda_effective_ratio = precomputed["lambda_effective_ratio"]
+
+    if not has_poison:
+        # Task 2: `has_poison` above is now post-subsampling (see `_build_poison_mask`) --
+        # an empty mask means v is identically 0 for every checkpoint this batch (no poisoned
+        # rows to build mu_p from), so B2 = ||Gu||^2/rho_k^2 would actively pull u toward 0 on
+        # a batch that carries no real signal about v(delta) at all. Skip the batch entirely
+        # rather than compute and backward through a step_loss that is pure noise pressure on u.
+        return {"skipped": True}
 
     B2_sum, bd_loss_sum = None, None
     B2_rho_sum, B2_v_sum, B2_qp_sum = None, None, None
@@ -802,6 +817,11 @@ def optimize_trigger_policy_step(
     }
 
     diag_event_counter = 0
+    # Task 2: batches whose poison mask is empty post-subsampling (v identically 0) carry no
+    # real signal about v(delta) and are skipped rather than computed -- counted here and
+    # surfaced in step_summary so a run where this fires often (lambda_poison too small
+    # relative to batch_size_trigger) is visible rather than silently degrading u/delta.
+    n_skipped = 0
 
     for batch_idx, batch in enumerate(pbar):
         optimizer_delta.zero_grad()
@@ -834,6 +854,14 @@ def optimize_trigger_policy_step(
             mask_b, y_poison_b, has_poison_b, lam_eff_b, lam_eff_ratio_b = _build_poison_mask(
                 y_b, x_raw_b.shape[0], source_label, target_label, lambda_poison,
             )
+            if not has_poison_b:
+                # Task 2: same empty-mask case as _compute_step_policy's own check, but caught
+                # HERE (before build_inner_context/aggregate_qp/the inner QP solve) so this
+                # mode doesn't spend the whole inner-solve pass on a batch whose v is
+                # identically 0 -- _compute_step_policy's check below would catch it too, but
+                # only after that work already ran.
+                n_skipped += 1
+                continue
             precomputed = {
                 "x_raw": x_raw_b, "y": y_b, "x_clean": x_clean_b, "mask": mask_b,
                 "y_poison": y_poison_b, "has_poison": has_poison_b,
@@ -1016,6 +1044,9 @@ def optimize_trigger_policy_step(
             diag_split_half=diag_split_half,
             diag_split_half_ridge_values=diag_split_half_ridge_values,
         )
+        if result.get("skipped"):
+            n_skipped += 1
+            continue
         B2, L_bd = result["B2"], result["L_bd"]
 
         if run_diag and diagnostics_writer is not None and result["diag_record"] is not None:
@@ -1141,6 +1172,7 @@ def optimize_trigger_policy_step(
         key: (sum(vals) / len(vals) if vals else None)
         for key, vals in metrics_history.items()
     }
+    step_summary["n_skipped"] = n_skipped
     return delta, u, step_summary
 
 
