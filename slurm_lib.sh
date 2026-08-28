@@ -35,6 +35,16 @@ set -u
 # ~2 TB RAM, MaxTime=1-00:00:00).
 # ---------------------------------------------------------------------------
 SLURM_PARTITION="${SLURM_PARTITION:-cypress_dgx}"
+
+# Space-separated list of partitions to spread GPU jobs across (round-robin
+# in submit_job_pool_slurm), to maximize the number of GPUs available to a
+# campaign at once when the same jobs are eligible on more than one
+# partition. Defaults to just SLURM_PARTITION, so single-partition behavior
+# is unchanged unless SLURM_PARTITIONS is set explicitly, e.g.:
+#   SLURM_PARTITIONS="cypress_dgx other_dgx_partition" ./orchestrate_...sh
+SLURM_PARTITIONS="${SLURM_PARTITIONS:-$SLURM_PARTITION}"
+read -ra _SLURM_PARTITIONS_ARR <<< "$SLURM_PARTITIONS"
+
 # R&D Line / account required by this cluster. Run `slurmaccounts` to list
 # the accounts you may charge jobs to. Nothing can be submitted without it.
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-power}"
@@ -45,9 +55,10 @@ CPUS_PER_TASK="${CPUS_PER_TASK:-14}"         # CPUs per experiment
 MEM_PER_TASK="${MEM_PER_TASK:-32G}"          # RAM per experiment
 TIME_PER_TASK="${TIME_PER_TASK:-1-00:00:00}" # walltime per experiment
 
-# Partition used for the tiny CPU-only barrier job. Defaults to the same
-# partition; override if a general-purpose CPU partition exists.
-BARRIER_PARTITION="${BARRIER_PARTITION:-$SLURM_PARTITION}"
+# Partition used for the tiny CPU-only barrier job. Defaults to the first
+# entry of SLURM_PARTITIONS; override if a general-purpose CPU partition
+# exists.
+BARRIER_PARTITION="${BARRIER_PARTITION:-${_SLURM_PARTITIONS_ARR[0]}}"
 
 # Set to 0 if this Slurm build does not support --kill-on-invalid-dep.
 # With 0, jobs whose dependency can never be satisfied stay PENDING with
@@ -99,29 +110,36 @@ preflight_slurm() {
         return 1
     fi
 
-    if ! sinfo -h -p "$SLURM_PARTITION" -o "%P" 2>/dev/null | grep -q .; then
-        echo "[PREFLIGHT] partition '$SLURM_PARTITION' unknown or unreachable" >&2
-        rc=1
-    fi
+    local partition
+    for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
+        if ! sinfo -h -p "$partition" -o "%P" 2>/dev/null | grep -q .; then
+            echo "[PREFLIGHT] partition '$partition' unknown or unreachable" >&2
+            rc=1
+        fi
+    done
 
-    # Trial submission (--test-only validates and submits nothing). Catches a
-    # bad account, an unknown QOS or an association limit before 450 real
-    # submissions hit the same wall. The dependency flag is included so the
-    # exact command shape used later is what gets validated.
+    # Trial submission per partition (--test-only validates and submits
+    # nothing). Catches a bad account, an unknown QOS, an association limit,
+    # or a partition this account can't use, before 450 real submissions hit
+    # the same wall. The dependency flag is included so the exact command
+    # shape used later is what gets validated.
     local probe probe_rc
-    probe=$(sbatch --kill-on-invalid-dep=yes --test-only \
-                   --account="$SLURM_ACCOUNT" \
-                   --partition="$SLURM_PARTITION" --time=00:01:00 \
-                   --wrap=true 2>&1)
-    probe_rc=$?
+    for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
+        probe=$(sbatch --kill-on-invalid-dep=yes --test-only \
+                       --account="$SLURM_ACCOUNT" \
+                       --partition="$partition" --time=00:01:00 \
+                       --wrap=true 2>&1)
+        probe_rc=$?
 
-    if [ $probe_rc -ne 0 ]; then
-        # Any other rejection (bad account, unknown QOS, limits...) would hit
-        # all 450 submissions. Surface sbatch's own message and stop here.
-        echo "[PREFLIGHT] a trial submission was rejected by Slurm:" >&2
-        echo "$probe" | sed 's/^/[PREFLIGHT]   /' >&2
-        rc=1
-    fi
+        if [ $probe_rc -ne 0 ]; then
+            # Any other rejection (bad account, unknown QOS, limits...) would
+            # hit all real submissions to this partition. Surface sbatch's
+            # own message and stop here.
+            echo "[PREFLIGHT] a trial submission to partition '$partition' was rejected by Slurm:" >&2
+            echo "$probe" | sed 's/^/[PREFLIGHT]   /' >&2
+            rc=1
+        fi
+    done
 
     if [ ! -x "$CONDA_ENV/bin/python" ]; then
         echo "[PREFLIGHT] warning: $CONDA_ENV/bin/python not visible from this host" >&2
@@ -142,7 +160,7 @@ join_job_ids() {
 }
 
 # ---------------------------------------------------------------------------
-# submit_job_slurm COMMAND SAFE_NAME [DEPENDENCY_SPEC]
+# submit_job_slurm COMMAND SAFE_NAME [DEPENDENCY_SPEC] [PARTITION]
 #
 # Submits ONE experiment as an independent Slurm job and prints its JobID on
 # stdout (everything else goes to stderr, so the caller can capture the id).
@@ -150,11 +168,14 @@ join_job_ids() {
 # integer -- a malformed id must never reach a --dependency string.
 #
 # DEPENDENCY_SPEC is passed as-is to --dependency (e.g. "afterok:12345").
+# PARTITION defaults to $SLURM_PARTITION when omitted, for callers that
+# don't care about spreading jobs across SLURM_PARTITIONS themselves.
 # ---------------------------------------------------------------------------
 submit_job_slurm() {
     local cmd="$1"
     local safe_name="$2"
     local dependency="${3:-}"
+    local partition="${4:-$SLURM_PARTITION}"
 
     local log_file="$LOG_DIR/${safe_name}.log"
     local done_file="$LOG_DIR/${safe_name}.done"
@@ -173,7 +194,7 @@ submit_job_slurm() {
     jobid=$(sbatch --parsable \
            --job-name="$safe_name" \
            --account="$SLURM_ACCOUNT" \
-           --partition="$SLURM_PARTITION" \
+           --partition="$partition" \
            --gres="gpu:$GPUS_PER_TASK" \
            --ntasks=1 \
            --cpus-per-task="$CPUS_PER_TASK" \
@@ -286,6 +307,10 @@ submit_barrier_slurm() {
 # jobs to run. Submitted ids are left in the global array SUBMITTED_JOB_IDS
 # and also written to $LOG_DIR/jobids_PHASE.txt.
 #
+# Jobs are spread round-robin across SLURM_PARTITIONS (a single partition,
+# i.e. the old behavior, when it wasn't set), so a campaign can use more
+# than one partition's GPUs concurrently instead of queueing on just one.
+#
 # Returns non-zero if any submission failed, so the caller can abort before
 # building a dependency on an incomplete phase.
 # ---------------------------------------------------------------------------
@@ -293,6 +318,10 @@ submit_job_pool_slurm() {
     local -n JOBS=$1
     local PHASE=$2
     local DEPENDENCY="${3:-}"
+
+    local -a PARTS
+    read -ra PARTS <<< "$SLURM_PARTITIONS"
+    local NPARTS=${#PARTS[@]}
 
     local TOTAL=${#JOBS[@]}
     local INDEX=0
@@ -303,17 +332,18 @@ submit_job_pool_slurm() {
     local id_file="$LOG_DIR/jobids_${PHASE}.txt"
     : > "$id_file"
 
-    echo "[SUBMIT $PHASE] total jobs = $TOTAL, dependency = ${DEPENDENCY:-none}" >&2
+    echo "[SUBMIT $PHASE] total jobs = $TOTAL, dependency = ${DEPENDENCY:-none}, partitions = ${PARTS[*]}" >&2
 
     while (( INDEX < TOTAL )); do
         local job="${JOBS[$INDEX]}"
         local cmd safe_name jobid
         IFS='|' read -r cmd safe_name <<< "$job"
+        local partition="${PARTS[$((INDEX % NPARTS))]}"
 
-        if jobid=$(submit_job_slurm "$cmd" "$safe_name" "$DEPENDENCY"); then
+        if jobid=$(submit_job_slurm "$cmd" "$safe_name" "$DEPENDENCY" "$partition"); then
             SUBMITTED_JOB_IDS+=("$jobid")
             echo "$jobid $safe_name" >> "$id_file"
-            echo "[SUBMIT $PHASE] ($((INDEX + 1))/$TOTAL) $safe_name -> job $jobid" >&2
+            echo "[SUBMIT $PHASE] ($((INDEX + 1))/$TOTAL) $safe_name -> job $jobid (partition=$partition)" >&2
         else
             FAILED=$((FAILED + 1))
             echo "[SUBMIT $PHASE] ($((INDEX + 1))/$TOTAL) FAILED to submit: $safe_name" >&2
