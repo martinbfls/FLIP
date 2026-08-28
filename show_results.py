@@ -1,8 +1,11 @@
 import os
 import numpy as np
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
+from torchvision import transforms
 
+from modules.base_utils.datasets import load_dataset, pick_poisoner
 from modules.federated_generate_labels_trigger_joint.gen_configs import (
     EXP_BASE,
     MODEL_FLAGS,
@@ -10,6 +13,10 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     AGG_METHODS,
     SEEDS,
     BUDGETS,
+    NUM_POISONED,
+    NUM_HONESTS,
+    SOURCE_LABEL,
+    TARGET_LABEL,
     cell_name,
 )
 
@@ -120,6 +127,80 @@ def compute_cta_pta_mean_var(
         )
 
     return pd.DataFrame.from_records(records)
+
+
+# =========================
+# TRIGGER VISUALS
+# =========================
+def trigger_path(model_flag, dataset, agg_method, seed):
+    """Path to the .pt trigger written by federated_generate_labels_trigger_joint's
+    run_module.py (torch.save(delta, ...), see its `trig_path` build). Mirrors
+    gen_configs.py's JOINT_TRIGGER_TEMPLATE exactly: output_dir_trigger =
+    "{module_dir}/trigger" where module_dir = cell_dir/"gen_labels_trigger_joint",
+    and the filename is init="stripe" (the module's own default, unchanged by
+    gen_configs.py) with run_tag=f"{num_poisoned}vs{num_honests}"."""
+    return (
+        EXP_BASE
+        / cell_name(model_flag, dataset, agg_method, seed)
+        / "gen_labels_trigger_joint"
+        / "trigger"
+        / f"opt_trig_direct_joint_stripe_{model_flag}_{dataset}_{NUM_POISONED}vs{NUM_HONESTS}.pt"
+    )
+
+
+def save_trigger_visual(model_flag, dataset, agg_method, seed, sample_seed=0):
+    """Renders clean-vs-poisoned side by side for one generated trigger and saves
+    the PNG next to the .pt file itself (same `trigger/` directory)."""
+    trig_path = trigger_path(model_flag, dataset, agg_method, seed)
+    if not trig_path.exists():
+        return None
+
+    dataset_obj = load_dataset(dataset, train=True)
+    indices = [i for i, (_, y) in enumerate(dataset_obj) if y == SOURCE_LABEL]
+    idx = np.random.RandomState(sample_seed).choice(indices)
+    img, _ = dataset_obj[idx]
+
+    clean_img = img
+    if isinstance(clean_img, torch.Tensor):
+        clean_img = transforms.ToPILImage()(clean_img)
+
+    poisoner = pick_poisoner("optimized", dataset, TARGET_LABEL, delta=str(trig_path))
+    poisoned_img, _ = poisoner.poison((img, SOURCE_LABEL))
+    if isinstance(poisoned_img, torch.Tensor):
+        poisoned_img = transforms.ToPILImage()(poisoned_img)
+
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3.2))
+    axes[0].imshow(clean_img)
+    axes[0].set_title("Clean image", fontsize=11)
+    axes[0].axis("off")
+    axes[1].imshow(poisoned_img)
+    axes[1].set_title(f"Poisoned ({agg_method}, seed{seed})", fontsize=11)
+    axes[1].axis("off")
+    plt.tight_layout()
+
+    out_path = trig_path.with_suffix(".png")
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] Saved trigger visual: {out_path}")
+    return out_path
+
+
+def save_all_trigger_visuals(model_flags, datasets, agg_methods, seeds):
+    saved, missing = [], []
+    for model_flag in model_flags:
+        for dataset in datasets:
+            for agg_method in agg_methods:
+                for seed in seeds:
+                    out_path = save_trigger_visual(model_flag, dataset, agg_method, seed)
+                    if out_path is None:
+                        missing.append((model_flag, dataset, agg_method, seed))
+                    else:
+                        saved.append(out_path)
+    if missing:
+        print(f"[INFO] {len(missing)} trigger(s) not found yet (skipped):")
+        for model_flag, dataset, agg_method, seed in missing:
+            print(f"  {trigger_path(model_flag, dataset, agg_method, seed)}")
+    return saved
 
 
 def compute_best_second(block, budgets, aggregators):
@@ -345,6 +426,9 @@ if __name__ == "__main__":
     os.makedirs(CSV_DIR, exist_ok=True)
     os.makedirs(TABLE_DIR, exist_ok=True)
     os.makedirs(PLOT_DIR, exist_ok=True)
+
+    print("\n=== Trigger visuals ===")
+    save_all_trigger_visuals(MODEL_FLAGS, DATASETS, AGG_METHODS, SEEDS)
 
     for model_flag in MODEL_FLAGS:
         for dataset in DATASETS:
