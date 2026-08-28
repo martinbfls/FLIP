@@ -21,6 +21,7 @@ Two guardrails specific to this module (docs/policy_module_audit_report.md, Bloc
      collapses for reasons unrelated to whatever is being swept) -- refused outright, not just
      warned about.
 """
+
 import argparse
 import math
 import os
@@ -39,7 +40,7 @@ from modules.federated_optimizing_trigger.utils import init_delta
 # --------------------------------------------------------------------------- #
 NUM_POISONED = 3
 NUM_HONESTS = 7
-SEEDS = [0]
+SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 AGG_METHODS = ["mean", "multikrum"]
 DATASETS = ["cifar"]
@@ -52,7 +53,9 @@ TARGET_LABEL = 4
 # a cross-module comparison MUST set both to the SAME value; see the warning this generator
 # prints when they differ.
 CHECKPOINT_SAMPLING = "biased"
-INDIRECT_MODULE_CHECKPOINT_SAMPLING = "uniform"  # mirrors the sibling generator's default
+INDIRECT_MODULE_CHECKPOINT_SAMPLING = (
+    "uniform"  # mirrors the sibling generator's default
+)
 
 ALPHA_CKPT = 0.01
 TRAIN_PCT = 1.0
@@ -66,14 +69,16 @@ N_ITERATIONS = 15
 # `single_cell` mode (see generate_single_cell / --single-cell) fixes ALL of these to the
 # defaults below and sweeps only the main axes (SEEDS/BUDGETS/AGG_METHODS).
 # --------------------------------------------------------------------------- #
-EPSILON = 0.1        # L_infinity bound on the trigger delta -- larger allows a stronger/more
-                      # visible perturbation; too small can make the backdoor unreachable.
-LR_DELTA = 1e-2       # Adam learning rate for the trigger optimization.
-LAMBDA_BD = 1.0       # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
-                      # formulas) -- higher pushes harder for backdoor success at the cost of
-                      # the matching term.
-GAMMA_STEALTH = 1.0   # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
-                      # to federated_optimizing_trigger_policy's gamma -- disjoint concept).
+EPSILON = 0.1  # L_infinity bound on the trigger delta -- larger allows a stronger/more
+# visible perturbation; too small can make the backdoor unreachable.
+LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization.
+LAMBDA_BD = 1.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
+# formulas) -- higher pushes harder for backdoor success at the cost of
+# the matching term.
+GAMMA_STEALTH = (
+    1.0  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
+)
+# to federated_optimizing_trigger_policy's gamma -- disjoint concept).
 # lambda_trigger_l2 (schema's lambda_delta): the L2-norm penalty on delta. Kept at 0.0 in THIS
 # module specifically -- the descent toward a null trigger (delta -> 0) is exactly the
 # collapse mode this module's anti-collapse machinery (trigger_constraint/align_kappa/
@@ -99,7 +104,9 @@ MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
 
 CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 
-EXP_BASE = Path("experiments/federated_experiments/threat_model_direct_trigger_joint").resolve()
+EXP_BASE = Path(
+    "experiments/federated_experiments/threat_model_direct_trigger_joint"
+).resolve()
 
 MODULE_NAME = "federated_generate_labels_trigger_joint"
 
@@ -120,7 +127,9 @@ def validate_config(path: Path):
     exp_toml = toml.load(path)
     for module_name, module_config in exp_toml.items():
         schema_path = Path("schemas") / f"{module_name}.toml"
-        assert schema_path.exists(), f"Malformed module! Schema {schema_path} does not exist."
+        assert schema_path.exists(), (
+            f"Malformed module! Schema {schema_path} does not exist."
+        )
         schema = toml.load(schema_path)
         optionals = list(schema.get("OPTIONAL", {}).keys())
 
@@ -154,7 +163,12 @@ def check_delta_min_feasible(dataset, epsilon, delta_min_frac):
         )
     shape = _TRIGGER_SHAPE[dataset]
     delta_init = init_delta(
-        shape, horizontal=True, strength=_STRENGTH, freq=_FREQ, device="cpu", init="stripe",
+        shape,
+        horizontal=True,
+        strength=_STRENGTH,
+        freq=_FREQ,
+        device="cpu",
+        init="stripe",
     )
     delta_min = delta_min_frac * delta_init.detach().norm().item()
     numel = shape[0] * shape[1] * shape[2]
@@ -245,11 +259,14 @@ schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 
 
 def cell_name(model_flag, dataset, agg_method, seed):
-    return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
+    return (
+        f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
+    )
 
 
-def generate_cell(model_flag, dataset, agg_method, seed, budgets, dry_run=False,
-                   delta_min_frac=None):
+def generate_cell(
+    model_flag, dataset, agg_method, seed, budgets, dry_run=False, delta_min_frac=None
+):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
 
     if CHECKPOINT_SAMPLING != INDIRECT_MODULE_CHECKPOINT_SAMPLING:
@@ -261,7 +278,9 @@ def generate_cell(model_flag, dataset, agg_method, seed, budgets, dry_run=False,
         )
 
     feasible, delta_min, max_reachable = check_delta_min_feasible(
-        dataset, EPSILON, delta_min_frac,
+        dataset,
+        EPSILON,
+        delta_min_frac,
     )
     if not feasible:
         reason = (
@@ -284,34 +303,66 @@ def generate_cell(model_flag, dataset, agg_method, seed, budgets, dry_run=False,
 
     configs = {
         train_expert_dir / "config.toml": TRAIN_EXPERT_TEMPLATE.format(
-            cluster_root=CLUSTER_ROOT, model_flag=model_flag, dataset=dataset,
-            source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            checkpoint_iters=CHECKPOINT_ITERS, epochs=EPOCHS_EXPERT, lr=lr, wd=wd,
+            cluster_root=CLUSTER_ROOT,
+            model_flag=model_flag,
+            dataset=dataset,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            checkpoint_iters=CHECKPOINT_ITERS,
+            epochs=EPOCHS_EXPERT,
+            lr=lr,
+            wd=wd,
             milestones=milestones,
         ),
         module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
-            cluster_root=CLUSTER_ROOT, model_flag=model_flag, dataset=dataset,
-            cell_dir=module_dir, source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            epsilon=EPSILON, lr_delta=LR_DELTA, lambda_bd=LAMBDA_BD, lambda_delta=LAMBDA_DELTA,
+            cluster_root=CLUSTER_ROOT,
+            model_flag=model_flag,
+            dataset=dataset,
+            cell_dir=module_dir,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            epsilon=EPSILON,
+            lr_delta=LR_DELTA,
+            lambda_bd=LAMBDA_BD,
+            lambda_delta=LAMBDA_DELTA,
             train_pct=TRAIN_PCT,
-            num_honests=NUM_HONESTS, num_poisoned=NUM_POISONED, agg_method=agg_method,
-            gamma_stealth=GAMMA_STEALTH, checkpoint_sampling=CHECKPOINT_SAMPLING,
-            alpha_ckpt=ALPHA_CKPT, n_iterations=N_ITERATIONS,
-            trigger_constraint=TRIGGER_CONSTRAINT, align_kappa=ALIGN_KAPPA,
-            lambda_align=LAMBDA_ALIGN, lambda_mag=LAMBDA_MAG, delta_min_frac=delta_min_frac,
+            num_honests=NUM_HONESTS,
+            num_poisoned=NUM_POISONED,
+            agg_method=agg_method,
+            gamma_stealth=GAMMA_STEALTH,
+            checkpoint_sampling=CHECKPOINT_SAMPLING,
+            alpha_ckpt=ALPHA_CKPT,
+            n_iterations=N_ITERATIONS,
+            trigger_constraint=TRIGGER_CONSTRAINT,
+            align_kappa=ALIGN_KAPPA,
+            lambda_align=LAMBDA_ALIGN,
+            lambda_mag=LAMBDA_MAG,
+            delta_min_frac=delta_min_frac,
         ),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
-            budgets=budgets, module_dir=module_dir, flips_dir=flips_dir,
-            num_honests=NUM_HONESTS, num_poisoned=NUM_POISONED,
+            budgets=budgets,
+            module_dir=module_dir,
+            flips_dir=flips_dir,
+            num_honests=NUM_HONESTS,
+            num_poisoned=NUM_POISONED,
         ),
     }
     for budget in budgets:
         train_user_dir = cell_dir / f"train_user_{budget}"
         configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
-            flips_dir=flips_dir, train_user_dir=train_user_dir, model_flag=model_flag,
-            dataset=dataset, source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            budget=budget, num_honests=NUM_HONESTS, num_poisoned=NUM_POISONED,
-            agg_method=agg_method, lr=lr, wd=wd, milestones=milestones,
+            flips_dir=flips_dir,
+            train_user_dir=train_user_dir,
+            model_flag=model_flag,
+            dataset=dataset,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            budget=budget,
+            num_honests=NUM_HONESTS,
+            num_poisoned=NUM_POISONED,
+            agg_method=agg_method,
+            lr=lr,
+            wd=wd,
+            milestones=milestones,
         )
 
     paths = []
@@ -334,9 +385,18 @@ def generate_single_cell(dry_run=True):
     fixed at REGULARIZATION_GRID's defaults -- the minimal preliminary campaign used to sanity
     check the chain before spending a real sweep's compute."""
     paths, reason = generate_cell(
-        MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], BUDGETS[:1], dry_run=dry_run,
+        MODEL_FLAGS[0],
+        DATASETS[0],
+        AGG_METHODS[0],
+        SEEDS[0],
+        BUDGETS[:1],
+        dry_run=dry_run,
     )
-    refused = [(MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], reason)] if reason else []
+    refused = (
+        [(MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], reason)]
+        if reason
+        else []
+    )
     return paths, refused
 
 
@@ -347,7 +407,12 @@ def generate_minimal_campaign(dry_run=True):
             for agg_method in AGG_METHODS[:2]:
                 for seed in SEEDS[:3]:
                     paths, reason = generate_cell(
-                        model_flag, dataset, agg_method, seed, BUDGETS[:3], dry_run=dry_run,
+                        model_flag,
+                        dataset,
+                        agg_method,
+                        seed,
+                        BUDGETS[:3],
+                        dry_run=dry_run,
                     )
                     all_paths += paths
                     if reason:
@@ -362,7 +427,12 @@ def generate_all_configs(dry_run=False):
             for agg_method in AGG_METHODS:
                 for seed in SEEDS:
                     paths, reason = generate_cell(
-                        model_flag, dataset, agg_method, seed, BUDGETS, dry_run=dry_run,
+                        model_flag,
+                        dataset,
+                        agg_method,
+                        seed,
+                        BUDGETS,
+                        dry_run=dry_run,
                     )
                     all_paths += paths
                     if reason:
@@ -373,14 +443,19 @@ def generate_all_configs(dry_run=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--minimal", action="store_true", help="B3 minimal campaign only")
     parser.add_argument(
-        "--single-cell", action="store_true",
+        "--minimal", action="store_true", help="B3 minimal campaign only"
+    )
+    parser.add_argument(
+        "--single-cell",
+        action="store_true",
         help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
-             "preliminary campaign",
+        "preliminary campaign",
     )
     args = parser.parse_args()
-    assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
+    assert not (args.minimal and args.single_cell), (
+        "pass at most one of --minimal/--single-cell"
+    )
 
     if args.single_cell:
         gen_fn = generate_single_cell
@@ -395,7 +470,9 @@ if __name__ == "__main__":
         for p in paths:
             print(f"  {p}")
     else:
-        print(f"\n{MODULE_NAME}: {len(paths)} config files written and schema-validated.")
+        print(
+            f"\n{MODULE_NAME}: {len(paths)} config files written and schema-validated."
+        )
 
     if refused:
         print(f"\n{len(refused)} cell(s) REFUSED (delta_min infeasible):")
