@@ -69,16 +69,26 @@ N_ITERATIONS = 15
 # `single_cell` mode (see generate_single_cell / --single-cell) fixes ALL of these to the
 # defaults below and sweeps only the main axes (SEEDS/BUDGETS/AGG_METHODS).
 # --------------------------------------------------------------------------- #
-EPSILON = 0.1  # L_infinity bound on the trigger delta -- larger allows a stronger/more
-# visible perturbation; too small can make the backdoor unreachable.
+# Relaxed 2026-08-28: the original constraints below (EPSILON=0.1, GAMMA_STEALTH=1.0,
+# ALIGN_KAPPA=0.6, LAMBDA_ALIGN=LAMBDA_MAG=1.0) were too tight -- the anti-collapse /
+# stealth terms fought the backdoor-efficacy term hard enough to degrade CTA/ASR well below
+# what the underlying attack can actually do. This is a proof-of-concept campaign (showing
+# what gradient-inversion-style trigger optimization CAN achieve), not a stealth-optimized
+# attack, so the norm bound is widened and every competing regularization weight is cut back
+# in favor of lambda_bd. DELTA_MIN_FRAC is lowered too, both because the anti-collapse floor
+# itself is one of the loosened constraints and because it has far more slack now that
+# EPSILON is bigger (see the feasibility guard below).
+EPSILON = 0.3  # L_infinity bound on the trigger delta -- larger allows a stronger/more
+# visible perturbation; too small can make the backdoor unreachable. (was 0.1)
 LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization.
-LAMBDA_BD = 1.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
+LAMBDA_BD = 2.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
 # formulas) -- higher pushes harder for backdoor success at the cost of
-# the matching term.
-GAMMA_STEALTH = (
-    1.0  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
-)
-# to federated_optimizing_trigger_policy's gamma -- disjoint concept).
+# the matching term. Raised (was 1.0) to lean further into backdoor efficacy now that the
+# competing regularizers below are relaxed.
+GAMMA_STEALTH = 0.3  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
+# to federated_optimizing_trigger_policy's gamma -- disjoint concept). Lowered (was 1.0):
+# stealth is secondary for this proof-of-concept, and was fighting L_bd for optimization
+# budget.
 # lambda_trigger_l2 (schema's lambda_delta): the L2-norm penalty on delta. Kept at 0.0 in THIS
 # module specifically -- the descent toward a null trigger (delta -> 0) is exactly the
 # collapse mode this module's anti-collapse machinery (trigger_constraint/align_kappa/
@@ -88,15 +98,18 @@ GAMMA_STEALTH = (
 LAMBDA_DELTA = 0.0
 
 TRIGGER_CONSTRAINT = "penalty"
-ALIGN_KAPPA = 0.6
-LAMBDA_ALIGN = 1.0
-LAMBDA_MAG = 1.0
-# NOTE: the schema's own default is 0.5, but delta_min_frac=0.5 is INFEASIBLE at EPSILON=0.1
-# (see the guard below: 0.5*||delta_init||_2 ~= 115.7 >> 0.1*sqrt(3*32*32) ~= 5.5) -- this is
-# exactly the bug the guard exists to catch. Set here to the largest value that stays feasible
-# at EPSILON=0.1 (with a small safety margin), so the generator is usable out of the box;
-# raise EPSILON instead of DELTA_MIN_FRAC if a stronger magnitude floor is genuinely wanted.
-DELTA_MIN_FRAC = 0.02
+ALIGN_KAPPA = 0.3  # directional floor on cos(delta, mu_target) -- lowered (was 0.6): easier
+# to satisfy, so L_align stays inactive more of the time instead of competing with L_bd.
+LAMBDA_ALIGN = 0.3  # weight of the (now easier-to-satisfy) directional floor. Lowered (was
+# 1.0) so it still guards against collapse without dominating the loss.
+LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reasoning.
+# NOTE: the schema's own default is 0.5, which is still INFEASIBLE at EPSILON=0.3 (see the
+# guard below: 0.5*||delta_init||_2 ~= 115.7 > 0.3*sqrt(3*32*32) ~= 16.6) -- raising EPSILON
+# alone doesn't buy back the schema default. delta_min_frac itself is one of the constraints
+# being relaxed here (was 0.02, tight purely for EPSILON=0.1 feasibility, not because 0.02
+# was a deliberately chosen floor) -- lowered further to 0.01, which now has ~14x feasibility
+# margin at EPSILON=0.3 instead of the old ~2x at EPSILON=0.1.
+DELTA_MIN_FRAC = 0.01
 
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
@@ -177,7 +190,7 @@ def check_delta_min_feasible(dataset, epsilon, delta_min_frac):
 
 
 TRAIN_EXPERT_TEMPLATE = """[train_expert]
-output_dir = "{cluster_root}/out/checkpoints/{model_flag}_1xs/0/"
+output_dir = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/0/"
 model = "{model_flag}"
 dataset = "{dataset}"
 trainer = "sgd"
@@ -191,8 +204,8 @@ scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 """
 
 JOINT_TRIGGER_TEMPLATE = """[federated_generate_labels_trigger_joint]
-input_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/{{}}/model_{{}}_{{}}.pth"
-opt_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/{{}}/model_{{}}_{{}}_opt.pth"
+input_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/{{}}/model_{{}}_{{}}.pth"
+opt_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/{{}}/model_{{}}_{{}}_opt.pth"
 output_dir = "{cell_dir}/labels/"
 output_dir_trigger = "{cell_dir}/trigger"
 expert_model = "{model_flag}"
@@ -297,7 +310,10 @@ def generate_cell(
     milestones = MILESTONE.get(model_flag, [75, 125])
 
     cell_dir = EXP_BASE / cell_name(model_flag, dataset, agg_method, seed)
-    train_expert_dir = EXP_BASE / f"train_expert/{model_flag}_1xs"
+    # One train_expert per seed (not shared/deduped across seeds): a real proof-of-concept
+    # sweep needs the label-generation step to see a genuinely different expert per seed, not
+    # the same checkpoint replayed under every seed.
+    train_expert_dir = EXP_BASE / f"train_expert/{model_flag}_1xs/seed{seed}"
     module_dir = cell_dir / "gen_labels_trigger_joint"
     flips_dir = cell_dir / "select_flips"
 
@@ -306,6 +322,7 @@ def generate_cell(
             cluster_root=CLUSTER_ROOT,
             model_flag=model_flag,
             dataset=dataset,
+            seed=seed,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
             checkpoint_iters=CHECKPOINT_ITERS,
@@ -318,6 +335,7 @@ def generate_cell(
             cluster_root=CLUSTER_ROOT,
             model_flag=model_flag,
             dataset=dataset,
+            seed=seed,
             cell_dir=module_dir,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,

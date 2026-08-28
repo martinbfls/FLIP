@@ -100,8 +100,10 @@ cell_dir() {
 # Build the job lists, following gen_configs.py's own nesting
 # (model_flag -> dataset -> agg_method -> seed -> budget) and directory
 # layout (cell_name / gen_labels_trigger_joint, select_flips, train_user_*).
-# train_expert is per model_flag only and shared across cells with that
-# model, so it is deduplicated instead of resubmitted per cell.
+# train_expert is per (model_flag, seed) -- a different expert per seed, per
+# gen_configs.py -- shared only across dataset/agg_method for a fixed
+# (model_flag, seed), so it is deduplicated on that pair instead of
+# resubmitted per cell.
 # ---------------------------------------------------------------------------
 EXPERT_JOBS=()
 GEN_JOBS=()
@@ -111,16 +113,17 @@ USER_JOBS=()
 SEEN_EXPERT=""
 
 for model_flag in "${MODEL_FLAGS[@]}"; do
-  if [[ " $SEEN_EXPERT " != *" $model_flag "* ]]; then
-    SEEN_EXPERT="$SEEN_EXPERT $model_flag"
-    expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs"
-    require_config "$expert_cfg"
-    EXPERT_JOBS+=("python run_experiment.py $expert_cfg|joint_expert_${model_flag}")
-  fi
-
   for dataset in "${DATASETS[@]}"; do
     for agg in "${AGG_METHODS[@]}"; do
       for seed in "${SEEDS[@]}"; do
+        expert_key="${model_flag}_seed${seed}"
+        if [[ " $SEEN_EXPERT " != *" $expert_key "* ]]; then
+          SEEN_EXPERT="$SEEN_EXPERT $expert_key"
+          expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs/seed${seed}"
+          require_config "$expert_cfg"
+          EXPERT_JOBS+=("python run_experiment.py $expert_cfg|joint_expert_${expert_key}")
+        fi
+
         cell="$(cell_dir "$model_flag" "$dataset" "$agg" "$seed")"
         tag="${model_flag}_${dataset}_${agg}_seed${seed}"
 
