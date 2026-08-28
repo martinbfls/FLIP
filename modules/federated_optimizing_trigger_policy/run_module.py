@@ -1345,32 +1345,55 @@ def optimize_trigger_policy(
             "prop:budget-match's hypothesis beta<=gamma*min_y(pi_y) does not hold, so eq:P's "
             "lambda=beta constraint is not theoretically justified for this configuration. "
             "Consider passing an explicit numeric lambda_poison (rather than the default "
-            "\"beta\") and sweeping it independently."
+            "\"beta\") and sweeping it independently. In the mono-source case (this module: a "
+            "single (source_label, target_label) pair), min_y(pi_y) above is a global bound "
+            "across ALL classes -- the constraint that actually binds first is the SOURCE "
+            "class's own capacity, pi_source, checked below (A3): once lambda_poison exceeds "
+            "gamma*pi_source it is now a hard error, not just a saturation warning."
         )
     else:
         print(f"s_beta={s_beta:.4f} <= 1 -- unsaturated regime, lambda=beta is justified (prop:budget-match).")
 
-    # A3 (docs/policy_module_audit_report.md, option (ii)): _compute_step_policy's per-batch
-    # mask can select at most idx_source.numel() rows (~pi_source*n_b), so lambda_effective is
-    # structurally capped near pi_source whenever lambda_poison exceeds it -- this is
-    # detectable a priori, not just observable on an unlucky batch, so it is a startup error
-    # rather than a per-batch warning. theta_bar_k's retraining (get_poison_dataset, ADD-based,
-    # below) does NOT have this cap -- it reaches lambda_poison exactly (mod overflow, already
-    # logged) -- so leaving this uncaught would train theta_bar_k and compute v_k at two
-    # DIFFERENT, silently-diverging rates. Chosen over lifting the cap via duplication (the
-    # other option presented for arbitration): duplicating rows in the objective's own batch
-    # would change what v_k measures, which is undesirable while A1 has just changed
-    # lambda_poison's own scale -- see docs/policy_module_audit_report.md for the two options.
-    if lambda_poison > pi_source:
+    # A3 (docs/policy_module_audit_report.md, option (ii); threshold corrected by a gamma
+    # factor -- see docs/policy_module_audit_report.md's A3 addendum). lambda_poison is a
+    # GLOBAL (aggregate) rate (def:budget, A1); reproducing v_k under mean aggregation requires
+    # gamma*u_{s,t} = lambda_poison (eq:local-scope: gamma corrupted workers, each deploying
+    # the SAME LOCAL u), i.e. u_{s,t} = lambda_poison/gamma -- and eq:Uloc's own per-class cap
+    # is u_{s,t} <= pi_source. The feasibility condition is therefore
+    #     lambda_poison <= gamma*pi_source        (GLOBAL form)
+    #   equivalently  beta_local <= pi_source      (LOCAL form, since lambda_poison=beta_global
+    #                                                = gamma*beta_local when lambda_poison="beta")
+    # NOT the pre-correction `lambda_poison <= pi_source` (missing the gamma factor): in
+    # (gamma*pi_source, pi_source], that older check passed while the attack was already
+    # structurally infeasible -- with a HARD floor on the objective (not just a lost constant),
+    # rem:saturated's mono-source reading: B2 >= (1 - gamma*pi_source/lambda_poison)^2 *
+    # (||Gbar_{s,t}|| / varsigma_k)^2 > 0, since u_{s,t} can never reach lambda_poison/gamma.
+    # _compute_step_policy's per-batch mask can select at most idx_source.numel() rows
+    # (~pi_source*n_b), so lambda_effective is structurally capped near pi_source whenever
+    # lambda_poison/gamma exceeds it -- detectable a priori, not just observable on an unlucky
+    # batch, so this is a startup error rather than a per-batch warning. theta_bar_k's
+    # retraining (get_poison_dataset, ADD-based, below) does NOT have this cap -- it reaches
+    # lambda_poison exactly (mod overflow, already logged) -- so leaving this uncaught would
+    # train theta_bar_k and compute v_k at two DIFFERENT, silently-diverging rates. Chosen over
+    # lifting the cap via duplication (the other option presented for arbitration): duplicating
+    # rows in the objective's own batch would change what v_k measures, which is undesirable
+    # while A1 has just changed lambda_poison's own scale -- see
+    # docs/policy_module_audit_report.md for the two options.
+    if lambda_poison > gamma * pi_source:
+        a3_threshold = gamma * pi_source
         raise ValueError(
-            f"A3: lambda_poison={lambda_poison:.6f} > pi_source={pi_source:.6f} -- "
-            "_compute_step_policy's per-batch mask cannot realize this rate (it selects from "
-            "the source-class rows actually present in a batch, ~pi_source*n_b, never "
+            f"A3: lambda_poison={lambda_poison:.6f} > gamma*pi_source={a3_threshold:.6f} "
+            f"(gamma={gamma:.6f}, pi_source={pi_source:.6f}) -- equivalently, in LOCAL terms, "
+            f"beta_local={beta:.6f} > pi_source={pi_source:.6f}. _compute_step_policy's "
+            "per-batch mask cannot realize u_{s,t}=lambda_poison/gamma (it selects from the "
+            "source-class rows actually present in a batch, ~pi_source*n_b, never "
             "duplicating), so lambda_effective would be structurally capped near pi_source "
             "while theta_bar_k's retraining (get_poison_dataset, ADD-based) reaches "
-            "lambda_poison exactly -- the two would silently diverge. Lower beta (hence "
-            "lambda_poison, if lambda_poison=\"beta\") or pass an explicit numeric "
-            "lambda_poison already <= pi_source."
+            "lambda_poison exactly -- the two would silently diverge, and B2 would carry a "
+            "hard floor it can never optimize past (rem:saturated's mono-source reading, see "
+            "the comment above). Lower beta so that beta_local <= "
+            f"{pi_source:.6f} (LOCAL form, if lambda_poison=\"beta\"), or pass an explicit "
+            f"numeric lambda_poison already <= {a3_threshold:.6f} (GLOBAL form)."
         )
 
     if expert_budget is not None:
@@ -1639,6 +1662,14 @@ def run(experiment_name, module_name, **kwargs):
     when `s_beta > 1`. An explicit numeric `lambda_poison` (used verbatim, unscaled) is the way
     to sweep lambda independently of beta in that regime. See `optimize_trigger_policy`'s
     docstring for the full derivation.
+
+    A3 (docs/policy_module_audit_report.md, gamma-corrected): reproducing v_k requires
+    gamma*u_{s,t} = lambda_poison (eq:local-scope), so eq:Uloc's per-class cap u_{s,t}<=pi_source
+    translates to `lambda_poison <= gamma*pi_source` (equivalently `beta_local <= pi_source`) --
+    NOT `lambda_poison <= pi_source` (missing the gamma factor). Violating it is a hard
+    ValueError at startup (see `optimize_trigger_policy`), not a warning: in the gap between the
+    two thresholds the attack is structurally infeasible with a hard floor on B2
+    (rem:saturated's mono-source reading), not merely a lost theoretical guarantee.
 
     Threat model: same as federated_optimizing_trigger (see its `run` docstring) -- the
     attacker needs only the model architecture, a sample from the training distribution, its
