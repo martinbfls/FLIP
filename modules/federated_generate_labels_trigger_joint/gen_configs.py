@@ -38,9 +38,9 @@ from modules.federated_optimizing_trigger.utils import init_delta
 # axis is shared (num_poisoned/num_honests/budgets/agg_method/epsilon/expert provenance) --
 # see the checkpoint_sampling note below for the one axis that is NOT aligned by default.
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 3
-NUM_HONESTS = 7
-SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+NUM_POISONED = 1
+NUM_HONESTS = 0
+SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 AGG_METHODS = ["mean", "multikrum"]
 DATASETS = ["cifar"]
@@ -78,14 +78,16 @@ N_ITERATIONS = 15
 # in favor of lambda_bd. DELTA_MIN_FRAC is lowered too, both because the anti-collapse floor
 # itself is one of the loosened constraints and because it has far more slack now that
 # EPSILON is bigger (see the feasibility guard below).
-EPSILON = 0.3  # L_infinity bound on the trigger delta -- larger allows a stronger/more
+EPSILON = 1.0  # L_infinity bound on the trigger delta -- larger allows a stronger/more
 # visible perturbation; too small can make the backdoor unreachable. (was 0.1)
 LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization.
 LAMBDA_BD = 2.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
 # formulas) -- higher pushes harder for backdoor success at the cost of
 # the matching term. Raised (was 1.0) to lean further into backdoor efficacy now that the
 # competing regularizers below are relaxed.
-GAMMA_STEALTH = 0.3  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
+GAMMA_STEALTH = (
+    0.3  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
+)
 # to federated_optimizing_trigger_policy's gamma -- disjoint concept). Lowered (was 1.0):
 # stealth is secondary for this proof-of-concept, and was fighting L_bd for optimization
 # budget.
@@ -98,9 +100,13 @@ GAMMA_STEALTH = 0.3  # scalar stealth/backdoor loss weight multiplying grand_los
 LAMBDA_DELTA = 0.0
 
 TRIGGER_CONSTRAINT = "penalty"
-ALIGN_KAPPA = 0.3  # directional floor on cos(delta, mu_target) -- lowered (was 0.6): easier
+ALIGN_KAPPA = (
+    0.3  # directional floor on cos(delta, mu_target) -- lowered (was 0.6): easier
+)
 # to satisfy, so L_align stays inactive more of the time instead of competing with L_bd.
-LAMBDA_ALIGN = 0.3  # weight of the (now easier-to-satisfy) directional floor. Lowered (was
+LAMBDA_ALIGN = (
+    0.3  # weight of the (now easier-to-satisfy) directional floor. Lowered (was
+)
 # 1.0) so it still guards against collapse without dominating the loss.
 LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reasoning.
 # NOTE: the schema's own default is 0.5, which is still INFEASIBLE at EPSILON=0.3 (see the
