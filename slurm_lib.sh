@@ -122,12 +122,23 @@ preflight_slurm() {
     # nothing). Catches a bad account, an unknown QOS, an association limit,
     # or a partition this account can't use, before 450 real submissions hit
     # the same wall. The dependency flag is included so the exact command
-    # shape used later is what gets validated.
+    # shape used later is what gets validated -- and so is the resource
+    # request (--gres/--cpus-per-task/--mem): a bare `--wrap=true` job with
+    # no resources requested is a DIFFERENT allocation shape from the real
+    # per-job submissions in submit_job_slurm, and some partitions reject one
+    # shape while happily accepting the other (e.g. GPU-only nodes that
+    # cannot schedule a 0-GPU job at all) -- probing the real shape avoids a
+    # false negative here (or worse, a false pass that only fails once 50
+    # real jobs are already queued).
     local probe probe_rc
     for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
         probe=$(sbatch --kill-on-invalid-dep=yes --test-only \
                        --account="$SLURM_ACCOUNT" \
-                       --partition="$partition" --time=00:01:00 \
+                       --partition="$partition" \
+                       --gres="gpu:$GPUS_PER_TASK" \
+                       --cpus-per-task="$CPUS_PER_TASK" \
+                       --mem="$MEM_PER_TASK" \
+                       --time=00:01:00 \
                        --wrap=true 2>&1)
         probe_rc=$?
 
