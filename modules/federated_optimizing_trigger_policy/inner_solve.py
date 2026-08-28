@@ -96,8 +96,71 @@ def get_or_build_flip_grad_cache_entry(
     return flip_grad_cache[k]
 
 
+def estimate_v_analytic(
+    M, loss_fn, x_raw, x_clean, y, source_label, target_label, delta, lambda_eff,
+    dataset_flag, model_flag, create_graph, need_L_bd=False,
+):
+    '''
+    Task 3 (variance-reduced v estimator, v_estimator="analytic"): the "subsample" estimator
+    (see `_compute_step_policy` docstring / this module's other v computation below) estimates
+    v_k over only `m = round(lambda_poison*n_b)` examples (the per-batch subsampled mask,
+    typically a handful), while G's columns are estimated over `flip_gradient_samples_per_class`
+    examples -- Var(v) then dominates E[v]^2 in the ~4.6e5-dimensional gradient space, making B2
+    and its delta-gradient mostly noise.
+
+    Let S = ALL source-class rows of this batch (not subsampled) and lambda_eff = the
+    "subsample" estimator's OWN target_count/n_b (unchanged -- this is a scale factor, not a
+    sample-size choice):
+
+        g_bd = grad_theta[ mean_{i in S} CE(f_theta(T_delta(x_i)), y_target) ]
+        g_ss = grad_theta[ mean_{i in S} CE(f_theta(x_i),          y_source) ]
+        v    = lambda_eff * (g_bd - g_ss)
+
+    Same expectation as the "subsample" estimator conditionally on the batch (both are
+    lambda_eff times a mean gradient difference over an unbiased sample of the source class),
+    variance divided by roughly |S|/m ~= pi_source/lambda_poison. Also cheaper: two passes over
+    the source-class sub-batch only, instead of two passes over the full batch.
+
+    `create_graph` controls whether g_bd keeps a graph back to `delta` (True for the
+    delta-update pass in `_compute_step_policy`, so B2/L_bd can backprop into delta; False for
+    the inner-solve path in `compute_frozen_v`, which only ever needs v's VALUE against a frozen
+    delta). g_ss never depends on delta and is always detached.
+
+    Returns (v, L_bd) -- L_bd (CE on ALL of S, the direct eq:P reading of E_{X~D_s}, same
+    variance reduction as v itself) only computed when `need_L_bd=True`, else None. Caller is
+    responsible for ensuring the batch actually has source-class rows (task 2's has_poison
+    check, upstream of every caller here, already guarantees this).
+    '''
+    source_mask = y == source_label
+    n_s = int(source_mask.sum().item())
+
+    x_s_raw = x_raw[source_mask]
+    x_s_clean = x_clean[source_mask]
+    y_target_s = torch.full((n_s,), target_label, dtype=torch.long, device=x_s_raw.device)
+    y_source_s = torch.full((n_s,), source_label, dtype=torch.long, device=x_s_raw.device)
+
+    x_s_poisoned = raw_to_trigger_preprocess(
+        x_s_raw, delta, dataset_flag=dataset_flag, model_flag=model_flag,
+    )
+    grads_bd, logits_bd = compute_batch_gradients(
+        M, loss_fn, (x_s_poisoned, y_target_s),
+        create_graph=create_graph, retain_graph=create_graph,
+    )
+    g_bd = torch.cat([g.reshape(-1) for g in grads_bd])
+    if not create_graph:
+        g_bd = g_bd.detach()
+
+    grads_ss, _ = compute_batch_gradients(M, loss_fn, (x_s_clean, y_source_s), create_graph=False)
+    g_ss = torch.cat([g.reshape(-1) for g in grads_ss]).detach()
+
+    v = lambda_eff * (g_bd - g_ss)
+    L_bd = loss_fn(logits_bd, y_target_s) if need_L_bd else None
+    return v, L_bd
+
+
 def compute_frozen_v(M, loss_fn, x_clean, y, x_raw, mask, y_poison, has_poison, delta_frozen,
-                      dataset_flag, model_flag):
+                      dataset_flag, model_flag, v_estimator="subsample", source_label=None,
+                      target_label=None, lambda_eff=None):
     '''
     v_k(delta) = grad_Lp[delta](theta_k) - grad_Lc(theta_k), computed with delta HELD FIXED
     (`delta_frozen`, expected to be a plain detached tensor -- e.g. `delta.detach()`): no
@@ -105,7 +168,19 @@ def compute_frozen_v(M, loss_fn, x_clean, y, x_raw, mask, y_poison, has_poison, 
     inner solve only ever needs v_k's VALUE), unlike `_compute_step_policy`'s own v computation
     (create_graph=True there, so mu_p keeps a graph back to delta for the OUTER, delta-update
     pass). Returns a detached (D,) tensor.
+
+    Task 3: `v_estimator="analytic"` (see `estimate_v_analytic`) computes v over ALL source-class
+    rows instead of `mask`'s subsampled few -- same estimator the delta-update pass uses when
+    `v_estimator="analytic"` there too, so both paths share the SAME reduced-variance v. Requires
+    `source_label`/`target_label`/`lambda_eff` in that mode.
     '''
+    if v_estimator == "analytic":
+        v, _L_bd = estimate_v_analytic(
+            M, loss_fn, x_raw, x_clean, y, source_label, target_label, delta_frozen, lambda_eff,
+            dataset_flag, model_flag, create_graph=False, need_L_bd=False,
+        )
+        return v.detach()
+
     x_poisoned = x_clean.clone()
     if has_poison:
         x_poisoned[mask] = raw_to_trigger_preprocess(
@@ -124,7 +199,8 @@ def compute_frozen_v(M, loss_fn, x_clean, y, x_raw, mask, y_poison, has_poison, 
 def build_inner_context(
     expert_models, sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison, delta_frozen,
     loss_fn, dataset_flag, model_flag, n_classes, flip_grad_cache, class_samples_raw, pi, gamma,
-    beta, beta_global, normalization, device,
+    beta, beta_global, normalization, device, v_estimator="subsample", source_label=None,
+    target_label=None, lambda_eff=None,
 ):
     '''
     Builds, for EACH sampled checkpoint, the (G_obj, v, den) triple the aggregate QP is built
@@ -133,6 +209,10 @@ def build_inner_context(
     every k). Reuses `flip_grad_cache` (shared with `_compute_step_policy`'s own per-batch
     cache) so a checkpoint computed by one path is not recomputed by the other within the same
     batch.
+
+    Task 3: `v_estimator`/`source_label`/`target_label`/`lambda_eff` are forwarded to
+    `compute_frozen_v` unchanged -- same estimator (and, when "analytic", the SAME reduced-
+    variance v) as `_compute_step_policy`'s own delta-update pass uses for this batch.
 
     Returns: list of dicts {k, G_obj, Q_obj, pairs_k, rho_k, v, den}.
     '''
@@ -146,7 +226,8 @@ def build_inner_context(
         )
         v = compute_frozen_v(
             M, loss_fn, x_clean, y, x_raw, mask, y_poison, has_poison, delta_frozen,
-            dataset_flag, model_flag,
+            dataset_flag, model_flag, v_estimator=v_estimator, source_label=source_label,
+            target_label=target_label, lambda_eff=lambda_eff,
         )
         den_v = v.norm() ** 2 + _EPS_DEN
         den_rho = rho_k ** 2 + _EPS_DEN

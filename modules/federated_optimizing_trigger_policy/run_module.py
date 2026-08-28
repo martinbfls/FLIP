@@ -176,6 +176,7 @@ def _compute_step_policy(
     diag_split_half=False,
     diag_split_half_ridge_values=(1e-6, 1e-4, 1e-2, 1e-1),
     precomputed=None,
+    v_estimator="analytic",
 ):
     '''Per sampled checkpoint theta_k, the (P^mean) objective's two terms:
 
@@ -226,6 +227,14 @@ def _compute_step_policy(
     All terms are averaged over sampled_k, matching the original convention (same keys: B2,
     L_bd, lambda_effective) so the two threat models' per-step metrics stay directly
     comparable.
+
+    Task 3 (`v_estimator`): v and L_bd_k above are, by default ("analytic"), the reduced-
+    variance estimator of `inner_solve.estimate_v_analytic` -- mean gradients over ALL
+    source-class rows of the batch, scaled by lambda_effective, instead of the original
+    ("subsample") estimator's much smaller per-batch subsampled `mask`. Same expectation
+    conditionally on the batch either way; see that function's docstring for the variance
+    argument. `n_source` (|S| this batch) is returned alongside for logging regardless of
+    which estimator is active.
     '''
     eps_den = 1e-8
     n_exp = len(sampled_k)
@@ -257,6 +266,12 @@ def _compute_step_policy(
         # rather than compute and backward through a step_loss that is pure noise pressure on u.
         return {"skipped": True}
 
+    # Task 3: |S| (source-class rows actually available this batch, regardless of
+    # v_estimator) -- logged (mean over batches, via metrics_history/step_summary) so a
+    # v_estimator="analytic" run's actual variance-reduction factor (~|S|/m) is visible, not
+    # just assumed from pi_source/lambda_poison.
+    n_source = int((y == source_label).sum().item())
+
     B2_sum, bd_loss_sum = None, None
     B2_rho_sum, B2_v_sum, B2_qp_sum = None, None, None
     B2_qp_relaxed_sum, pg_iters_sum, pg_obj_decrement_sum = None, None, None
@@ -273,28 +288,40 @@ def _compute_step_policy(
         M = expert_models[k].to(device).eval()
         params = list(M.parameters())
 
-        # x_poisoned rebuilt fresh per checkpoint -- see federated_optimizing_trigger's
-        # `_compute_step` docstring for why (checkpoint_backward frees delta's subgraph).
-        x_poisoned = x_clean.clone()
-        if has_poison:
-            x_poisoned[mask] = raw_to_trigger_preprocess(
-                x_raw[mask], delta, dataset_flag=dataset_flag, model_flag=model_flag,
+        # Task 3 (variance-reduced v estimator): "analytic" computes v (and L_bd_k, below) over
+        # ALL source-class rows of the batch instead of the "subsample" estimator's much
+        # smaller subsampled `mask` -- see inner_solve.estimate_v_analytic's docstring for the
+        # full derivation. Both branches produce the SAME expectation conditionally on the
+        # batch; only the variance (and, incidentally, the cost -- "analytic" is two passes
+        # over the source sub-batch only, not the full batch) differs.
+        if v_estimator == "analytic":
+            v, L_bd_k = inner_solve.estimate_v_analytic(
+                M, loss_fn, x_raw, x_clean, y, source_label, target_label, delta,
+                lambda_effective, dataset_flag, model_flag, create_graph=True, need_L_bd=True,
             )
+        else:
+            # x_poisoned rebuilt fresh per checkpoint -- see federated_optimizing_trigger's
+            # `_compute_step` docstring for why (checkpoint_backward frees delta's subgraph).
+            x_poisoned = x_clean.clone()
+            if has_poison:
+                x_poisoned[mask] = raw_to_trigger_preprocess(
+                    x_raw[mask], delta, dataset_flag=dataset_flag, model_flag=model_flag,
+                )
 
-        grads_c, _ = compute_batch_gradients(
-            M, loss_fn, (x_clean, y), create_graph=False, retain_graph=False,
-        )
-        g_c = torch.cat([g.reshape(-1) for g in grads_c]).detach()
+            grads_c, _ = compute_batch_gradients(
+                M, loss_fn, (x_clean, y), create_graph=False, retain_graph=False,
+            )
+            g_c = torch.cat([g.reshape(-1) for g in grads_c]).detach()
 
-        grads_p, logits_p = compute_batch_gradients(
-            M, loss_fn, (x_poisoned, y_poison), create_graph=True, retain_graph=True,
-        )
-        mu_p = torch.cat([g.reshape(-1) for g in grads_p])
+            grads_p, logits_p = compute_batch_gradients(
+                M, loss_fn, (x_poisoned, y_poison), create_graph=True, retain_graph=True,
+            )
+            mu_p = torch.cat([g.reshape(-1) for g in grads_p])
 
-        # Theory: sec:trigger-vk (eq:vk-delta) -- v_k(delta) = grad_Lp[delta](theta_k) -
-        # grad_Lc(theta_k), the trigger-induced gradient shift (mu_p, g_c standing in for the
-        # two gradients under the batch's poisoned/clean labels respectively).
-        v = mu_p - g_c
+            # Theory: sec:trigger-vk (eq:vk-delta) -- v_k(delta) = grad_Lp[delta](theta_k) -
+            # grad_Lc(theta_k), the trigger-induced gradient shift (mu_p, g_c standing in for
+            # the two gradients under the batch's poisoned/clean labels respectively).
+            v = mu_p - g_c
 
         # Theory: def:shifts (eq:shift) -- Gbar_{y,c} = g_{y,c} - g_{y,y}, WITH NO pi_y factor
         # (rem:no-pi); G_obj = (gamma/pi_y)*G_k column-wise (PIEGE 1/PIEGE 2); rho_k =
@@ -343,12 +370,16 @@ def _compute_step_policy(
         # Theory: eq:P's second term, kappa*E_k[E_X[loss_c(f(T_delta(X)), y_target)]] -- this
         # module names the weight `lambda_bd` (kept distinct from `kappa`, which here names
         # trigger_penalty_hinge's STEALTH margin instead, see that function). L_bd: CE
-        # restricted to the actually-triggered examples only (see federated_optimizing_trigger's
-        # `_compute_step` docstring).
-        L_bd_k = (
-            loss_fn(logits_p[mask], y_poison[mask])
-            if mask.sum() > 0 else torch.tensor(0.0, device=device)
-        )
+        # restricted to the actually-triggered examples -- under v_estimator="analytic",
+        # L_bd_k was already computed above (CE on ALL source-class rows S, the direct eq:P
+        # reading of E_{X~D_s}, same variance reduction as v itself); "subsample" restricts it
+        # to the smaller subsampled `mask` (see federated_optimizing_trigger's `_compute_step`
+        # docstring).
+        if v_estimator != "analytic":
+            L_bd_k = (
+                loss_fn(logits_p[mask], y_poison[mask])
+                if mask.sum() > 0 else torch.tensor(0.0, device=device)
+            )
 
         # A4 (docs/policy_module_audit_report.md Section 2.5/A4) -- Theory: rem:solver's
         # diagnostic, now solving on U_loc ITSELF (eq:Uloc, the same feasible set u is
@@ -477,6 +508,8 @@ def _compute_step_policy(
                 expert_models, sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison,
                 delta.detach(), loss_fn, dataset_flag, model_flag, n_classes, flip_grad_cache,
                 class_samples_raw, pi, gamma, beta, beta_global, normalization, device,
+                v_estimator=v_estimator, source_label=source_label, target_label=target_label,
+                lambda_eff=lambda_effective,
             )
             diag_record.update(
                 inner_solve.oneshot_coupling_diagnostic(
@@ -510,7 +543,7 @@ def _compute_step_policy(
         "B2_qp_relaxed": B2_qp_relaxed, "pg_iters": pg_iters,
         "pg_obj_decrement": pg_obj_decrement,
         "grad_delta_B2_norm": grad_delta_B2_norm, "grad_delta_BD_norm": grad_delta_BD_norm,
-        "grad_delta_ratio": grad_delta_ratio,
+        "grad_delta_ratio": grad_delta_ratio, "n_source": n_source,
         "diag_record": diag_record, "diag_checkpoint": diag_ctx["k"] if diag_ctx else None,
     }
 
@@ -760,6 +793,7 @@ def optimize_trigger_policy_step(
     qp_ridge=1e-3,
     diag_m_sweep=False,
     diag_m_sweep_values=(1, 2, 5, 10, 20),
+    v_estimator="analytic",
 ):
     '''Runs one outer step's worth of trigger+policy-optimization batches against a fixed set
     of expert checkpoints (see `_compute_step_policy` for the per-checkpoint objective).
@@ -834,6 +868,7 @@ def optimize_trigger_policy_step(
         "beta_used": [],
         "B2_rho": [], "B2_v": [], "B2_qp": [],
         "B2_qp_relaxed": [], "pg_iters": [], "pg_obj_decrement": [],
+        "n_source": [],  # Task 3: mean |S| (source-class rows/batch) across this step's batches.
     }
 
     diag_event_counter = 0
@@ -893,7 +928,8 @@ def optimize_trigger_policy_step(
                 expert_models, sampled_k, x_clean_b, y_b, x_raw_b, mask_b, y_poison_b,
                 has_poison_b, delta.detach(), loss_fn, dataset_flag, model_flag, n_classes,
                 flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global,
-                normalization, device,
+                normalization, device, v_estimator=v_estimator, source_label=source_label,
+                target_label=target_label, lambda_eff=lam_eff_b,
             )
             Q_agg, c_agg, pairs_agg = inner_solve.aggregate_qp(contexts)
             B2_before_inner = inner_solve.aggregate_b2(u, contexts)
@@ -1059,6 +1095,7 @@ def optimize_trigger_policy_step(
             diag_span_projection=diag_span_projection,
             diag_direction_scaling=diag_direction_scaling,
             precomputed=precomputed,
+            v_estimator=v_estimator,
             lambda_b2=lambda_b2,
             diag_oneshot_gap=diag_oneshot_gap,
             diag_split_half=diag_split_half,
@@ -1146,6 +1183,7 @@ def optimize_trigger_policy_step(
         beta_used = u.detach().sum().item()
         metrics_history["B2"].append(B2.item())
         metrics_history["L_bd"].append(L_bd.item())
+        metrics_history["n_source"].append(result["n_source"])
         metrics_history["lambda_effective"].append(result["lambda_effective"])
         metrics_history["lambda_effective_ratio"].append(result["lambda_effective_ratio"])
         metrics_history["beta_used"].append(beta_used)
@@ -1274,7 +1312,23 @@ def optimize_trigger_policy(
     qp_ridge=1e-3,
     diag_m_sweep=False,
     diag_m_sweep_values=(1, 2, 5, 10, 20),
+    v_estimator="analytic",
 ):
+    valid_v_estimators = ("subsample", "analytic")
+    if v_estimator not in valid_v_estimators:
+        raise ValueError(f"v_estimator={v_estimator!r} not in {valid_v_estimators}.")
+    print(
+        f"[v_estimator] {v_estimator!r} -- "
+        + (
+            "reduced-variance estimator (task 3): v/L_bd computed over ALL source-class rows "
+            "of each batch, scaled by lambda_effective, instead of the original subsampled "
+            "few. Mean |S| across a step's batches is reported as step_summary['n_source']."
+            if v_estimator == "analytic" else
+            "ORIGINAL estimator: v/L_bd computed over only the per-batch subsampled mask "
+            "(~round(lambda_poison*n_b) rows) -- kept for A/B comparison against 'analytic' "
+            "on the same seed, see inner_solve.estimate_v_analytic's docstring."
+        )
+    )
     valid_solvers = ("descent", "qp")
     if policy_solver not in valid_solvers:
         raise ValueError(f"policy_solver={policy_solver!r} not in {valid_solvers}.")
@@ -1650,6 +1704,7 @@ def optimize_trigger_policy(
             qp_ridge=qp_ridge,
             diag_m_sweep=diag_m_sweep,
             diag_m_sweep_values=diag_m_sweep_values,
+            v_estimator=v_estimator,
         )
 
         del expert_models
@@ -1771,6 +1826,10 @@ def run(experiment_name, module_name, **kwargs):
     qp_ridge = args.get("qp_ridge", 1e-3)
     diag_m_sweep = args.get("diag_m_sweep", False)
     diag_m_sweep_values = args.get("diag_m_sweep_values", [1, 2, 5, 10, 20])
+    # Task 3: "analytic" (default) is the reduced-variance v/L_bd estimator (see
+    # inner_solve.estimate_v_analytic's docstring); "subsample" reproduces the original
+    # estimator exactly, for an A/B comparison on the same seed.
+    v_estimator = args.get("v_estimator", "analytic")
     lambda_penalty = args.get("lambda_penalty", 0.0)
     lambda_delta = args.get("lambda_delta", 0.0)
     lambda_tv = args.get("lambda_tv", 0.0)
@@ -1938,6 +1997,7 @@ def run(experiment_name, module_name, **kwargs):
         qp_ridge=qp_ridge,
         diag_m_sweep=diag_m_sweep,
         diag_m_sweep_values=diag_m_sweep_values,
+        v_estimator=v_estimator,
     )
 
     print("Optimized trigger and policy obtained.")
