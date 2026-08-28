@@ -304,10 +304,30 @@ def _compute_step_policy(
         # assert) so `inner_solve.build_inner_context` -- the policy_inner_mode!="joint" path --
         # shares the SAME per-checkpoint (G_obj, Q_obj, rho_k) via this SAME flip_grad_cache
         # dict, rather than a second, possibly-drifting computation.
+        # Task 4: `pairs` (built once in `optimize_trigger_policy`, spanning u's own
+        # coordinates) and `pairs_k` (returned by `compute_expected_flip_gradients` via
+        # `get_or_build_flip_grad_cache_entry`, spanning G_obj's columns) are assumed identical
+        # in ordering EVERYWHERE u and G_obj/Q_obj are used together (project_policy_budget,
+        # project_gradient_descent_local, aggregate_qp) -- never checked until now. A silent
+        # divergence would permute G_obj's columns relative to u's coordinates without either
+        # side raising. Checked ONCE, at this batch's first cache fill (mirrors the A2 self-
+        # check's own `len(flip_grad_cache) == 0` one-shot pattern just above/in
+        # inner_solve.get_or_build_flip_grad_cache_entry), not on every checkpoint.
+        is_first_cache_fill = len(flip_grad_cache) == 0
         G_obj, Q_obj, pairs_k, rho_k = inner_solve.get_or_build_flip_grad_cache_entry(
             k, flip_grad_cache, M, loss_fn, class_samples_raw, n_classes, pi, dataset_flag,
             model_flag, params, gamma, beta, beta_global,
         )
+        if is_first_cache_fill:
+            assert list(pairs_k) == list(pairs), (
+                f"pairs ordering mismatch: optimize_trigger_policy's `pairs` "
+                f"({len(pairs)} entries) != compute_expected_flip_gradients's `pairs_k` "
+                f"({len(pairs_k)} entries) for checkpoint {k} -- u's coordinates and G_obj's "
+                "columns would be silently permuted relative to each other everywhere they are "
+                "used together (project_policy_budget, project_gradient_descent_local, "
+                "aggregate_qp). First differing entries: "
+                f"{[(i, a, b) for i, (a, b) in enumerate(zip(pairs, pairs_k)) if a != b][:5]}"
+            )
 
         # Theory: eq:P's first term (local reading, the paragraph right after the lambda=beta
         # constraint) -- ||gamma*Gbar(theta_bar_k)*u^i - v_k(delta)||^2 / rho_k^2. G_obj already
