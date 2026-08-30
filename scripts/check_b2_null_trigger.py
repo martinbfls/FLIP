@@ -25,9 +25,25 @@ READING THE RESULT (do not automate a reaction to this -- see above, this script
 
 Usage:
     python scripts/check_b2_null_trigger.py <experiment_name> [--n-batches 20]
+    python scripts/check_b2_null_trigger.py <experiment_name> \
+        --flip-gradient-samples-sweep 64,256,1024
 
 <experiment_name> is the same argument extract_toml expects (experiments/<experiment_name>/
 config.toml), pointing at a federated_optimizing_trigger_policy config.
+
+Task 6 (--flip-gradient-samples-sweep): with v_estimator="analytic", g_bd and g_ss are both
+computed on the SAME set S of source-class batch rows, so at delta=0, v(0) = lambda_eff *
+Gbar_{s,t} exactly, no residual noise between the two terms. The only remaining discrepancy at
+delta=0 is that v is estimated over S (~pi_source*batch_size_trigger rows) while G_obj's
+(s,t) column is estimated over class_samples_raw[source] (flip_gradient_samples_per_class
+examples) -- two DIFFERENT estimators of the same underlying quantity Gbar_{s,t}. B2_null_triv's
+floor is therefore largely that estimator disagreement, and should shrink as
+flip_gradient_samples_per_class grows (both estimators converging to the same population
+value). This flag reconstructs class_samples_raw (and `pairs`, which depends on it) for each
+value in the comma-separated list and reruns the Step 2 measurement for each, producing a
+flip_gradient_samples_per_class x {B2_current, B2_null_triv, B2_null_qp} table. Everything else
+(expert checkpoints, delta, u, pi, beta) is reused unchanged across the sweep -- only the
+estimator of G's (s,t) column changes.
 """
 import argparse
 import copy
@@ -171,7 +187,24 @@ def build_context(experiment_name, module_name, device):
         expert_models=expert_models, delta=delta, u_current=u_current,
         num_chckpt=num_chckpt, alpha_ckpt=alpha_ckpt, normalization=normalization,
         loss_fn=torch.nn.CrossEntropyLoss(), device=device,
+        flip_gradient_samples_per_class=flip_gradient_samples_per_class,
     )
+
+
+def rebuild_class_samples(ctx, flip_gradient_samples_per_class, device):
+    '''
+    Task 6: rebuilds `class_samples_raw` (hence `pairs`, which is derived from which classes
+    have any samples) for a different flip_gradient_samples_per_class, WITHOUT reloading expert
+    checkpoints or delta/u -- those don't depend on this value. Returns (class_samples_raw,
+    pairs); caller is responsible for resetting flip_grad_cache (G_obj/Q_obj/rho_k are built
+    FROM class_samples_raw, so a cache filled under a different sample size would be stale).
+    '''
+    class_samples_raw = get_class_conditional_samples(
+        ctx["dataset_flag"], ctx["n_classes"], flip_gradient_samples_per_class, device,
+    )
+    classes_present = sorted(class_samples_raw.keys())
+    pairs = [(y, c) for y in classes_present for c in range(ctx["n_classes"]) if c != y]
+    return class_samples_raw, pairs
 
 
 # --------------------------------------------------------------------------- #
@@ -278,39 +311,16 @@ def fmt(x):
     return f"{x:.6e}" if x is not None else "None"
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("experiment_name")
-    parser.add_argument("--module-name", default="federated_optimizing_trigger_policy")
-    parser.add_argument("--n-batches", type=int, default=20)
-    args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    ctx = build_context(args.experiment_name, args.module_name, device)
-
-    print(
-        f"\nbeta_local={ctx['beta']:.6f}, pi_source={ctx['pi_source']:.6f}, "
-        f"gamma={ctx['gamma']:.6f}, lambda_poison={ctx['lambda_poison']:.6f}"
-    )
-
-    # --- Step 3: pi_y convention check, on the FIRST expert checkpoint, for the
-    # (source, target) pair plus up to two others. ---
-    check_pairs = [(ctx["source_label"], ctx["target_label"])]
-    for (y, c) in ctx["pairs"]:
-        if len(check_pairs) >= 3:
-            break
-        if (y, c) != check_pairs[0]:
-            check_pairs.append((y, c))
-    pi_check_results = check_pi_convention(ctx, ctx["expert_models"][0], check_pairs)
-    print("\n=== Step 3: pi_y convention check (G_k[:, (y,c)] == pi[y]*(g_{y,c}-g_{y,y})) ===")
-    for (y, c, rel_err) in pi_check_results:
-        print(f"  (y={y}, c={c}): relative error = {rel_err:.3e}")
-
-    # --- Step 2: B2_current / B2_null_triv / B2_null_qp over --n-batches batches. ---
+def run_b2_measurement(ctx, n_batches):
+    '''Step 2: B2_current / B2_null_triv / B2_null_qp over `n_batches` batches, against
+    whatever class_samples_raw/pairs `ctx` currently holds. A fresh flip_grad_cache is used
+    (G_obj/Q_obj/rho_k are built from class_samples_raw, so a cache from a different
+    flip_gradient_samples_per_class would be stale -- see rebuild_class_samples). Returns the
+    list of per-batch records (empty-mask batches excluded, printed as skipped).'''
     flip_grad_cache = {}
     records = []
     loader_iter = iter(ctx["loader"])
-    for i in range(args.n_batches):
+    for i in range(n_batches):
         try:
             batch = next(loader_iter)
         except StopIteration:
@@ -327,19 +337,23 @@ if __name__ == "__main__":
             f"u_triv_feasible={rec['triv_feasible']} "
             f"||v||/rho per checkpoint={[f'{x:.3f}' for x in rec['v_over_rho_per_checkpoint']]}"
         )
+    return records
 
-    if not records:
-        print("\nNo non-empty batches measured -- nothing to summarize.")
-        sys.exit(0)
 
-    print("\n=== Step 4: summary (mean +/- std over measured batches) ===")
+def summarize(records):
+    '''Mean +/- std of the three B2 variants and the B2_null_triv/B2_current ratio, over
+    `records` (see run_b2_measurement). Returns a dict of the summary values (also printed).'''
+    summary = {}
+    print("\n=== Summary (mean +/- std over measured batches) ===")
     for key in ["B2_current", "B2_null_triv", "B2_null_qp"]:
         vals = np.array([r[key] for r in records], dtype=np.float64)
+        summary[key] = (float(vals.mean()), float(vals.std()))
         print(f"  {key}: {vals.mean():.6e} +/- {vals.std():.6e}")
 
     b2_current_vals = np.array([r["B2_current"] for r in records], dtype=np.float64)
     b2_null_triv_vals = np.array([r["B2_null_triv"] for r in records], dtype=np.float64)
     ratio = b2_null_triv_vals / np.maximum(np.abs(b2_current_vals), 1e-12)
+    summary["ratio_null_triv_over_current"] = (float(ratio.mean()), float(ratio.std()))
     print(f"  B2_null_triv / B2_current: mean={ratio.mean():.6e}, std={ratio.std():.6e}")
 
     n_infeasible = sum(1 for r in records if not r["triv_feasible"])
@@ -350,3 +364,78 @@ if __name__ == "__main__":
             "B2_null_triv above is then the value of an INFEASIBLE point, not a valid lower "
             "bound, and should not be trusted as evidence either way."
         )
+    return summary
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("experiment_name")
+    parser.add_argument("--module-name", default="federated_optimizing_trigger_policy")
+    parser.add_argument("--n-batches", type=int, default=20)
+    parser.add_argument(
+        "--flip-gradient-samples-sweep", default=None,
+        help="Task 6: comma-separated flip_gradient_samples_per_class values, e.g. "
+             "64,256,1024. Defaults to the single value already in the config.",
+    )
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ctx = build_context(args.experiment_name, args.module_name, device)
+
+    print(
+        f"\nbeta_local={ctx['beta']:.6f}, pi_source={ctx['pi_source']:.6f}, "
+        f"gamma={ctx['gamma']:.6f}, lambda_poison={ctx['lambda_poison']:.6f}"
+    )
+
+    # --- Step 3: pi_y convention check, on the FIRST expert checkpoint, for the
+    # (source, target) pair plus up to two others -- run ONCE, at the config's own
+    # flip_gradient_samples_per_class (not swept: this checks an estimator convention, not the
+    # sample-size trend Task 6 is after). ---
+    check_pairs = [(ctx["source_label"], ctx["target_label"])]
+    for (y, c) in ctx["pairs"]:
+        if len(check_pairs) >= 3:
+            break
+        if (y, c) != check_pairs[0]:
+            check_pairs.append((y, c))
+    pi_check_results = check_pi_convention(ctx, ctx["expert_models"][0], check_pairs)
+    print("\n=== Step 3: pi_y convention check (G_k[:, (y,c)] == pi[y]*(g_{y,c}-g_{y,y})) ===")
+    for (y, c, rel_err) in pi_check_results:
+        print(f"  (y={y}, c={c}): relative error = {rel_err:.3e}")
+
+    if args.flip_gradient_samples_sweep:
+        sweep_values = [int(v) for v in args.flip_gradient_samples_sweep.split(",")]
+    else:
+        sweep_values = [ctx["flip_gradient_samples_per_class"]]
+
+    table = {}
+    for n_per_class in sweep_values:
+        print(f"\n{'=' * 20} flip_gradient_samples_per_class={n_per_class} {'=' * 20}")
+        if n_per_class != ctx["flip_gradient_samples_per_class"] or len(sweep_values) > 1:
+            class_samples_raw, pairs = rebuild_class_samples(ctx, n_per_class, device)
+            ctx["class_samples_raw"], ctx["pairs"] = class_samples_raw, pairs
+        records = run_b2_measurement(ctx, args.n_batches)
+        if not records:
+            print("  No non-empty batches measured -- nothing to summarize for this value.")
+            continue
+        table[n_per_class] = summarize(records)
+
+    if len(sweep_values) > 1:
+        if not table:
+            print("\nNo sweep value produced any measured batch -- nothing to tabulate.")
+            sys.exit(0)
+        print("\n=== Task 6 table: flip_gradient_samples_per_class x {B2_current, "
+              "B2_null_triv, B2_null_qp} ===")
+        header = f"{'n_per_class':>12} {'B2_current':>18} {'B2_null_triv':>18} {'B2_null_qp':>18}"
+        print(header)
+        for n_per_class in sweep_values:
+            if n_per_class not in table:
+                print(f"{n_per_class:>12} {'(no batches)':>18}")
+                continue
+            row = table[n_per_class]
+            cells = " ".join(
+                f"{row[k][0]:.4e}+/-{row[k][1]:.1e}".rjust(18)
+                for k in ["B2_current", "B2_null_triv", "B2_null_qp"]
+            )
+            print(f"{n_per_class:>12} {cells}")
+    elif not table:
+        sys.exit(0)
