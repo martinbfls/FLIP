@@ -199,14 +199,14 @@ def measure_batch(ctx, batch, flip_grad_cache):
         ctx["expert_models"], sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison,
         ctx["delta"], ctx["loss_fn"], ctx["dataset_flag"], ctx["model_flag"], ctx["n_classes"],
         flip_grad_cache, ctx["class_samples_raw"], ctx["pi"], ctx["gamma"], ctx["beta"],
-        ctx["beta_global"], ctx["normalization"], ctx["device"],
+        ctx["beta_global"], pairs, ctx["normalization"], ctx["device"],
     )
     delta_zero = torch.zeros_like(ctx["delta"])
     contexts_null = inner_solve.build_inner_context(
         ctx["expert_models"], sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison,
         delta_zero, ctx["loss_fn"], ctx["dataset_flag"], ctx["model_flag"], ctx["n_classes"],
         flip_grad_cache, ctx["class_samples_raw"], ctx["pi"], ctx["gamma"], ctx["beta"],
-        ctx["beta_global"], ctx["normalization"], ctx["device"],
+        ctx["beta_global"], pairs, ctx["normalization"], ctx["device"],
     )
 
     B2_current = inner_solve.aggregate_b2(ctx["u_current"], contexts_current)

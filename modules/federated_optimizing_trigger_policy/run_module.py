@@ -85,7 +85,6 @@ from modules.federated_optimizing_trigger_policy import diagnostics as diag
 from modules.federated_optimizing_trigger_policy import inner_solve
 from modules.train_expert.utils import checkpoint_callback
 import torch
-from torch.utils.data import ConcatDataset, Subset
 import numpy as np
 from pathlib import Path
 import os
@@ -328,33 +327,21 @@ def _compute_step_policy(
         # beta_global*varsigma_k (eq:rho, A2), self-checked once against beta_local*max_col_norm
         # (G_obj) the first time this batch's cache is filled. Extracted into
         # `inner_solve.get_or_build_flip_grad_cache_entry` (pure move, same formulas, same
-        # assert) so `inner_solve.build_inner_context` -- the policy_inner_mode!="joint" path --
-        # shares the SAME per-checkpoint (G_obj, Q_obj, rho_k) via this SAME flip_grad_cache
-        # dict, rather than a second, possibly-drifting computation.
-        # Task 4: `pairs` (built once in `optimize_trigger_policy`, spanning u's own
-        # coordinates) and `pairs_k` (returned by `compute_expected_flip_gradients` via
-        # `get_or_build_flip_grad_cache_entry`, spanning G_obj's columns) are assumed identical
-        # in ordering EVERYWHERE u and G_obj/Q_obj are used together (project_policy_budget,
-        # project_gradient_descent_local, aggregate_qp) -- never checked until now. A silent
-        # divergence would permute G_obj's columns relative to u's coordinates without either
-        # side raising. Checked ONCE, at this batch's first cache fill (mirrors the A2 self-
-        # check's own `len(flip_grad_cache) == 0` one-shot pattern just above/in
-        # inner_solve.get_or_build_flip_grad_cache_entry), not on every checkpoint.
-        is_first_cache_fill = len(flip_grad_cache) == 0
+        # A2 self-check) so `inner_solve.build_inner_context` -- the policy_inner_mode!="joint"
+        # path -- shares the SAME per-checkpoint (G_obj, Q_obj, rho_k) via this SAME
+        # flip_grad_cache dict, rather than a second, possibly-drifting computation.
+        # Task 5a: the pairs/pairs_k ordering assert (Task 4) used to live HERE, gated on
+        # `len(flip_grad_cache) == 0` -- but in the policy_solver="qp"/policy_inner_mode!=
+        # "joint" path, `build_inner_context` already fills the cache for every sampled_k
+        # BEFORE this call ever runs, so that gate was never true in that path (i.e. never in
+        # production with policy_solver="qp") and the assert silently never fired there. Moved
+        # into `get_or_build_flip_grad_cache_entry` itself -- the one place both this call and
+        # `build_inner_context` actually reach on a cache miss -- so it fires on the real first
+        # fill regardless of which caller gets there first.
         G_obj, Q_obj, pairs_k, rho_k = inner_solve.get_or_build_flip_grad_cache_entry(
             k, flip_grad_cache, M, loss_fn, class_samples_raw, n_classes, pi, dataset_flag,
-            model_flag, params, gamma, beta, beta_global,
+            model_flag, params, gamma, beta, beta_global, pairs,
         )
-        if is_first_cache_fill:
-            assert list(pairs_k) == list(pairs), (
-                f"pairs ordering mismatch: optimize_trigger_policy's `pairs` "
-                f"({len(pairs)} entries) != compute_expected_flip_gradients's `pairs_k` "
-                f"({len(pairs_k)} entries) for checkpoint {k} -- u's coordinates and G_obj's "
-                "columns would be silently permuted relative to each other everywhere they are "
-                "used together (project_policy_budget, project_gradient_descent_local, "
-                "aggregate_qp). First differing entries: "
-                f"{[(i, a, b) for i, (a, b) in enumerate(zip(pairs, pairs_k)) if a != b][:5]}"
-            )
 
         # Theory: eq:P's first term (local reading, the paragraph right after the lambda=beta
         # constraint) -- ||gamma*Gbar(theta_bar_k)*u^i - v_k(delta)||^2 / rho_k^2. G_obj already
@@ -507,7 +494,7 @@ def _compute_step_policy(
             contexts = inner_solve.build_inner_context(
                 expert_models, sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison,
                 delta.detach(), loss_fn, dataset_flag, model_flag, n_classes, flip_grad_cache,
-                class_samples_raw, pi, gamma, beta, beta_global, normalization, device,
+                class_samples_raw, pi, gamma, beta, beta_global, pairs, normalization, device,
                 v_estimator=v_estimator, source_label=source_label, target_label=target_label,
                 lambda_eff=lambda_effective,
             )
@@ -927,7 +914,7 @@ def optimize_trigger_policy_step(
             contexts = inner_solve.build_inner_context(
                 expert_models, sampled_k, x_clean_b, y_b, x_raw_b, mask_b, y_poison_b,
                 has_poison_b, delta.detach(), loss_fn, dataset_flag, model_flag, n_classes,
-                flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global,
+                flip_grad_cache, class_samples_raw, pi, gamma, beta, beta_global, pairs,
                 normalization, device, v_estimator=v_estimator, source_label=source_label,
                 target_label=target_label, lambda_eff=lam_eff_b,
             )
@@ -1231,6 +1218,21 @@ def optimize_trigger_policy_step(
         for key, vals in metrics_history.items()
     }
     step_summary["n_skipped"] = n_skipped
+    # Task 5b: the startup guard in optimize_trigger_policy catches the deterministic case
+    # (target_count==0 on every batch because n_b is fixed); this catches any OTHER way every
+    # batch of this step ended up with an empty poison mask (e.g. a genuinely tiny/unlucky
+    # dataset, or a future change to _build_poison_mask) -- same symptom (delta/u never moved
+    # this step), so it is still worth failing loudly rather than returning a step_summary of
+    # all-None deltas that look like a converged, uneventful step.
+    if n_skipped == total_steps:
+        raise RuntimeError(
+            f"optimize_trigger_policy_step: all {total_steps} batch(es) this step had an "
+            "empty poison mask (task 2) and were skipped -- delta/u did not move this step. "
+            "See optimize_trigger_policy's startup guard on "
+            "round(lambda_poison*batch_size_trigger) for the deterministic cause; if that "
+            "guard passed, this is a different (non-deterministic) cause and needs its own "
+            "investigation."
+        )
     return delta, u, step_summary
 
 
@@ -1275,7 +1277,6 @@ def optimize_trigger_policy(
     flip_budget=None,
     lambda_poison="beta",
     lambda_overflow="clip",
-    source_duplication=False,
     checkpoint_backward=True,
     batch_size_trigger=256,
     flip_gradient_samples_per_class=64,
@@ -1474,32 +1475,50 @@ def optimize_trigger_policy(
     # structurally infeasible -- with a HARD floor on the objective (not just a lost constant),
     # rem:saturated's mono-source reading: B2 >= (1 - gamma*pi_source/lambda_poison)^2 *
     # (||Gbar_{s,t}|| / varsigma_k)^2 > 0, since u_{s,t} can never reach lambda_poison/gamma.
-    # _compute_step_policy's per-batch mask can select at most idx_source.numel() rows
-    # (~pi_source*n_b), so lambda_effective is structurally capped near pi_source whenever
-    # lambda_poison/gamma exceeds it -- detectable a priori, not just observable on an unlucky
-    # batch, so this is a startup error rather than a per-batch warning. theta_bar_k's
-    # retraining (get_poison_dataset, ADD-based, below) does NOT have this cap -- it reaches
-    # lambda_poison exactly (mod overflow, already logged) -- so leaving this uncaught would
-    # train theta_bar_k and compute v_k at two DIFFERENT, silently-diverging rates. Chosen over
-    # lifting the cap via duplication (the other option presented for arbitration): duplicating
-    # rows in the objective's own batch would change what v_k measures, which is undesirable
-    # while A1 has just changed lambda_poison's own scale -- see
-    # docs/policy_module_audit_report.md for the two options.
+    # This is the eq:Uloc capacity bite, not a per-batch sampling artifact: _compute_step_
+    # policy's mask CAN realize u_{s,t}=lambda_poison/gamma exactly whenever that is <=
+    # pi_source (it selects lambda_poison/gamma * n_b of the ~pi_source*n_b source rows
+    # present, no duplication needed) -- the guard above is what keeps lambda_poison/gamma in
+    # that reachable range in the first place. (Task 5c correction: an earlier version of this
+    # comment additionally claimed the mask's OWN cap -- which bites at the different,
+    # uncorrected threshold lambda_poison > pi_source, not gamma*pi_source -- justified this
+    # guard; with gamma<=1 that mask cap now sits entirely PAST the point this guard already
+    # refuses at, so it is not reachable here and does not motivate this threshold. `source_
+    # duplication`, which existed to lift that mask cap, was dead code for the same reason --
+    # removed, see docs/policy_module_audit_report.md's A3 addendum.) theta_bar_k's retraining
+    # (get_poison_dataset, ADD-based, below) is unaffected by any of this -- it reaches
+    # lambda_poison exactly (mod overflow, already logged) regardless of gamma.
     if lambda_poison > gamma * pi_source:
         a3_threshold = gamma * pi_source
         raise ValueError(
             f"A3: lambda_poison={lambda_poison:.6f} > gamma*pi_source={a3_threshold:.6f} "
             f"(gamma={gamma:.6f}, pi_source={pi_source:.6f}) -- equivalently, in LOCAL terms, "
-            f"beta_local={beta:.6f} > pi_source={pi_source:.6f}. _compute_step_policy's "
-            "per-batch mask cannot realize u_{s,t}=lambda_poison/gamma (it selects from the "
-            "source-class rows actually present in a batch, ~pi_source*n_b, never "
-            "duplicating), so lambda_effective would be structurally capped near pi_source "
-            "while theta_bar_k's retraining (get_poison_dataset, ADD-based) reaches "
-            "lambda_poison exactly -- the two would silently diverge, and B2 would carry a "
-            "hard floor it can never optimize past (rem:saturated's mono-source reading, see "
-            "the comment above). Lower beta so that beta_local <= "
+            f"beta_local={beta:.6f} > pi_source={pi_source:.6f}. Reproducing v_k requires "
+            "u_{s,t}=lambda_poison/gamma (eq:local-scope), but eq:Uloc caps u_{s,t}<=pi_source "
+            "-- no feasible policy can reach lambda_poison/gamma here, so B2 would carry a "
+            "hard floor it can never optimize past regardless of how well u/delta are "
+            "optimized (rem:saturated's mono-source reading, see the comment above). Lower "
+            "beta so that beta_local <= "
             f"{pi_source:.6f} (LOCAL form, if lambda_poison=\"beta\"), or pass an explicit "
             f"numeric lambda_poison already <= {a3_threshold:.6f} (GLOBAL form)."
+        )
+
+    # Task 5b: target_count = round(lambda_poison*n_b) in `_build_poison_mask` is deterministic
+    # and IDENTICAL for every batch (n_b=batch_size_trigger is fixed) -- if it rounds to 0,
+    # task 2's empty-mask skip fires on EVERY batch, not just an unlucky one: metrics_history
+    # stays empty, step_summary is all None, delta/u never move, and the run completes
+    # normally after retraining the expert n_steps times for nothing, with n_skipped as the
+    # only symptom. Checked here (deterministic, a priori) rather than left to the run-level
+    # guard below (which only catches it after actually running a full step).
+    if round(lambda_poison * batch_size_trigger) < 1:
+        raise ValueError(
+            f"lambda_poison={lambda_poison:.6f} * batch_size_trigger={batch_size_trigger} "
+            f"rounds to {round(lambda_poison * batch_size_trigger)} -- _build_poison_mask's "
+            "target_count would be 0 on EVERY batch (n_b is fixed and identical batch to "
+            "batch), so every batch would be skipped (task 2's empty-mask check) and delta/u "
+            "would never move. Raise batch_size_trigger above "
+            f"{1.0 / lambda_poison:.1f} (so lambda_poison*batch_size_trigger >= 1), or raise "
+            f"lambda_poison above {1.0 / batch_size_trigger:.6f}."
         )
 
     if expert_budget is not None:
@@ -1511,18 +1530,12 @@ def optimize_trigger_policy(
             "get_matching_datasets ADDS poisoned examples rather than replacing clean ones)."
         )
 
-    trigger_opt_dataset = raw_train_dataset
-    if source_duplication and lambda_poison > pi_source:
-        n_add = round(lambda_poison * n_train / (1 - lambda_poison))
-        labels = np.array([y for _, y in raw_train_dataset.dataset])
-        source_indices = np.where(labels == source_label)[0]
-        dup_rng = np.random.RandomState(0)
-        dup_indices = dup_rng.choice(source_indices, size=n_add, replace=True)
-        trigger_opt_dataset = ConcatDataset(
-            [raw_train_dataset, Subset(raw_train_dataset, dup_indices)]
-        )
-
-    loader = build_loader(trigger_opt_dataset, batch_size=batch_size_trigger)
+    # Task 5c: `source_duplication` (an opt-in row-duplication path for lambda_poison >
+    # pi_source, guarded on that same condition) was dead code -- A3 above now raises as soon
+    # as lambda_poison > gamma*pi_source, which is <= pi_source for any gamma<=1, so
+    # `lambda_poison > pi_source` can never be reached alive. Removed rather than left
+    # unreachable; see docs/policy_module_audit_report.md's A3 addendum.
+    loader = build_loader(raw_train_dataset, batch_size=batch_size_trigger)
 
     class_samples_raw = get_class_conditional_samples(
         dataset_flag, n_classes, flip_gradient_samples_per_class, device
@@ -1854,7 +1867,6 @@ def run(experiment_name, module_name, **kwargs):
     flip_budget = args.get("flip_budget", None)
     lambda_poison = args.get("lambda_poison", "beta")
     lambda_overflow = args.get("lambda_overflow", "clip")
-    source_duplication = args.get("source_duplication", False)
     checkpoint_backward = args.get("checkpoint_backward", True)
     batch_size_trigger = args.get("batch_size_trigger", 256)
     flip_gradient_samples_per_class = args.get("flip_gradient_samples_per_class", 64)
@@ -1960,7 +1972,6 @@ def run(experiment_name, module_name, **kwargs):
         flip_budget=flip_budget,
         lambda_poison=lambda_poison,
         lambda_overflow=lambda_overflow,
-        source_duplication=source_duplication,
         checkpoint_backward=checkpoint_backward,
         batch_size_trigger=batch_size_trigger,
         flip_gradient_samples_per_class=flip_gradient_samples_per_class,

@@ -55,7 +55,7 @@ _EPS_DEN = 1e-8
 
 def get_or_build_flip_grad_cache_entry(
     k, flip_grad_cache, M, loss_fn, class_samples_raw, n_classes, pi, dataset_flag, model_flag,
-    params, gamma, beta, beta_global,
+    params, gamma, beta, beta_global, pairs,
 ):
     '''
     Returns (G_obj, Q_obj, pairs_k, rho_k) for checkpoint k, filling `flip_grad_cache[k]` on a
@@ -65,6 +65,17 @@ def get_or_build_flip_grad_cache_entry(
     rho_k) the joint path uses for each checkpoint, from the SAME shared `flip_grad_cache`
     dict, instead of a second, possibly-drifting implementation. See run_module.py's
     `_compute_step_policy` docstring for the full derivation (PIEGE 1/PIEGE 2, eq:rho/eq:varsigma).
+
+    Task 5a: `pairs` (the caller's own u-coordinate ordering, built once in
+    optimize_trigger_policy) is checked against `pairs_k` HERE, at this function's single
+    cache-miss point -- the one place BOTH the joint co-descent path (`_compute_step_policy`)
+    and the inner-solve path (`build_inner_context`, used by policy_solver="qp" and every
+    policy_inner_mode!="joint") actually fill the cache. Task 4's original assert lived in
+    `_compute_step_policy` instead, gated on `len(flip_grad_cache) == 0` measured AFTER
+    `build_inner_context` had already filled the cache for every sampled_k in the qp/non-joint
+    path -- by the time `_compute_step_policy` ran, the cache was never empty there, so the
+    assert silently never fired in production (policy_solver="qp"). Moved here so it fires on
+    the actual first fill regardless of which caller reaches it first.
     '''
     if k in flip_grad_cache:
         return flip_grad_cache[k]
@@ -90,6 +101,15 @@ def get_or_build_flip_grad_cache_entry(
             f"A2 self-check failed: rho_k={rho_k:.6f} (beta_global*varsigma_k) vs "
             f"rho_k_check={rho_k_check:.6f} (beta_local*max_col_norm(G_obj)) -- see "
             "run_module.py's _compute_step_policy docstring."
+        )
+        assert list(pairs_k) == list(pairs), (
+            f"pairs ordering mismatch: optimize_trigger_policy's `pairs` ({len(pairs)} "
+            f"entries) != compute_expected_flip_gradients's `pairs_k` ({len(pairs_k)} "
+            f"entries) for checkpoint {k} -- u's coordinates and G_obj's columns would be "
+            "silently permuted relative to each other everywhere they are used together "
+            "(project_policy_budget, project_gradient_descent_local, aggregate_qp). First "
+            "differing entries: "
+            f"{[(i, a, b) for i, (a, b) in enumerate(zip(pairs, pairs_k)) if a != b][:5]}"
         )
 
     flip_grad_cache[k] = (G_obj, Q_obj, pairs_k, rho_k)
@@ -199,7 +219,7 @@ def compute_frozen_v(M, loss_fn, x_clean, y, x_raw, mask, y_poison, has_poison, 
 def build_inner_context(
     expert_models, sampled_k, x_clean, y, x_raw, mask, y_poison, has_poison, delta_frozen,
     loss_fn, dataset_flag, model_flag, n_classes, flip_grad_cache, class_samples_raw, pi, gamma,
-    beta, beta_global, normalization, device, v_estimator="subsample", source_label=None,
+    beta, beta_global, pairs, normalization, device, v_estimator="subsample", source_label=None,
     target_label=None, lambda_eff=None,
 ):
     '''
@@ -222,7 +242,7 @@ def build_inner_context(
         params = list(M.parameters())
         G_obj, Q_obj, pairs_k, rho_k = get_or_build_flip_grad_cache_entry(
             k, flip_grad_cache, M, loss_fn, class_samples_raw, n_classes, pi, dataset_flag,
-            model_flag, params, gamma, beta, beta_global,
+            model_flag, params, gamma, beta, beta_global, pairs,
         )
         v = compute_frozen_v(
             M, loss_fn, x_clean, y, x_raw, mask, y_poison, has_poison, delta_frozen,
