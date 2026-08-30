@@ -18,11 +18,18 @@ actually wrote to), reports three things at three different levels:
                            user model trained on the materialized flips), same convention as
                            the other threat-model modules' show_results.py.
 
-Usage: python show_results_policy.py
+Usage: python scripts/show_results/show_results_policy.py
 """
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
+
+# This file lives at FLIP/scripts/show_results/ -- three levels below the repo root, which
+# must be on sys.path for `modules.*` to import (moved here 2026-08-30, was directly at the
+# repo root before, where the script's own directory WAS the repo root).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from modules.federated_optimizing_trigger_policy.gen_configs import (
     BUDGETS_TARGET,

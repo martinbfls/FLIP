@@ -38,8 +38,8 @@ from modules.federated_optimizing_trigger.utils import init_delta
 # axis is shared (num_poisoned/num_honests/budgets/agg_method/epsilon/expert provenance) --
 # see the checkpoint_sampling note below for the one axis that is NOT aligned by default.
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 1
-NUM_HONESTS = 0
+NUM_POISONED = 3
+NUM_HONESTS = 7
 SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 # Validation run (2026-08-30) of the sweep's "combined candidate" (see
@@ -48,7 +48,7 @@ BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 # so "mean" vs "multikrum" aggregation is a no-op distinction here (see
 # gen_configs_sweep.py's own AGG_METHOD comment); dropped to avoid doubling this validation
 # campaign's cell count for a factor that can't actually vary at NUM_HONESTS=0.
-AGG_METHODS = ["mean"]
+AGG_METHODS = ["mean", "multikrum"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
@@ -84,7 +84,9 @@ N_ITERATIONS = 25  # Validation run (2026-08-30): sweep's best value for this ax
 # best-per-axis value substituted in for each axis that beat the 2026-08-28 baseline) --
 # NOTE this combination was never itself a sweep cell (one-at-a-time sweeps don't see axis
 # interactions): this run (SEEDS/BUDGETS above, full budget sweep) IS that confirmation run.
-EPSILON = 0.05  # L_infinity bound on the trigger delta. Sweep's best value for this axis
+EPSILON = (
+    0.05  # L_infinity bound on the trigger delta. Sweep's best value for this axis
+)
 # (ASR 0.9900 vs baseline's 0.9860 at epsilon=1.0) -- counterintuitively SMALLER than the
 # 2026-08-28 baseline, not larger; a tighter perturbation bound apparently helped THIS
 # checkpoint/init combination rather than hurting it. CAUTION: at DELTA_MIN_FRAC=0.01 below,
@@ -92,7 +94,9 @@ EPSILON = 0.05  # L_infinity bound on the trigger delta. Sweep's best value for 
 # thin enough that a small change to init strength/freq could flip the A3-style feasibility
 # guard below to REFUSED; re-check its printed delta_min/max_reachable if this generator's
 # init constants ever change. (was 1.0)
-LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization. Sweep confirmed baseline
+LR_DELTA = (
+    1e-2  # Adam learning rate for the trigger optimization. Sweep confirmed baseline
+)
 # already best on this axis -- unchanged.
 LAMBDA_BD = 2.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
 # formulas) -- higher pushes harder for backdoor success at the cost of

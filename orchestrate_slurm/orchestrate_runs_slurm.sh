@@ -32,15 +32,20 @@
 # NOTE: no `set -e` on purpose (same reasoning as orchestrate_runs_bis.sh):
 # one failed submission must not tear down the whole campaign.
 
-# Default to the directory this script lives in, so the repo can sit anywhere
-# (it is under /shared, not $HOME) and the script works from any cwd.
-BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Default to the FLIP repo root, so the repo can sit anywhere (it is under /shared, not
+# $HOME) and the script works from any cwd. This script lives one level below the repo root
+# (orchestrate_slurm/, moved here 2026-08-30; it used to sit at the repo root itself, where
+# the script's own directory WAS correct) -- go up one level from SCRIPT_DIR to compensate.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 cd "$BASE_DIR" || exit 1
 export BASE_DIR
 
 mkdir -p "$BASE_DIR/logs_slurm"
 
-source "$BASE_DIR/slurm_lib.sh"
+# slurm_lib.sh is a SIBLING of this script (both under orchestrate_slurm/), not at BASE_DIR
+# (the repo root) -- source it via SCRIPT_DIR, not BASE_DIR.
+source "$SCRIPT_DIR/slurm_lib.sh"
 
 # Fail before anything is queued if the environment cannot support the plan.
 preflight_slurm || { echo "[ABORT] preflight failed, nothing submitted"; exit 1; }

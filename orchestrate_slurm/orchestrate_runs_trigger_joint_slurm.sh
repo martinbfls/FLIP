@@ -44,7 +44,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
+# BASE_DIR must be the FLIP repo root -- this script lives one level below it
+# (orchestrate_slurm/, moved here 2026-08-30; it used to sit at the repo root, where
+# SCRIPT_DIR alone was correct). Every relative path below (experiments/..., python
+# run_experiment.py ...) is resolved against BASE_DIR after the cd below.
+BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 export BASE_DIR
 cd "$BASE_DIR"
 

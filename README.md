@@ -108,21 +108,23 @@ pip install -r requirements.txt
 
 ### Legacy SSH-pool infrastructure
 
-`orchestrate_runs.sh` (and its `bis`/`ter`/`trigger`/`trigger_orthogonal`
-variants) dispatch experiments over a hardcoded pool of SSH-reachable
-machines listed in the `MACHINES` array, one job per idle machine at a
-time. `connect_all.sh` sanity-checks Python availability on that pool, and
-`kill_all.sh` stops stray runs across it. These remain fully supported.
+Under `orchestrate_student_machines/`: `orchestrate_runs.sh` (and its
+`bis`/`ter`/`trigger`/`trigger_orthogonal` variants) dispatch experiments
+over a hardcoded pool of SSH-reachable machines listed in the `MACHINES`
+array, one job per idle machine at a time. `connect_all.sh` sanity-checks
+Python availability on that pool, and `kill_all.sh` stops stray runs across
+it. These remain fully supported.
 
 ### Slurm cluster
 
-The same experiment grids can be run on a Slurm cluster via:
+The same experiment grids can be run on a Slurm cluster via the scripts
+under `orchestrate_slurm/`:
 
-- `slurm_lib.sh` — shared pool executor: packs many experiments as
-  concurrent `srun --exclusive` steps inside a single sbatch allocation
-  (no `sbatch` per experiment).
-- `orchestrate_runs_slurm.sh` — Slurm translation of `orchestrate_runs.sh`
-  (same gen_labels/train_user grid), submit with `sbatch`.
+- `slurm_lib.sh` — shared bash library: each experiment is submitted as its
+  own `sbatch` job (one GPU each), no shared allocation.
+- `orchestrate_runs_slurm.sh` — Slurm translation of
+  `orchestrate_student_machines/orchestrate_runs.sh` (same gen_labels/
+  train_user grid), submit with `sbatch`.
 - `run_experiment_slurm.sh` — single-experiment entry point; also usable
   with `sbatch --array=...` to fan a config out over seeds using the
   existing `SLURM_ARRAY_TASK_ID` support in `run_experiment.py`.

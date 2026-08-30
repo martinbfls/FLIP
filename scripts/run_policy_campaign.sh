@@ -34,8 +34,9 @@ BASE_DIR="${BASE_DIR:-$(dirname "$SCRIPT_DIR")}"
 export BASE_DIR
 cd "$BASE_DIR"
 
-# shellcheck source=../slurm_lib.sh
-source "$BASE_DIR/slurm_lib.sh"
+# slurm_lib.sh moved to orchestrate_slurm/ 2026-08-30 (was directly at the repo root).
+# shellcheck source=../orchestrate_slurm/slurm_lib.sh
+source "$BASE_DIR/orchestrate_slurm/slurm_lib.sh"
 
 RUN_EXPERT="${RUN_EXPERT:-0}"
 DRY_RUN="${DRY_RUN:-0}"

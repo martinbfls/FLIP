@@ -19,14 +19,22 @@ show_results.py), then reports, in order:
      test axis interactions, so this combination has never actually been run -- see the CAVEAT
      printed with it).
 
-Usage: python analyze_trigger_joint_sweep.py [--generate-combined]
+Usage: python scripts/show_results/analyze_trigger_joint_sweep.py [--generate-combined]
   --generate-combined also writes the "combined" candidate as a new sweep cell (tag
   "combined_best") via gen_configs_sweep.generate_cell, ready to add to
-  orchestrate_runs_trigger_joint_sweep_slurm.sh's CELL_TAGS for a confirmation run.
+  orchestrate_slurm/orchestrate_runs_trigger_joint_sweep_slurm.sh's CELL_TAGS for a
+  confirmation run.
 """
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
+
+# This file lives at FLIP/scripts/show_results/ -- three levels below the repo root, which
+# must be on sys.path for `modules.*` to import (moved here 2026-08-30, was directly at the
+# repo root before, where the script's own directory WAS the repo root).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from modules.federated_generate_labels_trigger_joint.gen_configs_sweep import (
     BASELINE,
@@ -36,6 +44,8 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_sweep import (
     MODEL_FLAG,
     NUM_HONESTS,
     NUM_POISONED,
+    SOURCE_LABEL,
+    TARGET_LABEL,
     SEEDS,
     SWEEP_AXES,
     build_cells,

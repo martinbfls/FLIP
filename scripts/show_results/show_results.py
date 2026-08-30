@@ -1,9 +1,17 @@
 import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 from torchvision import transforms
+
+# This file lives at FLIP/scripts/show_results/ -- three levels below the repo root, which
+# must be on sys.path for `modules.*` to import (moved here 2026-08-30, was directly at the
+# repo root before, where the script's own directory WAS the repo root).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from modules.base_utils.datasets import load_dataset, pick_poisoner
 from modules.federated_generate_labels_trigger_joint.gen_configs import (
