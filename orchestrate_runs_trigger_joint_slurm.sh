@@ -67,12 +67,19 @@ USER_TIME="${USER_TIME:-0-01:00:00}"
 # ---------------------------------------------------------------------------
 read -ra MODEL_FLAGS <<< "${MODEL_FLAGS:-r32p}"
 read -ra DATASETS    <<< "${DATASETS:-cifar}"
-read -ra AGG_METHODS <<< "${AGG_METHODS:-mean multikrum}"
-read -ra SEEDS       <<< "${SEEDS:-0 1 2 3 4 5 6 7 8 9}"
+# Validation run (2026-08-30): gen_configs.py's own AGG_METHODS was narrowed to just "mean"
+# (NUM_HONESTS=0 makes aggregator choice a no-op) -- kept in sync here, override via env var
+# if gen_configs.py's grid changes again.
+read -ra AGG_METHODS <<< "${AGG_METHODS:-mean}"
+# Validation run (2026-08-30): this whole grid drifted out of sync with gen_configs.py's own
+# NUM_POISONED/NUM_HONESTS=1/0 and SEEDS=[0] (it was still hardcoded at the pre-1vs0 values,
+# 3vs7/10 seeds) -- corrected to match. BUDGETS was already in sync (gen_configs.py's own full
+# list, requested here as a single-seed validation run over every budget).
+read -ra SEEDS       <<< "${SEEDS:-0}"
 read -ra BUDGETS     <<< "${BUDGETS:-150 300 500 1000 2000 2500 5000}"
 
-NUM_POISONED="${NUM_POISONED:-3}"
-NUM_HONESTS="${NUM_HONESTS:-7}"
+NUM_POISONED="${NUM_POISONED:-1}"
+NUM_HONESTS="${NUM_HONESTS:-0}"
 
 # gen_configs.py's EXP_BASE, relative to experiments/ (what run_experiment.py
 # expects: it prepends "experiments/" and appends "/config.toml" itself).

@@ -42,7 +42,13 @@ NUM_POISONED = 1
 NUM_HONESTS = 0
 SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
-AGG_METHODS = ["mean", "multikrum"]
+# Validation run (2026-08-30) of the sweep's "combined candidate" (see
+# analyze_trigger_joint_sweep.py's output and the REGULARIZATION_GRID note below): single
+# seed, full budget sweep, "mean" only -- with NUM_HONESTS=0 there is only one worker total,
+# so "mean" vs "multikrum" aggregation is a no-op distinction here (see
+# gen_configs_sweep.py's own AGG_METHOD comment); dropped to avoid doubling this validation
+# campaign's cell count for a factor that can't actually vary at NUM_HONESTS=0.
+AGG_METHODS = ["mean"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
@@ -61,7 +67,9 @@ ALPHA_CKPT = 0.01
 TRAIN_PCT = 1.0
 EPOCHS_EXPERT = 20
 CHECKPOINT_ITERS = 50
-N_ITERATIONS = 15
+N_ITERATIONS = 25  # Validation run (2026-08-30): sweep's best value for this axis alone
+# (ASR 1.0000 vs baseline's 0.9860 at n_iterations=15, see analyze_trigger_joint_sweep.py) --
+# part of the "combined candidate" below. (was 15)
 
 # --------------------------------------------------------------------------- #
 # REGULARIZATION_GRID -- trigger regularization knobs, kept separate from the sweep axes
@@ -69,36 +77,46 @@ N_ITERATIONS = 15
 # `single_cell` mode (see generate_single_cell / --single-cell) fixes ALL of these to the
 # defaults below and sweeps only the main axes (SEEDS/BUDGETS/AGG_METHODS).
 # --------------------------------------------------------------------------- #
-# Relaxed 2026-08-28: the original constraints below (EPSILON=0.1, GAMMA_STEALTH=1.0,
-# ALIGN_KAPPA=0.6, LAMBDA_ALIGN=LAMBDA_MAG=1.0) were too tight -- the anti-collapse /
-# stealth terms fought the backdoor-efficacy term hard enough to degrade CTA/ASR well below
-# what the underlying attack can actually do. This is a proof-of-concept campaign (showing
-# what gradient-inversion-style trigger optimization CAN achieve), not a stealth-optimized
-# attack, so the norm bound is widened and every competing regularization weight is cut back
-# in favor of lambda_bd. DELTA_MIN_FRAC is lowered too, both because the anti-collapse floor
-# itself is one of the loosened constraints and because it has far more slack now that
-# EPSILON is bigger (see the feasibility guard below).
-EPSILON = 1.0  # L_infinity bound on the trigger delta -- larger allows a stronger/more
-# visible perturbation; too small can make the backdoor unreachable. (was 0.1)
-LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization.
+# Relaxed 2026-08-28 (see git history for that pass's reasoning), then VALIDATED 2026-08-30
+# against the one-at-a-time hyperparameter sweep in gen_configs_sweep.py (30 cells, 1
+# poisoned/0 honest, single budget=1500 -- see analyze_trigger_joint_sweep.py's ranking).
+# EPSILON/GAMMA_STEALTH/LAMBDA_DELTA below are the sweep's "combined candidate" (its own
+# best-per-axis value substituted in for each axis that beat the 2026-08-28 baseline) --
+# NOTE this combination was never itself a sweep cell (one-at-a-time sweeps don't see axis
+# interactions): this run (SEEDS/BUDGETS above, full budget sweep) IS that confirmation run.
+EPSILON = 0.05  # L_infinity bound on the trigger delta. Sweep's best value for this axis
+# (ASR 0.9900 vs baseline's 0.9860 at epsilon=1.0) -- counterintuitively SMALLER than the
+# 2026-08-28 baseline, not larger; a tighter perturbation bound apparently helped THIS
+# checkpoint/init combination rather than hurting it. CAUTION: at DELTA_MIN_FRAC=0.01 below,
+# this leaves only a ~1.2x feasibility margin (delta_min~=2.31 vs max_reachable~=2.77) --
+# thin enough that a small change to init strength/freq could flip the A3-style feasibility
+# guard below to REFUSED; re-check its printed delta_min/max_reachable if this generator's
+# init constants ever change. (was 1.0)
+LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization. Sweep confirmed baseline
+# already best on this axis -- unchanged.
 LAMBDA_BD = 2.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
 # formulas) -- higher pushes harder for backdoor success at the cost of
-# the matching term. Raised (was 1.0) to lean further into backdoor efficacy now that the
-# competing regularizers below are relaxed.
+# the matching term. Sweep confirmed baseline already best on this axis -- unchanged.
 GAMMA_STEALTH = (
-    0.3  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
+    1.0  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
 )
-# to federated_optimizing_trigger_policy's gamma -- disjoint concept). Lowered (was 1.0):
-# stealth is secondary for this proof-of-concept, and was fighting L_bd for optimization
-# budget.
-# lambda_trigger_l2 (schema's lambda_delta): the L2-norm penalty on delta. Kept at 0.0 in THIS
-# module specifically -- the descent toward a null trigger (delta -> 0) is exactly the
-# collapse mode this module's anti-collapse machinery (trigger_constraint/align_kappa/
-# lambda_align/lambda_mag/delta_min_frac, below) was built to detect and prevent. An L2
-# penalty on delta would passively encourage that same collapse, working against the floor
-# terms below -- do not raise this without also reconsidering delta_min_frac.
-LAMBDA_DELTA = 0.0
+# to federated_optimizing_trigger_policy's gamma -- disjoint concept). Sweep's best value for
+# this axis (ASR 0.9940 vs baseline's 0.9860 at gamma_stealth=0.3) -- back up at the ORIGINAL
+# (pre-2026-08-28) value: at NUM_HONESTS=0/NUM_POISONED=1 this proof-of-concept apparently
+# doesn't need stealth traded off against L_bd the way the relaxation pass assumed. (was 0.3)
+# lambda_trigger_l2 (schema's lambda_delta): the L2-norm penalty on delta. Sweep's best value
+# for this axis (ASR 0.9870 vs baseline's 0.9860 at lambda_delta=0.0) -- CAUTION: this is a
+# small margin over baseline, and raising lambda_delta off 0.0 is exactly what the ORIGINAL
+# comment here warned against ("do not raise this without also reconsidering delta_min_frac"
+# -- an L2 penalty passively encourages the delta->0 collapse this module's anti-collapse
+# floor terms below exist to prevent). Kept as the sweep's own suggestion for this
+# confirmation run, but if CTA/ASR degrade at the larger budgets, LAMBDA_DELTA is the first
+# axis to revert to 0.0.
+LAMBDA_DELTA = 1.0
 
+# TRIGGER_CONSTRAINT/ALIGN_KAPPA/LAMBDA_ALIGN/LAMBDA_MAG/DELTA_MIN_FRAC: sweep confirmed the
+# 2026-08-28 baseline already best on every one of these axes -- left unchanged for this
+# confirmation run.
 TRIGGER_CONSTRAINT = "penalty"
 ALIGN_KAPPA = (
     0.3  # directional floor on cos(delta, mu_target) -- lowered (was 0.6): easier
@@ -109,12 +127,11 @@ LAMBDA_ALIGN = (
 )
 # 1.0) so it still guards against collapse without dominating the loss.
 LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reasoning.
-# NOTE: the schema's own default is 0.5, which is still INFEASIBLE at EPSILON=0.3 (see the
-# guard below: 0.5*||delta_init||_2 ~= 115.7 > 0.3*sqrt(3*32*32) ~= 16.6) -- raising EPSILON
-# alone doesn't buy back the schema default. delta_min_frac itself is one of the constraints
-# being relaxed here (was 0.02, tight purely for EPSILON=0.1 feasibility, not because 0.02
-# was a deliberately chosen floor) -- lowered further to 0.01, which now has ~14x feasibility
-# margin at EPSILON=0.3 instead of the old ~2x at EPSILON=0.1.
+# NOTE (updated 2026-08-30 for EPSILON=0.05 above, was EPSILON=0.3's ~14x/EPSILON=0.1's ~2x):
+# delta_min = 0.01*||delta_init||_2 ~= 2.31 vs max_reachable = 0.05*sqrt(3*32*32) ~= 2.77 --
+# only a ~1.2x feasibility margin now, thin enough to be worth re-reading the feasibility
+# guard's printed values below rather than assuming this comment stays accurate if EPSILON,
+# DELTA_MIN_FRAC, or the init constants (_STRENGTH/_FREQ) change again.
 DELTA_MIN_FRAC = 0.01
 
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
