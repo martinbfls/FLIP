@@ -8,6 +8,7 @@ import sys
 from modules.train_expert.utils import checkpoint_callback
 from modules.base_utils.datasets import get_matching_datasets, get_n_classes, pick_poisoner, build_federated_datasets
 from modules.base_utils.util import extract_toml, load_model, clf_eval, mini_train_multi, get_train_info, needs_big_ims, slurmify_path
+from modules.base_utils.experiment_tracker import ExperimentTracker
 
 
 def run(experiment_name, module_name, **kwargs):
@@ -21,6 +22,7 @@ def run(experiment_name, module_name, **kwargs):
 
     slurm_id = kwargs.get('slurm_id', None)
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     model_flag = args["model"]
     dataset_flag = args["dataset"]
@@ -102,7 +104,8 @@ def run(experiment_name, module_name, **kwargs):
         record=True,
         agg_method=agg_method,
         f=num_poisoned,
-        callback=lambda m, o, e, i: checkpoint_callback(m, o, e, i, ckpt_iters, output_dir)
+        callback=lambda m, o, e, i: checkpoint_callback(m, o, e, i, ckpt_iters, output_dir),
+        epoch_callback=tracker.epoch_callback(),
     )
 
     # Evaluate
@@ -111,6 +114,8 @@ def run(experiment_name, module_name, **kwargs):
     poison_test_acc = clf_eval(model, poison_test.poison_dataset)[0]
     print(f"{clean_test_acc=}")
     print(f"{poison_test_acc=}")
+
+    tracker.finalize()
 
 if __name__ == "__main__":
     experiment_name, module_name = sys.argv[1], sys.argv[2]

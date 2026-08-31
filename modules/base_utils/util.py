@@ -216,6 +216,7 @@ def mini_train(
     shuffle=True,
     callback=None,
     record=False,
+    epoch_callback=None,
 ):
     device = get_module_device(model)
     dataloader, _ = either_dataloader_dataset_to_both(
@@ -273,6 +274,14 @@ def mini_train(
                         acc_loss[i].append((acc, loss))
             pbar.set_postfix(**pbar_postfix)
 
+            if epoch_callback is not None:
+                epoch_callback(
+                    epoch,
+                    train_epoch_loss / n,
+                    train_epoch_correct / n,
+                    lr,
+                )
+
     if record:
         return model, *acc_loss
     return model
@@ -294,6 +303,7 @@ def mini_train_multi(
     record=False,
     agg_method="mean",
     f=1,
+    epoch_callback=None,
 ):
     device = get_module_device(model)
 
@@ -397,6 +407,14 @@ def mini_train_multi(
                         acc_loss[i].append((acc, loss))
 
             pbar.set_postfix(**postfix)
+
+            if epoch_callback is not None:
+                epoch_callback(
+                    epoch,
+                    train_epoch_loss / total_samples,
+                    train_epoch_correct / total_samples,
+                    lr,
+                )
 
     if record:
         return model, *acc_loss

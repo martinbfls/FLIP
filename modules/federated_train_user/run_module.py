@@ -23,11 +23,13 @@ from modules.base_utils.util import (
     slurmify_path,
     softmax,
 )
+from modules.base_utils.experiment_tracker import ExperimentTracker
 
 
 def run(experiment_name, module_name, **kwargs):
     slurm_id = kwargs.get("slurm_id", None)
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     user_model_flag = args["user_model"]
     trainer_flag = args["trainer"]
@@ -118,13 +120,16 @@ def run(experiment_name, module_name, **kwargs):
         epochs=epochs,
         record=True,
         agg_method=agg_method,
-        f=num_poisoned
+        f=num_poisoned,
+        epoch_callback=tracker.epoch_callback(),
     )
 
     print("Saving results...")
     np.save(output_dir / "paccs.npy", poison_metrics)
     np.save(output_dir / "caccs.npy", clean_metrics)
     #torch.save(model_retrain.state_dict(), output_dir / "model.pth")
+
+    tracker.finalize()
 
 
 if __name__ == "__main__":

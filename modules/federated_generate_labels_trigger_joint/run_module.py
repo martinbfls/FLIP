@@ -22,6 +22,7 @@ from modules.base_utils.util import extract_toml, get_module_device, get_mtt_att
                                     load_model, either_dataloader_dataset_to_both, make_pbar, \
                                     needs_big_ims, slurmify_path, clf_loss, softmax, \
                                     total_mse_distance, get_train_info, mini_train
+from modules.base_utils.experiment_tracker import ExperimentTracker
 from modules.federated_generate_labels.utils import coalesce_attack_config, \
                                                      extract_labels, extract_experts, sgd_step, agg
 from modules.train_expert.utils import checkpoint_callback
@@ -233,6 +234,7 @@ def run(experiment_name, module_name, **kwargs):
     slurm_id = kwargs.get('slurm_id', None)
 
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     input_pths = args["input_pths"]
     opt_pths = args["opt_pths"]
@@ -943,6 +945,18 @@ def run(experiment_name, module_name, **kwargs):
                         "reg_term": reg_term.item(),
                         "mtt_delta_grad_norm": mtt_delta_grad_norm,
                     })
+                tracker.log(
+                    it,
+                    grand_loss=grand_loss.item(),
+                    L_bd_mean=L_bd_mean,
+                    expert_asr=asr_mean,
+                    expert_asr_frozen=asr_frozen_mean,
+                    delta_l2=delta_l2,
+                    delta_linf=delta_linf,
+                    L_align=L_align_post,
+                    L_mag=L_mag_post,
+                    mtt_delta_grad_norm=mtt_delta_grad_norm,
+                )
 
                 pbar.update(batch_size)
                 pbar.set_postfix(
@@ -973,6 +987,8 @@ def run(experiment_name, module_name, **kwargs):
         Path(metrics_log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(metrics_log_path, "w") as f:
             json.dump(history, f, indent=2)
+
+    tracker.finalize()
 
     run_tag = f"{num_poisoned}vs{num_honests}"
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)

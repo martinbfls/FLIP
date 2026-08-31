@@ -13,6 +13,7 @@ from modules.base_utils.datasets import get_matching_datasets, pick_poisoner, ge
 from modules.base_utils.util import extract_toml, get_module_device, get_mtt_attack_info, \
                                     load_model, either_dataloader_dataset_to_both, make_pbar, \
                                     needs_big_ims, slurmify_path, clf_loss, softmax, total_mse_distance
+from modules.base_utils.experiment_tracker import ExperimentTracker
 from modules.federated_generate_labels.utils import coalesce_attack_config, extract_experts, extract_labels, sgd_step, agg
 from modules.base_utils.aggregator.trmean import aggr_trmean
 from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
@@ -29,6 +30,7 @@ def run(experiment_name, module_name, **kwargs):
     slurm_id = kwargs.get('slurm_id', None)
 
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     input_pths = args["input_pths"]
     opt_pths = args["opt_pths"]
@@ -221,6 +223,7 @@ def run(experiment_name, module_name, **kwargs):
                 optimizer_labels.step()
 
                 losses.append(grand_loss.item())
+                tracker.log(it, grand_loss=grand_loss.item())
                 pbar.update(batch_size)
                 pbar.set_postfix(
                     g_loss=f"{np.mean(losses[-20:]):.4g}",
@@ -234,6 +237,8 @@ def run(experiment_name, module_name, **kwargs):
     np.save(output_dir + "labels.npy", labels_syn.detach().numpy())
     np.save(output_dir + "true.npy", y_true)
     np.save(output_dir + "losses.npy", losses)
+
+    tracker.finalize()
 
 if __name__ == "__main__":
     experiment_name, module_name = sys.argv[1], sys.argv[2]

@@ -23,3 +23,4 @@ lambda = "float: [0, infty]. Specifies regularization parameter. Set to 0 by def
 expert_config = "dict. Specifies expert checkpoints. Set to default if omitted. See example_attack."
 attack_config = "dict. Specifies algorithm parameters. Set to default if ommited. See example_attack."
 delta = "str: path to optimized trigger"
+wandb = "dict: {enabled: bool, project: str, entity: str (optional), mode: str {online, offline, disabled} (optional, default online), tags: list[str] (optional), group: str (optional), run_name: str (optional)}. If enabled=true, per-step metrics and the auto-generated loss-curve plots are also mirrored to Weights & Biases via modules/base_utils/experiment_tracker.py's ExperimentTracker. Absent or enabled=false (default): no W&B activity; local plots/metrics under experiments/<experiment_name>/{plots,logs}/<module_name>/ are produced either way."

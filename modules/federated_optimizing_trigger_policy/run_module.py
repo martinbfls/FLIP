@@ -84,6 +84,7 @@ from modules.federated_optimizing_trigger_policy.utils import (
 from modules.federated_optimizing_trigger_policy import diagnostics as diag
 from modules.federated_optimizing_trigger_policy import inner_solve
 from modules.train_expert.utils import checkpoint_callback
+from modules.base_utils.experiment_tracker import ExperimentTracker
 import torch
 import numpy as np
 from pathlib import Path
@@ -1298,6 +1299,7 @@ def optimize_trigger_policy(
     diag_constraint_tol=1e-8,
     diag_span_projection=True,
     diag_direction_scaling=True,
+    tracker=None,
     policy_inner_mode="joint",
     policy_inner_steps=1,
     policy_inner_iters=200,
@@ -1730,6 +1732,16 @@ def optimize_trigger_policy(
                 "poison_acc": poison_acc,
                 **step_summary,
             })
+        if tracker is not None:
+            tracker.log(
+                step,
+                clean_acc=clean_acc,
+                poison_acc=poison_acc,
+                **{
+                    k: v for k, v in step_summary.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                },
+            )
 
     if metrics_log_path:
         Path(metrics_log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1805,6 +1817,7 @@ def run(experiment_name, module_name, **kwargs):
     """
     slurm_id = kwargs.get("slurm_id", None)
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     print(f"[DIAG policy] config epochs={args.get('epochs', 'NOT SET')}", flush=True)
     print(f"[DIAG policy] config n_steps={args.get('n_steps', 'NOT SET')}", flush=True)
@@ -2009,6 +2022,7 @@ def run(experiment_name, module_name, **kwargs):
         diag_m_sweep=diag_m_sweep,
         diag_m_sweep_values=diag_m_sweep_values,
         v_estimator=v_estimator,
+        tracker=tracker,
     )
 
     print("Optimized trigger and policy obtained.")
@@ -2058,6 +2072,8 @@ def run(experiment_name, module_name, **kwargs):
     )
     print(f"Saved trigger to {trig_path}")
     print(f"Saved policy to {policy_path}")
+
+    tracker.finalize()
 
 
 if __name__ == "__main__":

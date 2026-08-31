@@ -12,6 +12,7 @@ from modules.base_utils.datasets import get_matching_datasets, get_n_classes, pi
                                         construct_user_dataset
 from modules.base_utils.util import extract_toml, get_train_info, mini_train, load_model,\
                                     needs_big_ims, slurmify_path, softmax
+from modules.base_utils.experiment_tracker import ExperimentTracker
 
 
 def run(experiment_name, module_name, **kwargs):
@@ -25,6 +26,7 @@ def run(experiment_name, module_name, **kwargs):
 
     slurm_id = kwargs.get('slurm_id', None)
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     user_model_flag = args["user_model"]
     trainer_flag = args["trainer"]
@@ -86,7 +88,8 @@ def run(experiment_name, module_name, **kwargs):
         opt=optimizer_retrain,
         scheduler=scheduler,
         epochs=epochs,
-        record=True
+        record=True,
+        epoch_callback=tracker.epoch_callback(),
     )
 
     # Save results
@@ -95,6 +98,8 @@ def run(experiment_name, module_name, **kwargs):
     np.save(output_path + "caccs.npy", clean_metrics)
     np.save(output_path + "labels.npy", labels_d.numpy())
     #torch.save(model_retrain.state_dict(), output_path + "model.pth")
+
+    tracker.finalize()
 
 if __name__ == "__main__":
     experiment_name, module_name = sys.argv[1], sys.argv[2]

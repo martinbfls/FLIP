@@ -15,6 +15,16 @@ GAMMA = 1.0
 RESTART = False
 ORTHOGONAL = False
 
+# Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
+# default -- flip WANDB_ENABLED to True to have every config generated below carry a
+# [<module>.wandb] table, so their runs also log to W&B (requires `wandb login` or
+# WANDB_API_KEY to be set in the environment that runs them). Local plots/metrics under
+# experiments/.../{plots,logs}/ are produced either way, regardless of this flag.
+WANDB_ENABLED = False
+WANDB_PROJECT = "flip"
+WANDB_ENTITY = None
+WANDB_MODE = "online"
+
 BASE_DIR = Path("experiments/federated_experiments").resolve()
 
 LEARNING_RATE = {
@@ -41,6 +51,27 @@ MILESTONE = {
     "vgg-pretrain": [125],
     "vit-pretrain": [125],
 }
+
+def wandb_block(module_name, run_name, enabled, project, mode="online", entity=None, group=None):
+    """Returns a `[<module_name>.wandb]` TOML snippet when enabled, else "" (the module
+    then runs with local-only plots/metrics, see experiment_tracker.py). Pure function of
+    its arguments (no reliance on this file's own WANDB_* globals) so other config
+    generators (e.g. gen_configs_mix.py) can import and reuse it with their own toggles."""
+    if not enabled:
+        return ""
+    lines = [
+        f"\n[{module_name}.wandb]",
+        "enabled = true",
+        f'project = "{project}"',
+        f'mode = "{mode}"',
+        f'run_name = "{run_name}"',
+    ]
+    if entity:
+        lines.append(f'entity = "{entity}"')
+    if group:
+        lines.append(f'group = "{group}"')
+    return "\n".join(lines) + "\n"
+
 
 OPT_TRIGGER_TEMPLATE = """[federated_optimizing_trigger]
 model = "{model_flag}"
@@ -76,7 +107,7 @@ num_poisoned = {num_poisoned}
 num_honests = {num_clean}
 
 restart = {restart}
-
+{wandb_block}
 [federated_optimizing_trigger.expert_config]
 experts = 1
 min = 0
@@ -99,7 +130,7 @@ epochs = 20
 checkpoint_iters = 50
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-
+{wandb_block_train_expert}
 # Module to generate attack labels from the expert trajectories.
 [federated_generate_labels]
 input_pths = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP/out/checkpoints/{model_flag}_{poisoner}/{{}}/model_{{}}_{{}}.pth"
@@ -118,7 +149,7 @@ num_poisoned = {num_poisoned}
 agg_method = "{aggregator}"
 attack = "{attack}"
 gamma = {gamma}
-
+{wandb_block_gen_labels}
 [federated_generate_labels.expert_config]
 experts = 1
 min = 0
@@ -161,7 +192,7 @@ num_poisoned = {num_poisoned}
 agg_method = "{aggregator}"
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-"""
+{wandb_block}"""
 
 
 def write_config(path: Path, content: str):
@@ -194,6 +225,12 @@ def generate_all_configs():
                     milestones=MILESTONE.get(model_flag, [75, 125]),
                     restart=str(RESTART).lower(),
                     orthogonal=str(ORTHOGONAL).lower(),
+                    wandb_block=wandb_block(
+                        "federated_optimizing_trigger",
+                        f"opt_trigger/{model_flag}/{dataset}/{aggregator}",
+                        enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                        mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                    ),
                 )
                 write_config(opt_dir / "config.toml", opt_config)
                 for poisoner in POISONERS:
@@ -217,6 +254,18 @@ def generate_all_configs():
                             lr=lr,
                             wd=wd,
                             milestones=MILESTONE.get(model_flag, [75, 125]),
+                            wandb_block_train_expert=wandb_block(
+                                "train_expert",
+                                f"train_expert/{model_flag}/{dataset}/{poisoner}/{run_id}",
+                                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                            ),
+                            wandb_block_gen_labels=wandb_block(
+                                "federated_generate_labels",
+                                f"gen_labels/{model_flag}/{dataset}/{aggregator}/{poisoner}/{run_id}",
+                                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                            ),
                         )
                         write_config(gen_label_dir / "config.toml", gen_label_config)
                         for budget in BUDGETS:
@@ -238,6 +287,12 @@ def generate_all_configs():
                                 lr=lr,
                                 wd=wd,
                                 milestones=MILESTONE.get(model_flag, [75, 125]),
+                                wandb_block=wandb_block(
+                                    "federated_train_user",
+                                    f"train_user/{model_flag}/{dataset}/{aggregator}/{poisoner}/{budget}/{run_id}",
+                                    enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                                    mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                                ),
                             )
                             write_config(
                                 train_user_dir / "config.toml", train_user_config

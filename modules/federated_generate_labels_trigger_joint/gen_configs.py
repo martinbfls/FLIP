@@ -30,6 +30,17 @@ from pathlib import Path
 import toml
 
 from modules.federated_optimizing_trigger.utils import init_delta
+from modules.base_utils.gen_configs import wandb_block
+
+# Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
+# default -- flip WANDB_ENABLED to True to have every config in this campaign carry a
+# [<module>.wandb] table (requires `wandb login` or WANDB_API_KEY in the environment that
+# runs them). Local plots/metrics under experiments/.../{plots,logs}/ are unaffected
+# either way. gen_configs_sweep.py (which reuses these templates) inherits this toggle.
+WANDB_ENABLED = False
+WANDB_PROJECT = "flip"
+WANDB_ENTITY = None
+WANDB_MODE = "online"
 
 # --------------------------------------------------------------------------- #
 # Sweep axes -- edit these for a real campaign. Defaults match the grid agreed
@@ -241,7 +252,7 @@ checkpoint_iters = {checkpoint_iters}
 epochs = {epochs}
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-"""
+{wandb_block_train_expert}"""
 
 JOINT_TRIGGER_TEMPLATE = """[federated_generate_labels_trigger_joint]
 input_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/{{}}/model_{{}}_{{}}.pth"
@@ -278,7 +289,7 @@ expert_retrain_epochs = {expert_retrain_epochs}
 expert_retrain_checkpoint_iters = {expert_retrain_checkpoint_iters}
 expert_retrain_optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-
+{wandb_block_module}
 [federated_generate_labels_trigger_joint.expert_config]
 experts = 1
 min = 0
@@ -314,7 +325,7 @@ num_poisoned = {num_poisoned}
 agg_method = "{agg_method}"
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-"""
+{wandb_block_train_user}"""
 
 
 def cell_name(model_flag, dataset, agg_method, seed):
@@ -376,6 +387,11 @@ def generate_cell(
             lr=lr,
             wd=wd,
             milestones=milestones,
+            wandb_block_train_expert=wandb_block(
+                "train_expert", f"train_expert/{model_flag}/{dataset}/seed{seed}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+            ),
         ),
         module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
@@ -408,6 +424,12 @@ def generate_cell(
             lr=lr,
             wd=wd,
             milestones=milestones,
+            wandb_block_module=wandb_block(
+                MODULE_NAME,
+                f"{MODULE_NAME}/{model_flag}/{dataset}/{agg_method}/seed{seed}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+            ),
         ),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
             budgets=budgets,
@@ -433,6 +455,12 @@ def generate_cell(
             lr=lr,
             wd=wd,
             milestones=milestones,
+            wandb_block_train_user=wandb_block(
+                "federated_train_user",
+                f"train_user/{model_flag}/{dataset}/{agg_method}/{budget}/seed{seed}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+            ),
         )
 
     paths = []

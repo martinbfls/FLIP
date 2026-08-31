@@ -24,6 +24,16 @@ le réglage omniscient et sert de baseline.
 import csv
 from pathlib import Path
 
+from modules.base_utils.gen_configs import wandb_block
+
+# Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py and
+# gen_configs.py's own WANDB_* constants). Off by default; independent of gen_configs.py's
+# toggle since this script generates its own separate sweep.
+WANDB_ENABLED = False
+WANDB_PROJECT = "flip"
+WANDB_ENTITY = None
+WANDB_MODE = "online"
+
 NUM_POISONED = 3
 NUM_CLEAN = 7
 ATTACK = "backdoor"

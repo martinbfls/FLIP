@@ -41,6 +41,7 @@ from modules.federated_optimizing_trigger.utils import (
 )
 from modules.federated_generate_labels_trigger.utils import TriggerMTTDataset, \
                                                              extract_experts_biased, build_expert_pool
+from modules.base_utils.experiment_tracker import ExperimentTracker
 
 
 def run(experiment_name, module_name, **kwargs):
@@ -105,6 +106,7 @@ def run(experiment_name, module_name, **kwargs):
     slurm_id = kwargs.get('slurm_id', None)
 
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     input_pths = args["input_pths"]
     opt_pths = args["opt_pths"]
@@ -468,6 +470,7 @@ def run(experiment_name, module_name, **kwargs):
 
                 L_bd_mean = (L_bd_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
                 losses.append(grand_loss.item())
+                tracker.log(it, grand_loss=grand_loss.item(), L_bd_mean=L_bd_mean)
                 pbar.update(batch_size)
                 pbar.set_postfix(
                     g_loss=f"{np.mean(losses[-20:]):.4g}",
@@ -483,6 +486,8 @@ def run(experiment_name, module_name, **kwargs):
     np.save(output_dir + "labels.npy", labels_syn.detach().numpy())
     np.save(output_dir + "true.npy", y_true)
     np.save(output_dir + "losses.npy", losses)
+
+    tracker.finalize()
 
     run_tag = f"{num_poisoned}vs{num_honests}"
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)

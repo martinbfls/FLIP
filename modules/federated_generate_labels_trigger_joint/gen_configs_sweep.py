@@ -39,9 +39,14 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     TRAIN_EXPERT_TEMPLATE,
     TRAIN_PCT,
     TRAIN_USER_TEMPLATE,
+    WANDB_ENABLED,
+    WANDB_ENTITY,
+    WANDB_MODE,
+    WANDB_PROJECT,
     WEIGHT_DECAY,
     check_delta_min_feasible,
     validate_config,
+    wandb_block,
     write_config,
 )
 
@@ -171,6 +176,11 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             lr=lr,
             wd=wd,
             milestones=milestones,
+            wandb_block_train_expert=wandb_block(
+                "train_expert", f"train_expert/{MODEL_FLAG}/{DATASET}/seed{seed}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
+            ),
         ),
         module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
@@ -197,6 +207,21 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             lambda_align=params["lambda_align"],
             lambda_mag=params["lambda_mag"],
             delta_min_frac=params["delta_min_frac"],
+            # expert_retrain_* is a gen_configs.py feature added after this sweep script was
+            # written (schema-optional, 0 = disabled); pinned to disabled here so this
+            # exploratory HP sweep's frozen-trajectory behavior is unchanged by its addition.
+            expert_retrain_interval=0,
+            expert_retrain_epochs=EPOCHS_EXPERT,
+            expert_retrain_checkpoint_iters=CHECKPOINT_ITERS,
+            lr=lr,
+            wd=wd,
+            milestones=milestones,
+            wandb_block_module=wandb_block(
+                "federated_generate_labels_trigger_joint",
+                f"{MODULE_NAME}/{tag}/seed{seed}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
+            ),
         ),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
             budgets=BUDGETS,
@@ -222,6 +247,12 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             lr=lr,
             wd=wd,
             milestones=milestones,
+            wandb_block_train_user=wandb_block(
+                "federated_train_user",
+                f"train_user/{MODEL_FLAG}/{DATASET}/{tag}/{budget}/seed{seed}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
+            ),
         )
 
     paths = []

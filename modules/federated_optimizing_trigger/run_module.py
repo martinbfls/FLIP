@@ -31,6 +31,7 @@ from modules.federated_optimizing_trigger.utils import (
     resolve_beta_and_lambda_poison,
 )
 from modules.train_expert.utils import checkpoint_callback
+from modules.base_utils.experiment_tracker import ExperimentTracker
 import torch
 from torch.utils.data import ConcatDataset, Subset
 import numpy as np
@@ -459,6 +460,7 @@ def optimize_trigger(
     flip_gradient_samples_per_class=64,
     metrics_log_path=None,
     beta_star_grid=None,
+    tracker=None,
 ):
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -689,6 +691,16 @@ def optimize_trigger(
                 "poison_acc": poison_acc,
                 **step_summary,
             })
+        if tracker is not None:
+            tracker.log(
+                step,
+                clean_acc=clean_acc,
+                poison_acc=poison_acc,
+                **{
+                    k: v for k, v in step_summary.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                },
+            )
 
     if metrics_log_path:
         Path(metrics_log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -725,6 +737,7 @@ def run(experiment_name, module_name, **kwargs):
 
     slurm_id = kwargs.get("slurm_id", None)
     args = extract_toml(experiment_name, module_name)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
 
     dataset_flag = args["dataset"]
     model_flag = args["model"]
@@ -858,6 +871,7 @@ def run(experiment_name, module_name, **kwargs):
         flip_qp_ridge=flip_qp_ridge,
         flip_gradient_samples_per_class=flip_gradient_samples_per_class,
         metrics_log_path=metrics_log_path,
+        tracker=tracker,
         beta_star_grid=beta_star_grid,
     )
 
@@ -881,6 +895,8 @@ def run(experiment_name, module_name, **kwargs):
         Path(output_dir_trigger)
         / f"opt_trig_{init}_{model_flag}_{dataset_flag}_{num_poisoned}vs{num_honests}.pt",
     )
+
+    tracker.finalize()
 
 
 if __name__ == "__main__":

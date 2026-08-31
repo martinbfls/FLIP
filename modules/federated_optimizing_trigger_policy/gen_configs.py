@@ -28,6 +28,18 @@ from pathlib import Path
 
 import toml
 
+from modules.base_utils.gen_configs import wandb_block
+
+# Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
+# default -- flip WANDB_ENABLED to True to have every config in this campaign carry a
+# [<module>.wandb] table (requires `wandb login` or WANDB_API_KEY in the environment that
+# runs them). Local plots/metrics under experiments/.../{plots,logs}/ are unaffected
+# either way.
+WANDB_ENABLED = False
+WANDB_PROJECT = "flip"
+WANDB_ENTITY = None
+WANDB_MODE = "online"
+
 # --------------------------------------------------------------------------- #
 # Sweep axes -- edit these for a real campaign. num_poisoned/num_honests, agg_method*, dataset,
 # model, checkpoint provenance ("1xs") kept ALIGNED with the other two generators.
@@ -327,7 +339,7 @@ checkpoint_iters = {checkpoint_iters}
 epochs = {epochs}
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-"""
+{wandb_block_train_expert}"""
 
 POLICY_TEMPLATE = """[federated_optimizing_trigger_policy]
 # A1/A2 (docs/policy_module_audit_report.md): beta below is LOCAL (this cell's own
@@ -409,7 +421,7 @@ policy_inner_ridge = {policy_inner_ridge}
 policy_solver = "{policy_solver}"
 qp_batches_per_checkpoint = {qp_batches_per_checkpoint}
 qp_ridge = {qp_ridge}
-
+{wandb_block_policy}
 [federated_optimizing_trigger_policy.expert_config]
 experts = 1
 min = {expert_min}
@@ -439,7 +451,7 @@ num_honests = {num_honests}
 num_poisoned = {num_poisoned}
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-"""
+{wandb_block_train_user}"""
 
 
 def cell_name(model_flag, dataset, seed, budget_target):
@@ -560,6 +572,11 @@ def generate_cell(
             lr=lr,
             wd=wd,
             milestones=milestones,
+            wandb_block_train_expert=wandb_block(
+                "train_expert", f"train_expert/{model_flag}/{dataset}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+            ),
         ),
         policy_dir / "config.toml": POLICY_TEMPLATE.format(
             gamma=gamma,
@@ -622,6 +639,11 @@ def generate_cell(
             policy_solver=cell_config["policy_solver"],
             qp_batches_per_checkpoint=cell_config["qp_batches_per_checkpoint"],
             qp_ridge=cell_config["qp_ridge"],
+            wandb_block_policy=wandb_block(
+                MODULE_NAME, f"{MODULE_NAME}/{cell_tag}",
+                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+            ),
         ),
         flips_dir / "config.toml": POLICY_TO_FLIPS_TEMPLATE.format(
             cell_dir=policy_dir,
@@ -655,6 +677,11 @@ def generate_cell(
         lr=lr,
         wd=wd,
         milestones=milestones,
+        wandb_block_train_user=wandb_block(
+            "federated_train_user", f"train_user/{model_flag}/{dataset}/{cell_tag}",
+            enabled=WANDB_ENABLED, project=WANDB_PROJECT,
+            mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+        ),
     )
 
     paths = []
