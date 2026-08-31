@@ -20,9 +20,11 @@ import numpy as np
 from modules.base_utils.datasets import get_matching_datasets, pick_poisoner, get_n_classes
 from modules.base_utils.util import extract_toml, get_module_device, get_mtt_attack_info, \
                                     load_model, either_dataloader_dataset_to_both, make_pbar, \
-                                    needs_big_ims, slurmify_path, clf_loss, softmax, total_mse_distance
+                                    needs_big_ims, slurmify_path, clf_loss, softmax, \
+                                    total_mse_distance, get_train_info, mini_train
 from modules.federated_generate_labels.utils import coalesce_attack_config, \
                                                      extract_labels, extract_experts, sgd_step, agg
+from modules.train_expert.utils import checkpoint_callback
 from modules.federated_optimizing_trigger.utils import (
     get_mu, init_delta, raw_to_trigger_preprocess, get_raw_clean_dataset,
     trigger_penalty_hinge, tv_loss,
@@ -183,6 +185,19 @@ def run(experiment_name, module_name, **kwargs):
     design difference from the policy module's live-retraining architecture, not a
     regularization-calibration defect.
 
+    `expert_retrain_interval` (2026-08-31, closes the gap above): if set > 0, every that many
+    outer iterations a FRESH expert is retrained from scratch against the CURRENT trigger (via
+    `pick_poisoner("optimized", ..., delta=delta.detach())` + `get_matching_datasets` +
+    `mini_train`, mirroring train_expert's own training call exactly, for
+    `expert_retrain_epochs` epochs), and its checkpoints (written under a PRIVATE
+    `<output_dir>/../expert_retrain/round<n>/` directory, never overwriting the shared
+    train_expert checkpoints this run started from) replace the expert trajectory
+    (`expert_starts`/`expert_opt_starts`, and `expert_pool` if pooling is on) for the remaining
+    iterations. Default 0 leaves the frozen-trajectory behavior above completely unchanged.
+    With retraining on, `expert_asr` should stop drifting away from `expert_asr_frozen` purely
+    because of trajectory staleness -- a persistent gap then points at delta/L_bd itself,
+    not this design difference.
+
     Two Step-3 corrections relative to the original H1 instrumentation (see
     docs/threat_models_audit.md for the original run's refuted-but-confounded result): (1)
     `delta_init` is now captured INSIDE the training loop, the first time execution reaches
@@ -308,6 +323,24 @@ def run(experiment_name, module_name, **kwargs):
     # prior behavior). Set both to the same value to remove this as a comparison factor.
     checkpoint_sampling = args.get("checkpoint_sampling", "biased")
     alpha_ckpt = args.get("alpha_ckpt", 0.01)
+
+    # Live expert retraining (closes the H1 gap documented above, "design difference from the
+    # policy module's live-retraining architecture"): every expert_retrain_interval outer
+    # iterations (`it`, each already one full epoch over mtt_dataset), retrain a FRESH expert
+    # from scratch against the CURRENT trigger for expert_retrain_epochs epochs (same duration
+    # as the ORIGINAL train_expert step -- see _retrain_expert_with_trigger below), and splice
+    # its checkpoints in as the expert trajectory for the remaining iterations. 0 (default)
+    # disables this entirely -- unchanged behavior, a frozen expert trajectory throughout.
+    expert_retrain_interval = args.get("expert_retrain_interval", 0)
+    expert_retrain_epochs = args.get("expert_retrain_epochs", 20)
+    # Must stay consistent with expert_config's own `trajectories` granularity (same
+    # constraint the ORIGINAL train_expert step's own checkpoint_iters already had to satisfy
+    # -- see checkpoint_callback: a trajectory value like 150 is only ever hit if it's a
+    # multiple of checkpoint_iters) for extract_experts/extract_experts_biased's redraw
+    # (below) to find checkpoints at the sampled trajectory positions.
+    expert_retrain_checkpoint_iters = args.get("expert_retrain_checkpoint_iters", 50)
+    expert_retrain_optim_kwargs = args.get("expert_retrain_optim_kwargs", {})
+    expert_retrain_scheduler_kwargs = args.get("expert_retrain_scheduler_kwargs", {})
 
     # P3: pool_size checkpoints preloaded into RAM once, then drawn from uniformly at random
     # per outer step (`it`), instead of a single checkpoint indexed sequentially by `it` --
@@ -469,13 +502,95 @@ def run(experiment_name, module_name, **kwargs):
         checkpoint, opt_state_cpu = random.choice(expert_pool)
         return checkpoint, _opt_state_to_device(opt_state_cpu, device)
 
+    # Live expert retraining -- see the run() docstring's H1 diagnostic and
+    # expert_retrain_interval's own comment above. Writes to a PRIVATE directory
+    # (output_dir/../expert_retrain/round<n>/), never overwriting the shared train_expert
+    # checkpoints this run started from (those may be reused by other cells/seeds -- see
+    # gen_configs.py's per-seed train_expert dedup). Redraws the remaining outer iterations'
+    # expert_starts/expert_opt_starts against this new, trigger-poisoned trajectory via the
+    # SAME extract_experts/extract_experts_biased functions used at startup -- no new sampling
+    # logic -- and rebuilds expert_pool if pooling is on.
+    retrain_base_dir = Path(output_dir).parent / "expert_retrain"
+
+    def _retrain_expert_with_trigger(round_idx, delta_snapshot, it, remaining_iterations):
+        nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size
+
+        print(
+            f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
+            f"{expert_retrain_epochs} epochs against the CURRENT trigger "
+            f"(||delta||_inf={delta_snapshot.abs().max().item():.4f})..."
+        )
+        poisoner = pick_poisoner(
+            "optimized", dataset_flag, target_label, delta=delta_snapshot.detach().cpu(),
+        )
+        poison_train, _, test, poison_test, _ = get_matching_datasets(
+            dataset_flag, poisoner, clean_label, train_pct=train_pct, big=big_ims,
+        )
+
+        retrain_model = load_model(expert_model_flag, n_classes)
+        retrain_batch_size, retrain_epochs, retrain_opt, retrain_sched = get_train_info(
+            retrain_model.parameters(), "sgd",
+            batch_size=None, epochs=expert_retrain_epochs,
+            optim_kwargs=expert_retrain_optim_kwargs,
+            scheduler_kwargs=expert_retrain_scheduler_kwargs,
+        )
+        # Single expert index (0) per round, matching expert_config['experts']=1's own
+        # convention -- see extract_experts/extract_experts_biased's `expert` draw below.
+        round_dir = retrain_base_dir / f"round{round_idx}" / "0"
+        mini_train(
+            model=retrain_model,
+            train_data=poison_train,
+            test_data=[test, poison_test.poison_dataset],
+            batch_size=retrain_batch_size,
+            opt=retrain_opt,
+            scheduler=retrain_sched,
+            epochs=retrain_epochs,
+            callback=lambda m, o, e, i: checkpoint_callback(
+                m, o, e, i, expert_retrain_checkpoint_iters, str(round_dir),
+            ),
+        )
+
+        round_input_pths = str(retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}.pth")
+        round_opt_pths = str(
+            retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}_opt.pth"
+        )
+        if checkpoint_sampling == "uniform":
+            new_starts, new_opt_starts = extract_experts(
+                expert_config, round_input_pths, remaining_iterations,
+                expert_opt_path=round_opt_pths,
+            )
+        else:
+            new_starts, new_opt_starts = extract_experts_biased(
+                expert_config, round_input_pths, remaining_iterations, alpha_ckpt,
+                expert_opt_path=round_opt_pths,
+            )
+        expert_starts = expert_starts[:it] + new_starts
+        expert_opt_starts = expert_opt_starts[:it] + new_opt_starts
+
+        if pool_size != 1:
+            print(
+                f"[expert_retrain] round {round_idx}: refreshing the {pool_size}-checkpoint "
+                "pool from the retrained trajectory..."
+            )
+            expert_pool, pool_size = build_expert_pool(
+                new_starts, new_opt_starts, pool_size,
+            )
+        print(f"[expert_retrain] round {round_idx}: done, trajectory refreshed from it={it}.")
+
     losses = []
     align_active_window = []  # rolling fraction of steps where L_align > 0 -- see hinge_rate
     mag_active_window = []    # in federated_optimizing_trigger_policy for the same pattern
     ANTI_COLLAPSE_WINDOW = 50
 
     with make_pbar(total=config['iterations'] * len(mtt_dataset)) as pbar:
+        expert_retrain_round = 0
         for it in range(config['iterations']):
+            if expert_retrain_interval and it > 0 and it % expert_retrain_interval == 0:
+                expert_retrain_round += 1
+                _retrain_expert_with_trigger(
+                    expert_retrain_round, delta, it, config['iterations'] - it,
+                )
+
             for batches in zip(*loaders):
 
                 # Load expert trajectory

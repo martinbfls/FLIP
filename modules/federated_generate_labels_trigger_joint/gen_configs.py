@@ -71,6 +71,19 @@ N_ITERATIONS = 25  # Validation run (2026-08-30): sweep's best value for this ax
 # (ASR 1.0000 vs baseline's 0.9860 at n_iterations=15, see analyze_trigger_joint_sweep.py) --
 # part of the "combined candidate" below. (was 15)
 
+# Live expert retraining (2026-08-31): every EXPERT_RETRAIN_INTERVAL outer iterations (each
+# one full epoch over mtt_dataset, per N_ITERATIONS above), retrain a fresh expert against the
+# CURRENT trigger for EXPERT_RETRAIN_EPOCHS epochs -- closes the H1 gap documented in
+# run_module.py's run() docstring ("a design difference from the policy module's
+# live-retraining architecture"). 0 disables entirely (unchanged behavior: a frozen expert
+# trajectory throughout, as before this feature). EXPERT_RETRAIN_EPOCHS/_CHECKPOINT_ITERS
+# default to the SAME values as the initial train_expert step above (EPOCHS_EXPERT/
+# CHECKPOINT_ITERS) so the retrained trajectory is comparable in depth/granularity to the one
+# it replaces -- override independently below if a shorter/longer retrain is wanted.
+EXPERT_RETRAIN_INTERVAL = 5
+EXPERT_RETRAIN_EPOCHS = EPOCHS_EXPERT
+EXPERT_RETRAIN_CHECKPOINT_ITERS = CHECKPOINT_ITERS
+
 # --------------------------------------------------------------------------- #
 # REGULARIZATION_GRID -- trigger regularization knobs, kept separate from the sweep axes
 # above so a real campaign's regularization sweep is easy to find and edit in one place.
@@ -260,6 +273,12 @@ lambda_align = {lambda_align}
 lambda_mag = {lambda_mag}
 delta_min_frac = {delta_min_frac}
 
+expert_retrain_interval = {expert_retrain_interval}
+expert_retrain_epochs = {expert_retrain_epochs}
+expert_retrain_checkpoint_iters = {expert_retrain_checkpoint_iters}
+expert_retrain_optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
+expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
+
 [federated_generate_labels_trigger_joint.expert_config]
 experts = 1
 min = 0
@@ -383,6 +402,12 @@ def generate_cell(
             lambda_align=LAMBDA_ALIGN,
             lambda_mag=LAMBDA_MAG,
             delta_min_frac=delta_min_frac,
+            expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
+            expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
+            expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
+            lr=lr,
+            wd=wd,
+            milestones=milestones,
         ),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
             budgets=budgets,
