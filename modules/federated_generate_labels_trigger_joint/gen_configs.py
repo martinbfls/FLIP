@@ -57,12 +57,10 @@ NUM_POISONED = 3
 NUM_HONESTS = 7
 SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
-# Validation run (2026-08-30) of the sweep's "combined candidate" (see
-# analyze_trigger_joint_sweep.py's output and the REGULARIZATION_GRID note below): single
-# seed, full budget sweep, "mean" only -- with NUM_HONESTS=0 there is only one worker total,
-# so "mean" vs "multikrum" aggregation is a no-op distinction here (see
-# gen_configs_sweep.py's own AGG_METHOD comment); dropped to avoid doubling this validation
-# campaign's cell count for a factor that can't actually vary at NUM_HONESTS=0.
+# grad-mismatch-penalty validation run (2026-08-31): single seed, full budget sweep, both
+# aggregators -- NUM_POISONED=3/NUM_HONESTS=7 makes "mean" vs "multikrum" a real,
+# non-degenerate comparison (unlike the NUM_HONESTS=0 validation run this comment used to
+# describe).
 AGG_METHODS = ["mean", "multikrum"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
@@ -166,6 +164,15 @@ LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reaso
 # DELTA_MIN_FRAC, or the init constants (_STRENGTH/_FREQ) change again.
 DELTA_MIN_FRAC = 0.01
 
+# Gradient-mismatch penalty (2026-08-31, see run_module.py's run() docstring): new term being
+# validated by THIS campaign -- ||grad(L_c)(theta_k) - grad(L_p)(theta_k)(delta)||^2 /
+# ||grad(L_c)(theta_k)||^2, added to grand_loss with weight LAMBDA_GRADMATCH. 0.0 is a full
+# no-op (identical behavior to before this term existed); 1.0 here is a first, unsweeped guess
+# (same order of magnitude as LAMBDA_ALIGN/LAMBDA_MAG above) -- re-tune once this campaign's
+# results (expert_asr / matching_term / L_gradmatch in metrics_log_path) are in.
+LAMBDA_GRADMATCH = 1.0
+GRADMATCH_EPS = 1e-8
+
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
 MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
@@ -243,6 +250,8 @@ epsilon = {epsilon}
 lr_delta = {lr_delta}
 lambda_bd = {lambda_bd}
 lambda_delta = {lambda_delta}
+lambda_gradmatch = {lambda_gradmatch}
+gradmatch_eps = {gradmatch_eps}
 
 train_pct = {train_pct}
 num_honests = {num_honests}
@@ -380,6 +389,8 @@ def generate_cell(
             lr_delta=LR_DELTA,
             lambda_bd=LAMBDA_BD,
             lambda_delta=LAMBDA_DELTA,
+            lambda_gradmatch=LAMBDA_GRADMATCH,
+            gradmatch_eps=GRADMATCH_EPS,
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,

@@ -205,6 +205,21 @@ def _project_onto_magnitude_floor(delta, delta_min, mu_target, eps=1e-8):
     return delta * (delta_min / n)
 
 
+def grad_mismatch_penalty(clean_grads, poison_grads, eps=1e-8):
+    '''
+    ||grad(L_c) - grad(L_p)(delta)||^2 / ||grad(L_c)||^2, flattened & summed across every
+    parameter tensor in `clean_grads`/`poison_grads` (same param order, one tensor per
+    parameter -- e.g. the per-parameter mean-over-clean-examples / mean-over-poisoned-examples
+    gradients at the current checkpoint theta_k). `clean_grads` is treated as a constant
+    (detached upstream); `poison_grads` may carry a live dependency on delta, in which case this
+    penalty is differentiable w.r.t. delta. `eps` guards the denominator when grad(L_c) is
+    (near) zero.
+    '''
+    diff_sq = sum((gc - gp).pow(2).sum() for gc, gp in zip(clean_grads, poison_grads))
+    clean_sq = sum(gc.pow(2).sum() for gc in clean_grads)
+    return diff_sq / (clean_sq + eps)
+
+
 def project_trigger_constraints(delta, mu_target, epsilon, align_kappa, delta_min, n_iters=8, eps=1e-8):
     '''
     Alternating-projection heuristic (see run_module.py's run() docstring,

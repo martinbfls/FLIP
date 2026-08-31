@@ -33,7 +33,7 @@ from modules.federated_optimizing_trigger.utils import (
 from modules.federated_generate_labels_trigger_joint.utils import (
     TriggerMTTDataset, extract_experts_biased, build_expert_pool,
     directional_floor_penalty, magnitude_floor_penalty, project_trigger_constraints,
-    cosine_to,
+    cosine_to, grad_mismatch_penalty,
 )
 
 
@@ -211,6 +211,27 @@ def run(experiment_name, module_name, **kwargs):
     batch's mini-batches. See docs/threat_models_audit.md for the re-run verdict under this
     corrected instrumentation.
 
+    Gradient-mismatch penalty (2026-08-31, optional, off by default): an additional term,
+    L_gradmatch = ||grad(L_c)(theta_k) - grad(L_p)(theta_k)(delta)||^2 / ||grad(L_c)(theta_k)||^2
+    (`lambda_gradmatch * L_gradmatch` added to grand_loss, weight default 0.0 = no-op),
+    penalizing delta for making the poisoned-example gradient distinguishable from the clean-
+    example gradient AT THE SAME checkpoint theta_k -- both gradients flattened/concatenated
+    across every expert_model parameter. grad(L_c)(theta_k) is the mean gradient of the
+    classification loss over every genuinely CLEAN example seen this batch (an honest client's
+    whole local batch, plus the non-poisoned rows of each poisoned client's local batch) --
+    computed with no dependency on delta (treated as a constant). grad(L_p)(theta_k)(delta) is
+    the mean gradient of the classification loss over every genuinely POISONED example this
+    batch (triggered input via T_delta, target label) -- reuses the same forward pass already
+    computed for L_bd (`logits_bd = expert_model(x_trig)`, `L_bd_cid`), just differentiated
+    w.r.t. expert_params (create_graph=True) INSTEAD OF (isolated torch.autograd.grad calls, in
+    the same combined call) w.r.t. [delta] -- so it carries a live dependency on delta and
+    contributes to delta.grad via grand_loss.backward(), exactly like param_loss/L_bd already
+    do. Both means are simple means-of-per-contributing-chunk (one chunk per honest client /
+    per poisoned client's clean subset / per poisoned client's poisoned subset), matching this
+    module's existing `agg()` convention rather than weighting by exact example count. Computed
+    only when lambda_gradmatch != 0 (`track_gradmatch` below) -- the clean-subset-only forward
+    pass this requires for poisoned clients is pure overhead otherwise.
+
     Comparability across the three arms (prerequisite before any campaign, not just doc):
       - checkpoint sampling: this module draws its expert-trajectory index via
         `extract_experts_biased` (own utils.py), the SAME exponentially-biased distribution
@@ -314,6 +335,13 @@ def run(experiment_name, module_name, **kwargs):
     lambda_align = args.get("lambda_align", 1.0)
     lambda_mag = args.get("lambda_mag", 1.0)
     delta_min_frac = args.get("delta_min_frac", 0.5)
+
+    # Gradient-mismatch penalty (see run() docstring): off by default (0.0 = no-op, identical
+    # to the module's behavior before this term existed).
+    lambda_gradmatch = args.get("lambda_gradmatch", 0.0)
+    gradmatch_eps = args.get("gradmatch_eps", 1e-8)
+    track_gradmatch = lambda_gradmatch != 0
+
     output_dir_trigger = slurmify_path(
         args.get("output_dir_trigger", "optimized_trigger"), slurm_id,
     )
@@ -612,6 +640,10 @@ def run(experiment_name, module_name, **kwargs):
 
                 student_grad_buf = [[] for _ in student_params]
                 expert_grad_buf = [[] for _ in expert_params]  # E2, point 2a
+                # Gradient-mismatch penalty buffers (see run() docstring) -- one chunk per
+                # contributing clean/poisoned example source this batch, meaned below.
+                clean_grad_chunks = [[] for _ in expert_params]
+                poison_grad_chunks = [[] for _ in expert_params]
 
                 optimizer_delta.zero_grad()
                 L_bd_sum = torch.tensor(0.0, device=device)
@@ -636,6 +668,11 @@ def run(experiment_name, module_name, **kwargs):
                                 g = p.grad.detach().clone()
                                 expert_grad_buf[i].append(g)
                                 student_grad_buf[i].append(g)
+                                if track_gradmatch:
+                                    # An honest client's local batch is entirely clean by
+                                    # construction -- this whole-batch gradient is exactly a
+                                    # grad(L_c) contributing chunk (see run() docstring).
+                                    clean_grad_chunks[i].append(g)
 
                     # POISONED CLIENTS
                     else:
@@ -689,27 +726,57 @@ def run(experiment_name, module_name, **kwargs):
                         for i, g in enumerate(grads_e):
                             expert_grad_buf[i].append(g)
 
+                        # Gradient-mismatch penalty (see run() docstring): the CLEAN subset of
+                        # this poisoned client's own local batch (is_poisoned == False rows,
+                        # untouched x_t/y_t) is itself a genuinely clean example source -- a
+                        # separate, independent forward/backward (not reused elsewhere), no
+                        # dependency on delta.
+                        if track_gradmatch:
+                            clean_mask = ~is_poisoned_dev
+                            if clean_mask.any():
+                                loss_clean_local = clf_loss(
+                                    expert_model(x_t[clean_mask]), y_t[clean_mask]
+                                )
+                                clean_grads_local = torch.autograd.grad(
+                                    loss_clean_local, expert_params, allow_unused=True,
+                                )
+                                for i, g in enumerate(clean_grads_local):
+                                    if g is not None:
+                                        clean_grad_chunks[i].append(g.detach())
+
                         # Backdoor efficacy term: CE of the CURRENT expert on the
-                        # genuinely-triggered rows, differentiated ONLY w.r.t. delta (isolated
-                        # torch.autograd.grad call -- never touches expert_params.grad). This
-                        # stays exactly as in the indirect module (point 3): an ADDITIONAL
-                        # contribution to delta.grad, not a duplicate of the param_loss path.
+                        # genuinely-triggered rows. Differentiated w.r.t. delta (isolated,
+                        # unscaled -- see below) exactly as in the indirect module (point 3): an
+                        # ADDITIONAL contribution to delta.grad, not a duplicate of the
+                        # param_loss path. When track_gradmatch, the SAME call also
+                        # differentiates w.r.t. expert_params (create_graph=True) -- this is
+                        # exactly grad(L_p)(theta_k)(delta) (see run() docstring): the mean
+                        # gradient of the classification loss over the genuinely-poisoned rows,
+                        # still carrying delta's live dependency via x_trig.
                         if is_poisoned.any():
                             logits_bd = expert_model(x_trig)
                             L_bd_cid = clf_loss(logits_bd, y_t[is_poisoned_dev])
+                            grad_targets = [delta] + expert_params if track_gradmatch else [delta]
                             # retain_graph=True (unlike the indirect module): x_trig's node is
                             # shared with x_t_adv (which fed loss_e/grads_e, still needed by
                             # grand_loss.backward() later this batch) -- freeing it here would
                             # break that second, later backward through the same node.
-                            (delta_grad,) = torch.autograd.grad(
-                                lambda_bd * L_bd_cid, [delta],
+                            bd_grads = torch.autograd.grad(
+                                L_bd_cid, grad_targets,
                                 retain_graph=True, allow_unused=True,
+                                create_graph=track_gradmatch,
                             )
-                            if delta_grad is not None:
+                            delta_grad_raw = bd_grads[0]
+                            if delta_grad_raw is not None:
+                                delta_grad = lambda_bd * delta_grad_raw.detach()
                                 delta.grad = (
-                                    delta_grad.detach() if delta.grad is None
-                                    else delta.grad + delta_grad.detach()
+                                    delta_grad if delta.grad is None
+                                    else delta.grad + delta_grad
                                 )
+                            if track_gradmatch:
+                                for i, g in enumerate(bd_grads[1:]):
+                                    if g is not None:
+                                        poison_grad_chunks[i].append(g)
                             L_bd_sum = L_bd_sum + L_bd_cid.detach()
                             n_bd_valid += 1
 
@@ -731,6 +798,26 @@ def run(experiment_name, module_name, **kwargs):
                     delta.grad.detach().clone() if delta.grad is not None
                     else torch.zeros_like(delta)
                 )
+
+                # Gradient-mismatch penalty (see run() docstring): means-of-contributing-chunks
+                # per expert_model parameter, then flattened/combined into a single ratio.
+                # Falls back to 0.0 (no-op on grand_loss) whenever disabled, or whenever this
+                # batch happened to draw zero clean or zero poisoned examples for some parameter
+                # (e.g. num_honests==0 and no poisoned client's batch had any clean rows).
+                if track_gradmatch and all(len(c) > 0 for c in clean_grad_chunks) and all(
+                    len(c) > 0 for c in poison_grad_chunks
+                ):
+                    clean_grad_mean = [
+                        torch.stack(c, dim=0).mean(dim=0) for c in clean_grad_chunks
+                    ]
+                    poison_grad_mean = [
+                        torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks
+                    ]
+                    L_gradmatch = grad_mismatch_penalty(
+                        clean_grad_mean, poison_grad_mean, eps=gradmatch_eps,
+                    )
+                else:
+                    L_gradmatch = torch.tensor(0.0, device=device)
 
                 # Aggregate student gradients (DIFFERENTIABLE)
                 agg_student_grads = agg(
@@ -815,6 +902,8 @@ def run(experiment_name, module_name, **kwargs):
                 L_mag, _ = magnitude_floor_penalty(delta, delta_min)
                 if trigger_constraint == "penalty":
                     grand_loss = grand_loss + (lambda_align * L_align + lambda_mag * L_mag)
+
+                grand_loss = grand_loss + lambda_gradmatch * L_gradmatch
 
                 # Optimize labels and trigger. delta.grad already holds the per-client L_bd
                 # contributions accumulated above (point 3) -- grand_loss.backward() ADDS the
@@ -944,6 +1033,7 @@ def run(experiment_name, module_name, **kwargs):
                         "mag_active_rate": mag_active_rate,
                         "reg_term": reg_term.item(),
                         "mtt_delta_grad_norm": mtt_delta_grad_norm,
+                        "L_gradmatch": L_gradmatch.item(),
                     })
                 tracker.log(
                     it,
@@ -956,6 +1046,7 @@ def run(experiment_name, module_name, **kwargs):
                     L_align=L_align_post,
                     L_mag=L_mag_post,
                     mtt_delta_grad_norm=mtt_delta_grad_norm,
+                    L_gradmatch=L_gradmatch.item(),
                 )
 
                 pbar.update(batch_size)
@@ -974,6 +1065,7 @@ def run(experiment_name, module_name, **kwargs):
                     align_rate=f"{align_active_rate:.2f}",
                     mag_rate=f"{mag_active_rate:.2f}",
                     mtt_grad=f"{mtt_delta_grad_norm:.4g}",
+                    gradmatch=f"{L_gradmatch.item():.4g}",
                 )
 
     # Save results
