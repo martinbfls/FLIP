@@ -39,6 +39,13 @@
 #   2. Submit the campaign:
 #        SLURM_ACCOUNT=<account> ./orchestrate_runs_trigger_joint_slurm.sh
 #        SLURM_ACCOUNT=<account> DRY_RUN=1 ./orchestrate_runs_trigger_joint_slurm.sh
+#
+# USER_ONLY=1 submits ONLY the [USER] (federated_train_user) phase, with no dependency on
+# EXPERT/GEN/FLIPS and without even checking their configs -- for re-running train_user alone
+# (e.g. a new BUDGETS list, or a train_user-only code change) against flips already produced by
+# a previous full run of this same campaign. Does NOT verify those flips actually exist on disk
+# (this script only ever checks config.toml presence, never module outputs) -- that's on you:
+#        SLURM_ACCOUNT=<account> USER_ONLY=1 ./orchestrate_runs_trigger_joint_slurm.sh
 ###
 
 set -euo pipefail
@@ -56,7 +63,14 @@ cd "$BASE_DIR"
 source "$SCRIPT_DIR/slurm_lib.sh"
 
 RUN_EXPERT="${RUN_EXPERT:-0}"
+USER_ONLY="${USER_ONLY:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+
+if [ "$USER_ONLY" = "1" ] && [ "$RUN_EXPERT" = "1" ]; then
+    echo "[ABORT] USER_ONLY=1 and RUN_EXPERT=1 both set -- USER_ONLY skips EXPERT entirely," >&2
+    echo "[ABORT] so RUN_EXPERT would have nothing to do. Pass at most one." >&2
+    exit 1
+fi
 
 EXPERT_TIME="${EXPERT_TIME:-0-00:10:00}"
 GEN_TIME="${GEN_TIME:-1-00:00:00}"
@@ -127,25 +141,29 @@ for model_flag in "${MODEL_FLAGS[@]}"; do
   for dataset in "${DATASETS[@]}"; do
     for agg in "${AGG_METHODS[@]}"; do
       for seed in "${SEEDS[@]}"; do
-        expert_key="${model_flag}_seed${seed}"
-        if [[ " $SEEN_EXPERT " != *" $expert_key "* ]]; then
-          SEEN_EXPERT="$SEEN_EXPERT $expert_key"
-          expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs/seed${seed}"
-          require_config "$expert_cfg"
-          EXPERT_JOBS+=("python run_experiment.py $expert_cfg|joint_expert_${expert_key}")
+        if [ "$USER_ONLY" != "1" ]; then
+          expert_key="${model_flag}_seed${seed}"
+          if [[ " $SEEN_EXPERT " != *" $expert_key "* ]]; then
+            SEEN_EXPERT="$SEEN_EXPERT $expert_key"
+            expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs/seed${seed}"
+            require_config "$expert_cfg"
+            EXPERT_JOBS+=("python run_experiment.py $expert_cfg|joint_expert_${expert_key}")
+          fi
         fi
 
         cell="$(cell_dir "$model_flag" "$dataset" "$agg" "$seed")"
         tag="${model_flag}_${dataset}_${agg}_seed${seed}"
 
-        gen_cfg="$cell/gen_labels_trigger_joint"
-        flips_cfg="$cell/select_flips"
+        if [ "$USER_ONLY" != "1" ]; then
+          gen_cfg="$cell/gen_labels_trigger_joint"
+          flips_cfg="$cell/select_flips"
 
-        require_config "$gen_cfg"
-        require_config "$flips_cfg"
+          require_config "$gen_cfg"
+          require_config "$flips_cfg"
 
-        GEN_JOBS+=("python run_experiment.py $gen_cfg|joint_gen_${tag}")
-        FLIPS_JOBS+=("python run_experiment.py $flips_cfg|joint_flips_${tag}")
+          GEN_JOBS+=("python run_experiment.py $gen_cfg|joint_gen_${tag}")
+          FLIPS_JOBS+=("python run_experiment.py $flips_cfg|joint_flips_${tag}")
+        fi
 
         for budget in "${BUDGETS[@]}"; do
           user_cfg="$cell/train_user_${budget}"
@@ -169,8 +187,12 @@ fi
 echo "[PLAN] module=federated_generate_labels_trigger_joint exp_base=$EXP_BASE_REL"
 echo "[PLAN] model_flags=${MODEL_FLAGS[*]} datasets=${DATASETS[*]} agg_methods=${AGG_METHODS[*]}"
 echo "[PLAN] seeds=${SEEDS[*]} budgets=${BUDGETS[*]} num_poisoned=$NUM_POISONED num_honests=$NUM_HONESTS"
-echo "[PLAN] cells=${#GEN_JOBS[@]} (=model_flags x datasets x agg_methods x seeds), train_user jobs=${#USER_JOBS[@]}"
-echo "[PLAN] phases: $([ "$RUN_EXPERT" = 1 ] && echo 'EXPERT -> ')GEN -> FLIPS -> USER"
+if [ "$USER_ONLY" = "1" ]; then
+    echo "[PLAN] USER_ONLY=1: train_user jobs=${#USER_JOBS[@]}"
+else
+    echo "[PLAN] cells=${#GEN_JOBS[@]} (=model_flags x datasets x agg_methods x seeds), train_user jobs=${#USER_JOBS[@]}"
+fi
+echo "[PLAN] phases: $([ "$USER_ONLY" = 1 ] && echo 'USER only' || echo "$([ "$RUN_EXPERT" = 1 ] && echo 'EXPERT -> ')GEN -> FLIPS -> USER")"
 
 if [ "$DRY_RUN" = "1" ]; then
     echo "[DRY-RUN] nothing submitted."
@@ -191,29 +213,35 @@ preflight_slurm || exit 1
 # ---------------------------------------------------------------------------
 DEP=""
 
-if [ "$RUN_EXPERT" = "1" ]; then
-    TIME_PER_TASK="$EXPERT_TIME"
-    submit_job_pool_slurm EXPERT_JOBS "joint_expert" "" || exit 1
-    expert_barrier=$(submit_barrier_slurm "joint_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-    DEP="afterok:$expert_barrier"
-    echo "[PHASE] EXPERT submitted (${#EXPERT_JOBS[@]} jobs) -> barrier $expert_barrier"
+if [ "$USER_ONLY" = "1" ]; then
+    echo "[PHASE] EXPERT/GEN/FLIPS skipped (USER_ONLY=1) -- flips assumed already produced by"
+    echo "[PHASE] a previous full run of this campaign."
 else
-    echo "[PHASE] EXPERT skipped (RUN_EXPERT=0) -- expert checkpoints assumed present."
-    echo "[PHASE] they MUST be the same ones used by the sibling indirect campaign."
+    if [ "$RUN_EXPERT" = "1" ]; then
+        TIME_PER_TASK="$EXPERT_TIME"
+        submit_job_pool_slurm EXPERT_JOBS "joint_expert" "" || exit 1
+        expert_barrier=$(submit_barrier_slurm "joint_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+        DEP="afterok:$expert_barrier"
+        echo "[PHASE] EXPERT submitted (${#EXPERT_JOBS[@]} jobs) -> barrier $expert_barrier"
+    else
+        echo "[PHASE] EXPERT skipped (RUN_EXPERT=0) -- expert checkpoints assumed present."
+        echo "[PHASE] they MUST be the same ones used by the sibling indirect campaign."
+    fi
+
+    TIME_PER_TASK="$GEN_TIME"
+    submit_job_pool_slurm GEN_JOBS "joint_gen" "$DEP" || exit 1
+    gen_barrier=$(submit_barrier_slurm "joint_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    echo "[PHASE] GEN submitted (${#GEN_JOBS[@]} jobs) -> barrier $gen_barrier"
+
+    TIME_PER_TASK="$FLIPS_TIME"
+    submit_job_pool_slurm FLIPS_JOBS "joint_flips" "afterok:$gen_barrier" || exit 1
+    flips_barrier=$(submit_barrier_slurm "joint_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs) -> barrier $flips_barrier"
+    DEP="afterok:$flips_barrier"
 fi
 
-TIME_PER_TASK="$GEN_TIME"
-submit_job_pool_slurm GEN_JOBS "joint_gen" "$DEP" || exit 1
-gen_barrier=$(submit_barrier_slurm "joint_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-echo "[PHASE] GEN submitted (${#GEN_JOBS[@]} jobs) -> barrier $gen_barrier"
-
-TIME_PER_TASK="$FLIPS_TIME"
-submit_job_pool_slurm FLIPS_JOBS "joint_flips" "afterok:$gen_barrier" || exit 1
-flips_barrier=$(submit_barrier_slurm "joint_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs) -> barrier $flips_barrier"
-
 TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm USER_JOBS "joint_user" "afterok:$flips_barrier" || exit 1
+submit_job_pool_slurm USER_JOBS "joint_user" "$DEP" || exit 1
 echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
 
 echo "[DONE] campaign submitted; job ids in $LOG_DIR/jobids_*.txt"
