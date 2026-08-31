@@ -21,6 +21,14 @@ from pathlib import Path
 import toml
 
 from modules.base_utils.gen_configs import wandb_block
+# write_config/validate_config: same check run_experiment.py performs before running a
+# module (every schema key present unless [OPTIONAL], every config key known to the schema),
+# run at GENERATION time instead of only being discovered when the config is later executed.
+# Shared with the other gen_configs*.py generators and run_experiment.py itself.
+from modules.base_utils.config_validation import (
+    write_config,
+    validate_config_file as validate_config,
+)
 
 # Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
 # default -- flip WANDB_ENABLED to True to have every config in this campaign carry a
@@ -94,40 +102,6 @@ CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 EXP_BASE = Path("experiments/federated_experiments/threat_model_direct_trigger").resolve()
 
 MODULE_NAME = "federated_generate_labels_trigger"
-
-
-def write_config(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    print(f"[OK] Config written to {path}")
-
-
-def validate_config(path: Path):
-    """
-    Same check run_experiment.py performs before running a module: every schema key (unless
-    listed under [OPTIONAL]) must be present in the config, and every config key must exist in
-    the schema. Raises AssertionError on any mismatch -- run at GENERATION time, not only
-    discovered when the config is actually executed.
-    """
-    exp_toml = toml.load(path)
-    for module_name, module_config in exp_toml.items():
-        schema_path = Path("schemas") / f"{module_name}.toml"
-        assert schema_path.exists(), f"Malformed module! Schema {schema_path} does not exist."
-        schema = toml.load(schema_path)
-        optionals = list(schema.get("OPTIONAL", {}).keys())
-
-        schema_keys = set(schema[module_name].keys())
-        config_keys = set(module_config.keys())
-
-        missing = [k for k in schema_keys - config_keys if k not in optionals]
-        extra = [k for k in config_keys - schema_keys if k not in optionals]
-        assert not missing, (
-            f"Malformed config ({path}, [{module_name}]): missing required keys {missing}"
-        )
-        assert not extra, (
-            f"Malformed config ({path}, [{module_name}]): unknown keys {extra} "
-            "(not in schema, not optional)"
-        )
 
 
 TRAIN_EXPERT_TEMPLATE = """[train_expert]
@@ -321,6 +295,20 @@ def generate_all_configs(dry_run=False):
     return all_paths
 
 
+def list_grid():
+    """Enumerates this campaign's sweep cells (model/dataset/agg_method/seed) as plain
+    dicts, without writing any config -- the single source of truth for the grid's shape,
+    so orchestrate_slurm/orchestrate_runs_trigger_slurm.sh doesn't need to duplicate
+    MODEL_FLAGS/DATASETS/AGG_METHODS/SEEDS by hand (see --print-grid)."""
+    return [
+        {"model_flag": model_flag, "dataset": dataset, "agg_method": agg_method, "seed": seed}
+        for model_flag in MODEL_FLAGS
+        for dataset in DATASETS
+        for agg_method in AGG_METHODS
+        for seed in SEEDS
+    ]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -330,7 +318,17 @@ if __name__ == "__main__":
         help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
              "preliminary campaign",
     )
+    parser.add_argument(
+        "--print-grid", action="store_true",
+        help="print this campaign's sweep cells as JSON and exit, without writing configs",
+    )
     args = parser.parse_args()
+
+    if args.print_grid:
+        import json
+        print(json.dumps(list_grid(), indent=2))
+        raise SystemExit(0)
+
     assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
 
     if args.single_cell:

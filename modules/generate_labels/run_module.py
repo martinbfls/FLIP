@@ -61,7 +61,7 @@ def run(experiment_name, module_name, **kwargs):
     big_ims = needs_big_ims(expert_model_flag)
     _, _, _, _, mtt_dataset =\
         get_matching_datasets(dataset_flag, poisoner, clean_label, train_pct=train_pct, big=big_ims)
-    
+
     labels = extract_labels(mtt_dataset.distill, config['one_hot_temp'], n_classes)
     labels_init = torch.stack(extract_labels(mtt_dataset.distill, 1, n_classes))
     labels_syn = torch.stack(labels).requires_grad_(True)

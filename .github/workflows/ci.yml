@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # Non-blocking for now: this codebase had never been linted before, so the baseline
+      # has known findings (see pyproject.toml). Widen `select` there and drop
+      # continue-on-error once the baseline is clean.
+      - name: ruff check
+        continue-on-error: true
+        run: uv tool run ruff check .
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      # Only what modules/base_utils/experiment_tracker.py needs -- deliberately NOT the
+      # full requirements.txt (no torch), so this job stays fast and has no GPU/data
+      # dependency (see the module's own docstring on why it avoids importing util.py).
+      - run: pip install matplotlib toml
+      - run: python tests/test_experiment_tracker.py
+
+  validate-configs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install toml
+      # Regenerate every campaign's configs into a throwaway experiments/ tree (gitignored,
+      # never committed) and schema-validate the result -- catches template/schema drift at
+      # generation time (the class of bug this CI job exists to catch: gen_configs.py's
+      # JOINT_TRIGGER_TEMPLATE grew expert_retrain_* keys that gen_configs_sweep.py's own
+      # .format() call wasn't updated for, and would only have surfaced as a KeyError deep
+      # into a real cluster run).
+      - name: Generate every campaign's configs
+        run: |
+          python -m modules.base_utils.gen_configs
+          python -m modules.federated_generate_labels_trigger.gen_configs
+          python -m modules.federated_generate_labels_trigger_joint.gen_configs
+          python -m modules.federated_generate_labels_trigger_joint.gen_configs_sweep --dry-run
+          python -m modules.federated_optimizing_trigger_policy.gen_configs
+      - name: Validate every generated config against its schema
+        run: python scripts/validate_all_configs.py
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      # CPU-only wheel explicitly -- requirements.txt's torch==2.8.0 otherwise resolves to
+      # the much larger CUDA build on a GPU-less runner.
+      - name: Install CPU-only requirements
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torchvision==0.23.0
+          pip install -r requirements.txt
+      - name: Run end-to-end smoke test on a tiny CIFAR-10 slice
+        run: python scripts/smoke_test_pipeline.py

@@ -1,7 +1,7 @@
-### 
+###
 # train_expert schema
 # Records trajectories for an expert model.
-# Outputs the .pth files for expert and optimizer trajectories. 
+# Outputs the .pth files for expert and optimizer trajectories.
 ###
 
 [train_expert]

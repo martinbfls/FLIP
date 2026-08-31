@@ -43,7 +43,7 @@ def run(experiment_name, module_name, **kwargs):
     num_poisoned = args.get("num_poisoned", 1)
     num_workers = num_honests + num_poisoned
     agg_method = args.get("agg_method", "mean")
-    
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     if slurm_id is None:
@@ -92,7 +92,7 @@ def run(experiment_name, module_name, **kwargs):
     #     epochs=epochs,
     #     callback=lambda m, o, e, i: checkpoint_callback(m, o, e, i, ckpt_iters, output_dir)
     # )
-    
+
     model, clean_metrics, poison_metrics = mini_train_multi(
         model=model,
         train_datasets=worker_datasets,

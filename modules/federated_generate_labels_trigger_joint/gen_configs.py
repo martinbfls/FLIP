@@ -31,6 +31,10 @@ import toml
 
 from modules.federated_optimizing_trigger.utils import init_delta
 from modules.base_utils.gen_configs import wandb_block
+from modules.base_utils.config_validation import (
+    write_config,
+    validate_config_file as validate_config,
+)
 
 # Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
 # default -- flip WANDB_ENABLED to True to have every config in this campaign carry a
@@ -180,35 +184,6 @@ MODULE_NAME = "federated_generate_labels_trigger_joint"
 _TRIGGER_SHAPE = {"cifar": (3, 32, 32), "cifar_100": (3, 32, 32), "svhn": (3, 32, 32)}
 _STRENGTH, _FREQ = 6.0, 16  # must match init_delta's call in run_module.py exactly
 
-
-def write_config(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    print(f"[OK] Config written to {path}")
-
-
-def validate_config(path: Path):
-    exp_toml = toml.load(path)
-    for module_name, module_config in exp_toml.items():
-        schema_path = Path("schemas") / f"{module_name}.toml"
-        assert schema_path.exists(), (
-            f"Malformed module! Schema {schema_path} does not exist."
-        )
-        schema = toml.load(schema_path)
-        optionals = list(schema.get("OPTIONAL", {}).keys())
-
-        schema_keys = set(schema[module_name].keys())
-        config_keys = set(module_config.keys())
-
-        missing = [k for k in schema_keys - config_keys if k not in optionals]
-        extra = [k for k in config_keys - schema_keys if k not in optionals]
-        assert not missing, (
-            f"Malformed config ({path}, [{module_name}]): missing required keys {missing}"
-        )
-        assert not extra, (
-            f"Malformed config ({path}, [{module_name}]): unknown keys {extra} "
-            "(not in schema, not optional)"
-        )
 
 
 def check_delta_min_feasible(dataset, epsilon, delta_min_frac):
@@ -538,6 +513,20 @@ def generate_all_configs(dry_run=False):
     return all_paths, refused
 
 
+def list_grid():
+    """Enumerates this campaign's sweep cells (model/dataset/agg_method/seed) as plain
+    dicts, without writing any config -- the single source of truth for the grid's shape,
+    so orchestrate_slurm/orchestrate_runs_trigger_joint_slurm.sh doesn't need to duplicate
+    MODEL_FLAGS/DATASETS/AGG_METHODS/SEEDS by hand (see --print-grid)."""
+    return [
+        {"model_flag": model_flag, "dataset": dataset, "agg_method": agg_method, "seed": seed}
+        for model_flag in MODEL_FLAGS
+        for dataset in DATASETS
+        for agg_method in AGG_METHODS
+        for seed in SEEDS
+    ]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -550,7 +539,17 @@ if __name__ == "__main__":
         help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
         "preliminary campaign",
     )
+    parser.add_argument(
+        "--print-grid", action="store_true",
+        help="print this campaign's sweep cells as JSON and exit, without writing configs",
+    )
     args = parser.parse_args()
+
+    if args.print_grid:
+        import json
+        print(json.dumps(list_grid(), indent=2))
+        raise SystemExit(0)
+
     assert not (args.minimal and args.single_cell), (
         "pass at most one of --minimal/--single-cell"
     )

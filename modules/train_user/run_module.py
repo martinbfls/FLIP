@@ -56,7 +56,7 @@ def run(experiment_name, module_name, **kwargs):
     _, distillation, test, poison_test, _ =\
         get_matching_datasets(dataset_flag, poisoner, clean_label, big=big_ims)
 
-    labels_syn = torch.tensor(np.load(input_path))        
+    labels_syn = torch.tensor(np.load(input_path))
 
     if alpha > 0:
         assert true_path is not None
@@ -74,7 +74,7 @@ def run(experiment_name, module_name, **kwargs):
     print("Training user model...")
     n_classes = get_n_classes(dataset_flag)
     model_retrain = load_model(user_model_flag, n_classes)
-        
+
     batch_size, epochs, optimizer_retrain, scheduler = get_train_info(
         model_retrain.parameters(), trainer_flag, batch_size,
         epochs, optim_kwargs, scheduler_kwargs

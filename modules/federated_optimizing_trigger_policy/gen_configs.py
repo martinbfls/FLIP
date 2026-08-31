@@ -29,6 +29,10 @@ from pathlib import Path
 import toml
 
 from modules.base_utils.gen_configs import wandb_block
+from modules.base_utils.config_validation import (
+    write_config,
+    validate_config_file as validate_config,
+)
 
 # Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
 # default -- flip WANDB_ENABLED to True to have every config in this campaign carry a
@@ -276,36 +280,6 @@ EXP_BASE = Path(
 ).resolve()
 
 MODULE_NAME = "federated_optimizing_trigger_policy"
-
-
-def write_config(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    print(f"[OK] Config written to {path}")
-
-
-def validate_config(path: Path):
-    exp_toml = toml.load(path)
-    for module_name, module_config in exp_toml.items():
-        schema_path = Path("schemas") / f"{module_name}.toml"
-        assert schema_path.exists(), (
-            f"Malformed module! Schema {schema_path} does not exist."
-        )
-        schema = toml.load(schema_path)
-        optionals = list(schema.get("OPTIONAL", {}).keys())
-
-        schema_keys = set(schema[module_name].keys())
-        config_keys = set(module_config.keys())
-
-        missing = [k for k in schema_keys - config_keys if k not in optionals]
-        extra = [k for k in config_keys - schema_keys if k not in optionals]
-        assert not missing, (
-            f"Malformed config ({path}, [{module_name}]): missing required keys {missing}"
-        )
-        assert not extra, (
-            f"Malformed config ({path}, [{module_name}]): unknown keys {extra} "
-            "(not in schema, not optional)"
-        )
 
 
 def resolve_beta_gamma(budget_target, dataset, num_poisoned, num_honests):
@@ -970,9 +944,27 @@ def generate_inner_solve_comparison(dry_run=True):
     return all_paths, refused
 
 
+def list_grid():
+    """Enumerates the main campaign's sweep cells (model/dataset/budget_target/seed) as
+    plain dicts, without writing any config -- the single source of truth for the grid's
+    shape, so orchestrate_slurm/orchestrate_runs_policy_slurm.sh doesn't need to duplicate
+    MODEL_FLAGS/DATASETS/BUDGETS_TARGET/SEEDS by hand (see --print-grid)."""
+    return [
+        {"model_flag": model_flag, "dataset": dataset, "budget_target": budget_target, "seed": seed}
+        for model_flag in MODEL_FLAGS
+        for dataset in DATASETS
+        for budget_target in BUDGETS_TARGET
+        for seed in SEEDS
+    ]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--print-grid", action="store_true",
+        help="print the main campaign's sweep cells as JSON and exit, without writing configs",
+    )
     parser.add_argument(
         "--minimal", action="store_true", help="B3 minimal campaign only"
     )
@@ -1029,6 +1021,12 @@ if __name__ == "__main__":
         "generate_qp_split_half_audit's docstring.",
     )
     args = parser.parse_args()
+
+    if args.print_grid:
+        import json
+        print(json.dumps(list_grid(), indent=2))
+        raise SystemExit(0)
+
     assert sum([
         args.minimal, args.single_cell, args.inner_solve_comparison, args.oneshot_gap_audit,
         args.oneshot_gap_audit_restricted, args.qp_m_sweep_audit, args.qp_split_half_audit,

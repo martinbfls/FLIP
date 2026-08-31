@@ -22,9 +22,11 @@ le réglage omniscient et sert de baseline.
 """
 
 import csv
+import json
 from pathlib import Path
 
 from modules.base_utils.gen_configs import wandb_block
+from modules.base_utils.config_validation import write_config, validate_config_file
 
 # Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py and
 # gen_configs.py's own WANDB_* constants). Off by default; independent of gen_configs.py's
@@ -92,10 +94,6 @@ schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 """
 
 
-def write_config(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    print(f"[OK] Config written to {path}")
 
 
 def generate_all_configs():

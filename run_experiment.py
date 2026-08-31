@@ -5,7 +5,6 @@ Run experiment based on config.
 import sys
 import os
 
-import numpy as np
 import toml
 from collections import OrderedDict
 
@@ -14,6 +13,7 @@ sys.path.insert(0, os.path.abspath(
     ))
 
 from modules.base_utils import util
+from modules.base_utils.config_validation import ConfigValidationError, validate_module_config
 
 
 experiment_name = sys.argv[1]
@@ -32,27 +32,12 @@ for module_name, module_config in args.items():
 
     schema = toml.load(full_path, _dict=OrderedDict)
 
-    optionals = []
-    if 'OPTIONAL' in schema:
-        optionals = list(schema['OPTIONAL'].keys())
-
-    # Check if config is well formed
-    bad_config = False
-    diff_forward = np.setdiff1d(list(schema[module_name].keys()),
-                                list(module_config.keys()))
-    for item in diff_forward:
-        if item not in optionals:
-            print(f"Malformed config: {item} exists in schema but not config.")
-            bad_config = True
-
-    diff_backward = np.setdiff1d(list(module_config.keys()),
-                                 list(schema[module_name].keys()))
-    for item in diff_backward:
-        if item not in optionals:
-            print(f"Malformed config: {item} exists in config but not schema.")
-            bad_config = True
-
-    if bad_config:
+    # Check if config is well formed (schema key presence, both directions -- see
+    # modules/base_utils/config_validation.py, shared with every gen_configs*.py generator).
+    try:
+        validate_module_config(module_name, module_config)
+    except ConfigValidationError as e:
+        print(f"Malformed config: {e}")
         exit()
 
     # Check if module has distinct module name

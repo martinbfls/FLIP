@@ -1,5 +1,8 @@
+import json
 import os
 from pathlib import Path
+
+from modules.base_utils.config_validation import write_config, validate_config_file
 
 NUM_POISONED = 1
 NUM_CLEAN = 0
@@ -195,12 +198,6 @@ schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 {wandb_block}"""
 
 
-def write_config(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    print(f"[OK] Config written to {path}")
-
-
 def generate_all_configs():
     for model_flag in MODEL_FLAGS:
         for dataset in DATASETS:
@@ -299,5 +296,42 @@ def generate_all_configs():
                             )
 
 
+def list_grid():
+    """Enumerates this campaign's sweep cells (model/dataset/aggregator/poisoner/run_id/
+    budget) as plain dicts, without writing any config -- the single source of truth for
+    the grid's shape, so orchestrate_slurm/*.sh doesn't need to duplicate MODEL_FLAGS/
+    DATASETS/AGGREGATORS/etc by hand (see --print-grid)."""
+    cells = []
+    for model_flag in MODEL_FLAGS:
+        for dataset in DATASETS:
+            if dataset == "tiny_imagenet" and model_flag in ["r18", "r32p"]:
+                continue
+            for aggregator in AGGREGATORS:
+                for poisoner in POISONERS:
+                    for run_id in range(1, N_CYCLES + 1):
+                        for budget in BUDGETS:
+                            cells.append({
+                                "model_flag": model_flag,
+                                "dataset": dataset,
+                                "aggregator": aggregator,
+                                "poisoner": poisoner,
+                                "run_id": run_id,
+                                "budget": budget,
+                            })
+    return cells
+
+
 if __name__ == "__main__":
-    generate_all_configs()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--print-grid", action="store_true",
+        help="print this campaign's sweep cells as JSON and exit, without writing configs",
+    )
+    args = parser.parse_args()
+
+    if args.print_grid:
+        print(json.dumps(list_grid(), indent=2))
+    else:
+        generate_all_configs()

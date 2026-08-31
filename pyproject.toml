@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [
+    "prelim", "experiments", "out", "out*", "wandb", "logs_slurm",
+    "modules/pytorch_cifar",  # vendored third-party code (pytorch-cifar), not ours to fix
+]
+
+[tool.ruff.lint]
+# Kept deliberately narrow: this codebase has never been linted, so we start with the
+# checks that catch real bugs (unused/undefined names, obvious errors) rather than style.
+# Widen this selection incrementally rather than all at once.
+select = ["E9", "F"]
+ignore = [
+    "F401",  # unused imports -- several modules re-export names on purpose (e.g.
+             # gen_configs*.py importing write_config/validate_config for its own call sites)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

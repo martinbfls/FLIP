@@ -1,4 +1,4 @@
-### 
+###
 # train_user schema
 # Trains and records metrics on a downstream model trained on input labels.
 # Outputs the poison accuracy, clean accuracy, and training labels .npy files and a final model .pth.
