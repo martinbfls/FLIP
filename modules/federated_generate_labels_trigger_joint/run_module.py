@@ -33,7 +33,7 @@ from modules.federated_optimizing_trigger.utils import (
 from modules.federated_generate_labels_trigger_joint.utils import (
     TriggerMTTDataset, extract_experts_biased, build_expert_pool,
     directional_floor_penalty, magnitude_floor_penalty, project_trigger_constraints,
-    cosine_to, grad_mismatch_penalty,
+    cosine_to, grad_mismatch_penalty, grad_cosine_penalty,
 )
 
 
@@ -212,8 +212,14 @@ def run(experiment_name, module_name, **kwargs):
     corrected instrumentation.
 
     Gradient-mismatch penalty (2026-08-31, optional, off by default): an additional term,
-    L_gradmatch = ||grad(L_c)(theta_k) - grad(L_p)(theta_k)(delta)||^2 / ||grad(L_c)(theta_k)||^2
-    (`lambda_gradmatch * L_gradmatch` added to grand_loss, weight default 0.0 = no-op),
+    L_gradmatch (`lambda_gradmatch * L_gradmatch` added to grand_loss, weight default 0.0 =
+    no-op), measuring how distinguishable grad(L_p)(theta_k)(delta) is from grad(L_c)(theta_k)
+    at the current checkpoint. `gradmatch_metric` selects the distance used (2026-09-01):
+    "relerr" (default, original formulation) is the scale-SENSITIVE relative squared error
+    ||grad(L_c)(theta_k) - grad(L_p)(theta_k)(delta)||^2 / ||grad(L_c)(theta_k)||^2
+    (grad_mismatch_penalty); "cosine" is the scale-INVARIANT 1 - cos(grad(L_c)(theta_k),
+    grad(L_p)(theta_k)(delta)) instead (grad_cosine_penalty) -- unlike "relerr", it does not
+    penalize the two gradients merely having different magnitudes, only differing in direction.
     penalizing delta for making the poisoned-example gradient distinguishable from the clean-
     example gradient AT THE SAME checkpoint theta_k -- both gradients flattened/concatenated
     across every expert_model parameter. grad(L_c)(theta_k) is the mean gradient of the
@@ -337,9 +343,18 @@ def run(experiment_name, module_name, **kwargs):
     delta_min_frac = args.get("delta_min_frac", 0.5)
 
     # Gradient-mismatch penalty (see run() docstring): off by default (0.0 = no-op, identical
-    # to the module's behavior before this term existed).
+    # to the module's behavior before this term existed). gradmatch_metric selects the distance
+    # used between grad(L_c)(theta_k) and grad(L_p)(theta_k)(delta): "relerr" (default, the
+    # original formulation) is the scale-SENSITIVE relative-squared-error ratio
+    # ||.-.||^2/||grad(L_c)||^2; "cosine" is the scale-INVARIANT 1 - cos(.,.) instead (see
+    # grad_cosine_penalty).
     lambda_gradmatch = args.get("lambda_gradmatch", 0.0)
     gradmatch_eps = args.get("gradmatch_eps", 1e-8)
+    gradmatch_metric = args.get("gradmatch_metric", "relerr")
+    if gradmatch_metric not in ("relerr", "cosine"):
+        raise ValueError(
+            f"gradmatch_metric must be 'relerr' or 'cosine', got {gradmatch_metric!r}"
+        )
     track_gradmatch = lambda_gradmatch != 0
 
     output_dir_trigger = slurmify_path(
@@ -813,7 +828,11 @@ def run(experiment_name, module_name, **kwargs):
                     poison_grad_mean = [
                         torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks
                     ]
-                    L_gradmatch = grad_mismatch_penalty(
+                    penalty_fn = (
+                        grad_cosine_penalty if gradmatch_metric == "cosine"
+                        else grad_mismatch_penalty
+                    )
+                    L_gradmatch = penalty_fn(
                         clean_grad_mean, poison_grad_mean, eps=gradmatch_eps,
                     )
                 else:

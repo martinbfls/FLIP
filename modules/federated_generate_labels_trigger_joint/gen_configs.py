@@ -172,6 +172,11 @@ DELTA_MIN_FRAC = 0.01
 # results (expert_asr / matching_term / L_gradmatch in metrics_log_path) are in.
 LAMBDA_GRADMATCH = 1.0
 GRADMATCH_EPS = 1e-8
+# "relerr" (original formulation) here -- kept as this campaign's default so its results stay
+# comparable to the sweep that validated LAMBDA_GRADMATCH=1.0 above. The "cosine" alternative
+# (2026-09-01, see run_module.py's run() docstring) is compared separately, in the dedicated
+# 1-poisoned/0-honest sweep -- see gen_configs_gradmatch_metric.py.
+GRADMATCH_METRIC = "relerr"
 
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
@@ -252,6 +257,7 @@ lambda_bd = {lambda_bd}
 lambda_delta = {lambda_delta}
 lambda_gradmatch = {lambda_gradmatch}
 gradmatch_eps = {gradmatch_eps}
+gradmatch_metric = "{gradmatch_metric}"
 
 train_pct = {train_pct}
 num_honests = {num_honests}
@@ -391,6 +397,7 @@ def generate_cell(
             lambda_delta=LAMBDA_DELTA,
             lambda_gradmatch=LAMBDA_GRADMATCH,
             gradmatch_eps=GRADMATCH_EPS,
+            gradmatch_metric=GRADMATCH_METRIC,
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,

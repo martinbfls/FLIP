@@ -220,6 +220,23 @@ def grad_mismatch_penalty(clean_grads, poison_grads, eps=1e-8):
     return diff_sq / (clean_sq + eps)
 
 
+def grad_cosine_penalty(clean_grads, poison_grads, eps=1e-8):
+    '''
+    1 - cos(grad(L_c), grad(L_p)(delta)), flattened & concatenated across every parameter
+    tensor in `clean_grads`/`poison_grads` -- same convention/inputs as `grad_mismatch_penalty`
+    (see there for what the two grad lists mean), an alternative to its relative-squared-error
+    ratio. Bounded in [0, 2]: 0 iff the two gradients point in exactly the same direction
+    (scale-invariant -- unlike grad_mismatch_penalty, magnitude differences alone don't
+    penalize), 1 iff orthogonal, 2 iff exactly opposite. `eps` guards the denominator when
+    either gradient is (near) zero.
+    '''
+    dot = sum((gc * gp).sum() for gc, gp in zip(clean_grads, poison_grads))
+    clean_norm = torch.sqrt(sum(gc.pow(2).sum() for gc in clean_grads))
+    poison_norm = torch.sqrt(sum(gp.pow(2).sum() for gp in poison_grads))
+    cos = dot / (clean_norm * poison_norm + eps)
+    return 1 - cos
+
+
 def project_trigger_constraints(delta, mu_target, epsilon, align_kappa, delta_min, n_iters=8, eps=1e-8):
     '''
     Alternating-projection heuristic (see run_module.py's run() docstring,

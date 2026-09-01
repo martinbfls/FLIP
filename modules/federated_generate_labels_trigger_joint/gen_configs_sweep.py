@@ -194,6 +194,12 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             lr_delta=params["lr_delta"],
             lambda_bd=params["lambda_bd"],
             lambda_delta=params["lambda_delta"],
+            # Gradient-mismatch penalty (added to gen_configs.py/run_module.py after this sweep
+            # script was written, schema-optional, 0.0 = disabled): pinned off here so this
+            # OFAT hyperparameter search's own axes stay the only thing varying between cells.
+            lambda_gradmatch=0.0,
+            gradmatch_eps=1e-8,
+            gradmatch_metric="relerr",
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
