@@ -232,6 +232,12 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             expert_retrain_interval=0,
             expert_retrain_epochs=EPOCHS_EXPERT,
             expert_retrain_checkpoint_iters=CHECKPOINT_ITERS,
+            # n_checkpoints_per_step (added to gen_configs.py/run_module.py after this sweep
+            # script was written, schema-optional, 1 = single-checkpoint-per-step, unchanged):
+            # pinned to 1 here so this OFAT hyperparameter search's own axes stay the only thing
+            # varying between cells -- the 5-checkpoint real test lives in gen_configs.py's own
+            # main campaign instead.
+            n_checkpoints_per_step=1,
             lr=lr,
             wd=wd,
             milestones=milestones,

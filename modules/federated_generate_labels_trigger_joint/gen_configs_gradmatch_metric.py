@@ -175,6 +175,12 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
+            # n_checkpoints_per_step (added to gen_configs.py/run_module.py after this
+            # comparison script was written, schema-optional, 1 = single-checkpoint-per-step,
+            # unchanged): pinned to 1 here so gradmatch_metric stays the only axis varying
+            # between this script's two cells -- the 5-checkpoint real test lives in
+            # gen_configs.py's own main campaign instead.
+            n_checkpoints_per_step=1,
             lr=lr,
             wd=wd,
             milestones=milestones,

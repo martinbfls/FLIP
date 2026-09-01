@@ -130,6 +130,19 @@ EXPERT_RETRAIN_INTERVAL = 5
 EXPERT_RETRAIN_EPOCHS = EPOCHS_EXPERT
 EXPERT_RETRAIN_CHECKPOINT_ITERS = CHECKPOINT_ITERS
 
+# Multi-checkpoint averaging (2026-09-02, see run_module.py's run() docstring "Averaging the
+# loss over multiple checkpoints"): every batch-step draws N_CHECKPOINTS_PER_STEP DISTINCT
+# checkpoints from the pool and averages each one's own matching term/gradient-mismatch penalty
+# into grand_loss, instead of conditioning the whole step's gradient on a single checkpoint draw.
+# Requires pool_size >= N_CHECKPOINTS_PER_STEP -- POOL_SIZE isn't itself exposed in this
+# generator (run_module.py's own default, 15, is used, comfortably >= 5 here). 5 here is the
+# real-test value requested for THIS campaign -- was 1 (no-op, single-checkpoint-per-step,
+# bit-for-bit unchanged) before. Memory scales roughly linearly with this value (5 DISTINCT sets
+# of model parameters + their create_graph=True graphs held simultaneously, see run_module.py's
+# own IMPLEMENTATION NOTE) -- watch the first GEN job for OOM before the rest start, same caution
+# the orchestrator script already prints for this module's second-order graph.
+N_CHECKPOINTS_PER_STEP = 5
+
 # --------------------------------------------------------------------------- #
 # REGULARIZATION_GRID -- trigger regularization knobs, kept separate from the sweep axes
 # above so a real campaign's regularization sweep is easy to find and edit in one place.
@@ -338,6 +351,8 @@ expert_retrain_checkpoint_iters = {expert_retrain_checkpoint_iters}
 expert_retrain_optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 seed = {rng_seed}
+
+n_checkpoints_per_step = {n_checkpoints_per_step}
 {wandb_block_module}
 [federated_generate_labels_trigger_joint.expert_config]
 experts = 1
@@ -483,6 +498,7 @@ def generate_cell(
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
+            n_checkpoints_per_step=N_CHECKPOINTS_PER_STEP,
             lr=lr,
             wd=wd,
             milestones=milestones,

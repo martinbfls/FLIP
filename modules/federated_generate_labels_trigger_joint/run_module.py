@@ -210,6 +210,42 @@ def run(experiment_name, module_name, **kwargs):
     order," which this field removes as a factor. No effect when unset or when
     expert_retrain_interval=0 (both leave the prior, unseeded behavior unchanged).
 
+    Averaging the loss over multiple checkpoints (2026-09-02, `n_checkpoints_per_step`):
+    conditioning every outer step's gradient on a SINGLE expert checkpoint (even with P3's
+    pool_size random draw, still one draw per step) makes the resulting labels_syn/delta fit to
+    whatever quirks that one checkpoint happens to have. If set > 1, every batch-step instead
+    draws that many DISTINCT checkpoints from the pool (requires pool_size >=
+    n_checkpoints_per_step -- see the ValueError this raises otherwise) and computes THIS step's
+    grand_loss as the mean, over those n_checkpoints_per_step checkpoints, of each one's own
+    otherwise-unchanged matching term (param_loss/param_dist) and gradient-mismatch penalty --
+    reg_term and the trigger/anti-collapse regularizers do NOT depend on the checkpoint, so they
+    are still computed/added exactly once, not per checkpoint. The isolated L_bd manual
+    delta.grad accumulation (point 3 above) is explicitly scaled by 1/n_checkpoints_per_step per
+    checkpoint's poisoned clients, to stay consistent with the mean the rest of grand_loss
+    already takes. A SINGLE combined `grand_loss.backward()` call still runs once per step.
+    expert_asr/expert_asr_frozen/L_bd_mean/matching_term (both history and tracker.log) are
+    likewise averaged over the n_checkpoints_per_step checkpoints; `matching_term_std`/
+    `L_bd_mean_std`/`expert_asr_std` (history only) additionally record the SPREAD across them,
+    a diagnostic for whether the checkpoints disagree a lot on a given step. Default 1 leaves
+    the single-checkpoint-per-step behavior completely, bit-for-bit unchanged (mean of one
+    element).
+
+    IMPLEMENTATION NOTE (why n_checkpoints_per_step DISTINCT, PERSISTENT model instances, not
+    one model reloaded n_checkpoints_per_step times): `expert_models`/`student_models` below are
+    lists of n_checkpoints_per_step separate nn.Module instances, each `load_state_dict`-ed from
+    its own checkpoint ONCE per batch-step. Reusing ONE model object and reloading its
+    state_dict between checkpoints WITHIN the same step would mutate leaf parameter tensors
+    still referenced by an EARLIER checkpoint's not-yet-backwarded create_graph=True graph --
+    PyTorch's per-tensor version counter detects this and raises "one of the variables needed
+    for gradient computation has been modified by an inplace operation" at the combined
+    backward() -- a hard failure, not a silent bug, but one that only manifests with > 1
+    checkpoint per step. Verified on a tiny synthetic model in
+    prelim/tests/test_multi_checkpoint_step.py (both the hazard and the fix). Memory scales
+    roughly linearly with n_checkpoints_per_step (n_checkpoints_per_step DISTINCT sets of model
+    parameters, each with its own live create_graph=True computation graph, all held
+    simultaneously until the single combined backward() completes) -- size pool_size/GPU memory
+    accordingly.
+
     Two Step-3 corrections relative to the original H1 instrumentation (see
     docs/threat_models_audit.md for the original run's refuted-but-confounded result): (1)
     `delta_init` is now captured INSIDE the training loop, the first time execution reaches
@@ -411,6 +447,24 @@ def run(experiment_name, module_name, **kwargs):
     # path -- see the pool_size==1 branch below.
     pool_size = args.get("pool_size", 15)
 
+    # Multi-checkpoint averaging (2026-09-02, see run() docstring "Averaging the loss over
+    # multiple checkpoints"): if > 1, every outer step draws n_checkpoints_per_step DISTINCT
+    # checkpoints from the pool (instead of just one) and computes THIS step's grand_loss as
+    # the MEAN of each checkpoint's own (otherwise unchanged) per-checkpoint grand_loss, before
+    # a SINGLE backward() call. Requires pool_size > 1 (checkpoint pooling enabled) -- validated
+    # against the ACTUAL (possibly clamped) pool_size once it's built, below. Default 1 leaves
+    # the single-checkpoint-per-step behavior completely unchanged.
+    n_checkpoints_per_step = args.get("n_checkpoints_per_step", 1)
+    if n_checkpoints_per_step < 1:
+        raise ValueError(
+            f"n_checkpoints_per_step must be >= 1, got {n_checkpoints_per_step}"
+        )
+    if n_checkpoints_per_step > 1 and pool_size == 1:
+        raise ValueError(
+            "n_checkpoints_per_step > 1 requires pool_size > 1 (checkpoint pooling must be "
+            "enabled to draw multiple DISTINCT checkpoints per step) -- got pool_size=1."
+        )
+
     # Instrumentation (mandatory, see run() docstring): if set, per-batch metrics (expert_asr,
     # delta_inf, delta_l2, param_loss, param_dist, L_bd_mean, grand_loss) are dumped as JSON.
     metrics_log_path = args.get("metrics_log_path", None)
@@ -462,10 +516,28 @@ def run(experiment_name, module_name, **kwargs):
     # Optimize labels and trigger jointly
     print("Training...")
 
-    student_model = load_model(expert_model_flag, n_classes)
-    expert_model = load_model(expert_model_flag, n_classes)
+    # n_checkpoints_per_step DISTINCT, PERSISTENT model instances (not one reloaded K times --
+    # see run() docstring "Averaging the loss over multiple checkpoints" for why this is
+    # required, not just a memory/parallelism choice): each expert_models[k]/student_models[k]
+    # is loaded from its own checkpoint ONCE per batch-step and only reloaded again at the START
+    # of the NEXT batch-step, by which point this step's single, combined grand_loss.backward()
+    # has ALREADY run -- exactly mirroring the single-checkpoint invariant this module has
+    # always relied on (load_state_dict only ever happens between one graph's construction and
+    # ITS OWN eventual backward(), never in between). Reusing ONE model object and reloading it
+    # K times per step instead would mutate leaf parameter tensors still referenced by an
+    # EARLIER checkpoint's not-yet-backwarded create_graph=True graph -- PyTorch detects this via
+    # its per-tensor version counter and raises "modified by an inplace operation" at backward()
+    # time (a hard, unambiguous failure, not a silent correctness bug -- verified in
+    # prelim/tests/test_multi_checkpoint_step.py; kept as a regression pin for this design
+    # choice).
+    student_models = [
+        load_model(expert_model_flag, n_classes) for _ in range(n_checkpoints_per_step)
+    ]
+    expert_models = [
+        load_model(expert_model_flag, n_classes) for _ in range(n_checkpoints_per_step)
+    ]
 
-    device = get_module_device(student_model)
+    device = get_module_device(student_models[0])
 
     mu = get_mu(dataset_flag, target_label, device, model_flag=expert_model_flag)
     mu_source = mu if clean_label == -1 else get_mu(
@@ -494,7 +566,7 @@ def run(experiment_name, module_name, **kwargs):
     optimizer_delta = torch.optim.Adam([delta], lr=lr_delta)
 
     batch_size, epochs, optimizer_expert, optimizer_labels = get_mtt_attack_info(
-        expert_model.parameters(),
+        expert_models[0].parameters(),
         labels_syn,
         config['expert_kwargs'],
         config['labels_kwargs'],
@@ -541,6 +613,16 @@ def run(experiment_name, module_name, **kwargs):
         print(f"Preloading up to {pool_size} expert checkpoints into RAM (float32, CPU)...")
         expert_pool, pool_size = build_expert_pool(expert_starts, expert_opt_starts, pool_size)
 
+    # n_checkpoints_per_step must not exceed the ACTUAL pool_size -- build_expert_pool above may
+    # have clamped the requested pool_size down to the number of distinct checkpoints actually
+    # available (see its own docstring), so this is checked here, not at param-parsing time.
+    if n_checkpoints_per_step > pool_size:
+        raise ValueError(
+            f"n_checkpoints_per_step={n_checkpoints_per_step} > pool_size={pool_size} "
+            "(possibly already clamped down from a larger request, see build_expert_pool) -- "
+            "cannot draw that many DISTINCT checkpoints per step."
+        )
+
     def _opt_state_to_device(opt_state_cpu, device):
         return {
             "state": {
@@ -563,6 +645,22 @@ def run(experiment_name, module_name, **kwargs):
             return checkpoint, opt_state
         checkpoint, opt_state_cpu = random.choice(expert_pool)
         return checkpoint, _opt_state_to_device(opt_state_cpu, device)
+
+    def _load_experts_for_step(it):
+        """Returns a list of n_checkpoints_per_step (params_state_dict, opt_state_dict) pairs
+        for outer step `it` (see run() docstring "Averaging the loss over multiple
+        checkpoints"). n_checkpoints_per_step==1 (default) just wraps _load_expert_for_step's
+        single draw in a list -- bit-for-bit the prior single-checkpoint behavior. > 1 draws
+        that many DISTINCT entries from expert_pool (validated >= n_checkpoints_per_step
+        above) -- distinct, not with replacement, so the K checkpoints averaged this step are
+        genuinely different points on the expert trajectory."""
+        if n_checkpoints_per_step == 1:
+            return [_load_expert_for_step(it)]
+        drawn = random.sample(expert_pool, n_checkpoints_per_step)
+        return [
+            (checkpoint, _opt_state_to_device(opt_state_cpu, device))
+            for checkpoint, opt_state_cpu in drawn
+        ]
 
     # Live expert retraining -- see the run() docstring's H1 diagnostic and
     # expert_retrain_interval's own comment above. Writes to a PRIVATE directory
@@ -670,272 +768,327 @@ def run(experiment_name, module_name, **kwargs):
 
             for batches in zip(*loaders):
 
-                # Load expert trajectory
-                checkpoint, state_dict = _load_expert_for_step(it)
-                expert_model.load_state_dict(checkpoint)
-                student_model.load_state_dict({k: v.clone() for k, v in checkpoint.items()})
-
-                expert_start = [p.clone() for p in expert_model.parameters()]
-
-                # optimizer_expert itself is never stepped or loaded from disk any more (E2,
-                # point 2b) -- state_dict (loaded directly, independent of optimizer_expert) is
-                # the only source of per-param momentum buffers / SGD hyperparameters used by
-                # both sgd_step calls below.
-
-                expert_params = list(expert_model.parameters())
-                student_params = list(student_model.parameters())
-
-                student_grad_buf = [[] for _ in student_params]
-                expert_grad_buf = [[] for _ in expert_params]  # E2, point 2a
-                # Gradient-mismatch penalty buffers (see run() docstring) -- one chunk per
-                # contributing clean/poisoned example source this batch, meaned below.
-                clean_grad_chunks = [[] for _ in expert_params]
-                poison_grad_chunks = [[] for _ in expert_params]
-
+                # Multi-checkpoint averaging (see run() docstring "Averaging the loss over
+                # multiple checkpoints"): n_checkpoints_per_step DISTINCT checkpoints drawn for
+                # THIS batch-step (n_checkpoints_per_step==1, the default, draws exactly the
+                # ONE checkpoint the pre-existing code always drew -- see _load_experts_for_step).
+                # optimizer_delta.zero_grad() runs ONCE per batch-step, BEFORE the k-loop below,
+                # so delta.grad accumulates the (1/n_checkpoints_per_step-scaled, see point 3
+                # below) L_bd contribution from every poisoned client of EVERY checkpoint k --
+                # exactly the single-checkpoint invariant, extended across k.
+                checkpoints_k = _load_experts_for_step(it)
                 optimizer_delta.zero_grad()
-                L_bd_sum = torch.tensor(0.0, device=device)
-                n_bd_valid = 0
 
-                for cid, batch in enumerate(batches):
+                mtt_term_list = []
+                gradmatch_list = []
+                matching_term_list = []
+                L_bd_mean_list = []
 
-                    # HONEST CLIENTS -- delta plays no role here; the real (non-differentiable)
-                    # backward is exactly as before. Feeds BOTH expert_grad_buf and
-                    # student_grad_buf (E2, point 2a) -- an honest client's contribution to the
-                    # federated aggregate is the same gradient on both sides, same as
-                    # federated_generate_labels/federated_generate_labels_trigger.
-                    if cid < num_honests:
-                        x, y = batch[0].to(device), batch[1].to(device)
+                for k, (checkpoint, state_dict) in enumerate(checkpoints_k):
+                    # expert_models[k]/student_models[k] are PERSISTENT, DISTINCT instances
+                    # (see their construction site's own comment for why this must not be one
+                    # model object reloaded n_checkpoints_per_step times within this step).
+                    expert_model = expert_models[k]
+                    student_model = student_models[k]
+                    expert_model.load_state_dict(checkpoint)
+                    student_model.load_state_dict({kk: v.clone() for kk, v in checkpoint.items()})
 
-                        expert_model.zero_grad()
-                        loss = clf_loss(expert_model(x), y)
-                        loss.backward()
+                    expert_start = [p.clone() for p in expert_model.parameters()]
 
-                        for i, p in enumerate(expert_params):
-                            if p.grad is not None:
-                                g = p.grad.detach().clone()
+                    # optimizer_expert itself is never stepped or loaded from disk any more (E2,
+                    # point 2b) -- state_dict (loaded directly, independent of optimizer_expert) is
+                    # the only source of per-param momentum buffers / SGD hyperparameters used by
+                    # both sgd_step calls below.
+
+                    expert_params = list(expert_model.parameters())
+                    student_params = list(student_model.parameters())
+
+                    student_grad_buf = [[] for _ in student_params]
+                    expert_grad_buf = [[] for _ in expert_params]  # E2, point 2a
+                    # Gradient-mismatch penalty buffers (see run() docstring) -- one chunk per
+                    # contributing clean/poisoned example source this batch, meaned below.
+                    clean_grad_chunks = [[] for _ in expert_params]
+                    poison_grad_chunks = [[] for _ in expert_params]
+
+                    L_bd_sum = torch.tensor(0.0, device=device)
+                    n_bd_valid = 0
+
+                    for cid, batch in enumerate(batches):
+
+                        # HONEST CLIENTS -- delta plays no role here; the real (non-differentiable)
+                        # backward is exactly as before. Feeds BOTH expert_grad_buf and
+                        # student_grad_buf (E2, point 2a) -- an honest client's contribution to the
+                        # federated aggregate is the same gradient on both sides, same as
+                        # federated_generate_labels/federated_generate_labels_trigger.
+                        if cid < num_honests:
+                            x, y = batch[0].to(device), batch[1].to(device)
+
+                            expert_model.zero_grad()
+                            loss = clf_loss(expert_model(x), y)
+                            loss.backward()
+
+                            for i, p in enumerate(expert_params):
+                                if p.grad is not None:
+                                    g = p.grad.detach().clone()
+                                    expert_grad_buf[i].append(g)
+                                    student_grad_buf[i].append(g)
+                                    if track_gradmatch:
+                                        # An honest client's local batch is entirely clean by
+                                        # construction -- this whole-batch gradient is exactly a
+                                        # grad(L_c) contributing chunk (see run() docstring).
+                                        clean_grad_chunks[i].append(g)
+
+                        # POISONED CLIENTS
+                        else:
+                            x_t, y_t, x_d, _, idx, is_poisoned = batch
+                            # idx and is_poisoned are kept on CPU (as collated) for indexing idx
+                            # itself and for the .any()/.tolist() checks below; is_poisoned_dev is
+                            # the copy used to index device-resident tensors (x_t_adv, y_t).
+                            x_t, y_t = x_t.to(device), y_t.to(device)
+                            x_d = x_d.to(device)
+                            is_poisoned_dev = is_poisoned.to(device)
+                            y_d = labels_syn[idx].to(device)
+
+                            # Rebuild the genuinely-poisoned rows of x_t from raw pixels via
+                            # T_delta (differentiable); the honest fraction of this poisoned
+                            # client's local batch (is_poisoned == False) keeps the clean,
+                            # unmodified image + true label MTTDataset already returns for it.
+                            x_t_adv = x_t
+                            if is_poisoned.any():
+                                idx_poisoned = idx[is_poisoned].tolist()
+                                x_raw_adv = torch.stack(
+                                    [raw_train_dataset[i][0] for i in idx_poisoned]
+                                ).to(device)
+                                x_trig = raw_to_trigger_preprocess(
+                                    x_raw_adv, delta, dataset_flag=dataset_flag,
+                                    model_flag=expert_model_flag,
+                                )
+                                x_t_adv = x_t.clone()
+                                # NOT detached (E2, point 2): x_t_adv now carries delta's gradient
+                                # into loss_e below -- this is the real-coupling change relative to
+                                # federated_generate_labels_trigger's x_trig.detach().
+                                x_t_adv[is_poisoned_dev] = x_trig
+
+                            # Expert (E2, point 1): differentiable w.r.t. BOTH expert_params AND
+                            # delta (via x_t_adv). p.grad is deliberately NEVER set on expert_params
+                            # anywhere in this module any more (E2, point 2a/2b): expert_params[i]
+                            # is a LEAF that also participates in grads_e's own create_graph=True
+                            # graph, so an early `.grad` assignment risks PyTorch's AccumulateGrad
+                            # mutating it in place the moment grand_loss.backward() runs later this
+                            # batch (see prelim/tests/test_joint_accumgrad_hazard.py) -- simply
+                            # never assigning it sidesteps the hazard rather than sequencing around
+                            # it. agg(expert_params, ...) below DOES set expert_params[i].grad as a
+                            # side effect, but only AFTER this point and harmlessly (see point 2a).
+                            expert_model.zero_grad()
+                            loss_e = clf_loss(expert_model(x_t_adv), y_t)
+                            grads_e = torch.autograd.grad(
+                                loss_e, expert_params, create_graph=True, retain_graph=True,
+                            )
+                            # E2, point 2a: this client's (differentiable, undetached) contribution
+                            # to the federated expert-gradient aggregate -- replaces the old
+                            # "last-poisoned-client-wins" grads_e_last.
+                            for i, g in enumerate(grads_e):
                                 expert_grad_buf[i].append(g)
-                                student_grad_buf[i].append(g)
-                                if track_gradmatch:
-                                    # An honest client's local batch is entirely clean by
-                                    # construction -- this whole-batch gradient is exactly a
-                                    # grad(L_c) contributing chunk (see run() docstring).
-                                    clean_grad_chunks[i].append(g)
 
-                    # POISONED CLIENTS
-                    else:
-                        x_t, y_t, x_d, _, idx, is_poisoned = batch
-                        # idx and is_poisoned are kept on CPU (as collated) for indexing idx
-                        # itself and for the .any()/.tolist() checks below; is_poisoned_dev is
-                        # the copy used to index device-resident tensors (x_t_adv, y_t).
-                        x_t, y_t = x_t.to(device), y_t.to(device)
-                        x_d = x_d.to(device)
-                        is_poisoned_dev = is_poisoned.to(device)
-                        y_d = labels_syn[idx].to(device)
-
-                        # Rebuild the genuinely-poisoned rows of x_t from raw pixels via
-                        # T_delta (differentiable); the honest fraction of this poisoned
-                        # client's local batch (is_poisoned == False) keeps the clean,
-                        # unmodified image + true label MTTDataset already returns for it.
-                        x_t_adv = x_t
-                        if is_poisoned.any():
-                            idx_poisoned = idx[is_poisoned].tolist()
-                            x_raw_adv = torch.stack(
-                                [raw_train_dataset[i][0] for i in idx_poisoned]
-                            ).to(device)
-                            x_trig = raw_to_trigger_preprocess(
-                                x_raw_adv, delta, dataset_flag=dataset_flag,
-                                model_flag=expert_model_flag,
-                            )
-                            x_t_adv = x_t.clone()
-                            # NOT detached (E2, point 2): x_t_adv now carries delta's gradient
-                            # into loss_e below -- this is the real-coupling change relative to
-                            # federated_generate_labels_trigger's x_trig.detach().
-                            x_t_adv[is_poisoned_dev] = x_trig
-
-                        # Expert (E2, point 1): differentiable w.r.t. BOTH expert_params AND
-                        # delta (via x_t_adv). p.grad is deliberately NEVER set on expert_params
-                        # anywhere in this module any more (E2, point 2a/2b): expert_params[i]
-                        # is a LEAF that also participates in grads_e's own create_graph=True
-                        # graph, so an early `.grad` assignment risks PyTorch's AccumulateGrad
-                        # mutating it in place the moment grand_loss.backward() runs later this
-                        # batch (see prelim/tests/test_joint_accumgrad_hazard.py) -- simply
-                        # never assigning it sidesteps the hazard rather than sequencing around
-                        # it. agg(expert_params, ...) below DOES set expert_params[i].grad as a
-                        # side effect, but only AFTER this point and harmlessly (see point 2a).
-                        expert_model.zero_grad()
-                        loss_e = clf_loss(expert_model(x_t_adv), y_t)
-                        grads_e = torch.autograd.grad(
-                            loss_e, expert_params, create_graph=True, retain_graph=True,
-                        )
-                        # E2, point 2a: this client's (differentiable, undetached) contribution
-                        # to the federated expert-gradient aggregate -- replaces the old
-                        # "last-poisoned-client-wins" grads_e_last.
-                        for i, g in enumerate(grads_e):
-                            expert_grad_buf[i].append(g)
-
-                        # Gradient-mismatch penalty (see run() docstring): the CLEAN subset of
-                        # this poisoned client's own local batch (is_poisoned == False rows,
-                        # untouched x_t/y_t) is itself a genuinely clean example source -- a
-                        # separate, independent forward/backward (not reused elsewhere), no
-                        # dependency on delta.
-                        if track_gradmatch:
-                            clean_mask = ~is_poisoned_dev
-                            if clean_mask.any():
-                                loss_clean_local = clf_loss(
-                                    expert_model(x_t[clean_mask]), y_t[clean_mask]
-                                )
-                                clean_grads_local = torch.autograd.grad(
-                                    loss_clean_local, expert_params, allow_unused=True,
-                                )
-                                for i, g in enumerate(clean_grads_local):
-                                    if g is not None:
-                                        clean_grad_chunks[i].append(g.detach())
-
-                        # Backdoor efficacy term: CE of the CURRENT expert on the
-                        # genuinely-triggered rows. Differentiated w.r.t. delta (isolated,
-                        # unscaled -- see below) exactly as in the indirect module (point 3): an
-                        # ADDITIONAL contribution to delta.grad, not a duplicate of the
-                        # param_loss path. When track_gradmatch, the SAME call also
-                        # differentiates w.r.t. expert_params (create_graph=True) -- this is
-                        # exactly grad(L_p)(theta_k)(delta) (see run() docstring): the mean
-                        # gradient of the classification loss over the genuinely-poisoned rows,
-                        # still carrying delta's live dependency via x_trig.
-                        if is_poisoned.any():
-                            logits_bd = expert_model(x_trig)
-                            L_bd_cid = clf_loss(logits_bd, y_t[is_poisoned_dev])
-                            grad_targets = [delta] + expert_params if track_gradmatch else [delta]
-                            # retain_graph=True (unlike the indirect module): x_trig's node is
-                            # shared with x_t_adv (which fed loss_e/grads_e, still needed by
-                            # grand_loss.backward() later this batch) -- freeing it here would
-                            # break that second, later backward through the same node.
-                            bd_grads = torch.autograd.grad(
-                                L_bd_cid, grad_targets,
-                                retain_graph=True, allow_unused=True,
-                                create_graph=track_gradmatch,
-                            )
-                            delta_grad_raw = bd_grads[0]
-                            if delta_grad_raw is not None:
-                                delta_grad = lambda_bd * delta_grad_raw.detach()
-                                delta.grad = (
-                                    delta_grad if delta.grad is None
-                                    else delta.grad + delta_grad
-                                )
+                            # Gradient-mismatch penalty (see run() docstring): the CLEAN subset of
+                            # this poisoned client's own local batch (is_poisoned == False rows,
+                            # untouched x_t/y_t) is itself a genuinely clean example source -- a
+                            # separate, independent forward/backward (not reused elsewhere), no
+                            # dependency on delta.
                             if track_gradmatch:
-                                for i, g in enumerate(bd_grads[1:]):
-                                    if g is not None:
-                                        poison_grad_chunks[i].append(g)
-                            L_bd_sum = L_bd_sum + L_bd_cid.detach()
-                            n_bd_valid += 1
+                                clean_mask = ~is_poisoned_dev
+                                if clean_mask.any():
+                                    loss_clean_local = clf_loss(
+                                        expert_model(x_t[clean_mask]), y_t[clean_mask]
+                                    )
+                                    clean_grads_local = torch.autograd.grad(
+                                        loss_clean_local, expert_params, allow_unused=True,
+                                    )
+                                    for i, g in enumerate(clean_grads_local):
+                                        if g is not None:
+                                            clean_grad_chunks[i].append(g.detach())
 
-                        # Student
-                        loss_s = clf_loss(student_model(x_d), softmax(y_d))
-                        grads_s = torch.autograd.grad(
-                            loss_s, student_params, create_graph=True
+                            # Backdoor efficacy term: CE of the CURRENT expert on the
+                            # genuinely-triggered rows. Differentiated w.r.t. delta (isolated,
+                            # unscaled -- see below) exactly as in the indirect module (point 3): an
+                            # ADDITIONAL contribution to delta.grad, not a duplicate of the
+                            # param_loss path. When track_gradmatch, the SAME call also
+                            # differentiates w.r.t. expert_params (create_graph=True) -- this is
+                            # exactly grad(L_p)(theta_k)(delta) (see run() docstring): the mean
+                            # gradient of the classification loss over the genuinely-poisoned rows,
+                            # still carrying delta's live dependency via x_trig.
+                            if is_poisoned.any():
+                                logits_bd = expert_model(x_trig)
+                                L_bd_cid = clf_loss(logits_bd, y_t[is_poisoned_dev])
+                                grad_targets = [delta] + expert_params if track_gradmatch else [delta]
+                                # retain_graph=True (unlike the indirect module): x_trig's node is
+                                # shared with x_t_adv (which fed loss_e/grads_e, still needed by
+                                # grand_loss.backward() later this batch) -- freeing it here would
+                                # break that second, later backward through the same node.
+                                bd_grads = torch.autograd.grad(
+                                    L_bd_cid, grad_targets,
+                                    retain_graph=True, allow_unused=True,
+                                    create_graph=track_gradmatch,
+                                )
+                                delta_grad_raw = bd_grads[0]
+                                if delta_grad_raw is not None:
+                                    # Scaled by 1/n_checkpoints_per_step (2026-09-02, see run()
+                                    # docstring "Averaging the loss over multiple checkpoints"):
+                                    # this manual accumulation bypasses grand_loss's own graph
+                                    # (point 3 above), so it does NOT automatically get averaged
+                                    # by grand_loss's mtt_term_avg/L_gradmatch_avg mean-over-k --
+                                    # this explicit division keeps it consistent with those
+                                    # (n_checkpoints_per_step==1 makes this a no-op, /1).
+                                    delta_grad = (
+                                        lambda_bd / n_checkpoints_per_step
+                                    ) * delta_grad_raw.detach()
+                                    delta.grad = (
+                                        delta_grad if delta.grad is None
+                                        else delta.grad + delta_grad
+                                    )
+                                if track_gradmatch:
+                                    for i, g in enumerate(bd_grads[1:]):
+                                        if g is not None:
+                                            poison_grad_chunks[i].append(g)
+                                L_bd_sum = L_bd_sum + L_bd_cid.detach()
+                                n_bd_valid += 1
+
+                            # Student
+                            loss_s = clf_loss(student_model(x_d), softmax(y_d))
+                            grads_s = torch.autograd.grad(
+                                loss_s, student_params, create_graph=True
+                            )
+
+                            for i, g in enumerate(grads_s):
+                                student_grad_buf[i].append(g)
+
+                    # Gradient-mismatch penalty for THIS checkpoint (see run() docstring):
+                    # means-of-contributing-chunks per expert_model parameter, then
+                    # flattened/combined into a single ratio. Falls back to 0.0 whenever
+                    # disabled, or whenever this batch happened to draw zero clean or zero
+                    # poisoned examples for some parameter (e.g. num_honests==0 and no poisoned
+                    # client's batch had any clean rows).
+                    if track_gradmatch and all(len(c) > 0 for c in clean_grad_chunks) and all(
+                        len(c) > 0 for c in poison_grad_chunks
+                    ):
+                        clean_grad_mean = [
+                            torch.stack(c, dim=0).mean(dim=0) for c in clean_grad_chunks
+                        ]
+                        poison_grad_mean = [
+                            torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks
+                        ]
+                        penalty_fn = (
+                            grad_cosine_penalty if gradmatch_metric == "cosine"
+                            else grad_mismatch_penalty
                         )
+                        L_gradmatch_k = penalty_fn(
+                            clean_grad_mean, poison_grad_mean, eps=gradmatch_eps,
+                        )
+                    else:
+                        L_gradmatch_k = torch.tensor(0.0, device=device)
 
-                        for i, g in enumerate(grads_s):
-                            student_grad_buf[i].append(g)
+                    # Aggregate student gradients (DIFFERENTIABLE)
+                    agg_student_grads = agg(
+                        student_params,
+                        student_grad_buf,
+                        agg_method,
+                        f=num_poisoned
+                    )
+                    # Aggregate expert gradients across ALL clients (DIFFERENTIABLE w.r.t. delta
+                    # through every poisoned client's contribution) -- E2, point 2a. Replaces the
+                    # old "last-poisoned-client-wins" grads_e_last. Sets expert_params[i].grad as
+                    # a side effect, harmlessly -- see point 2a in the docstring above.
+                    agg_expert_grads = agg(
+                        expert_params,
+                        expert_grad_buf,
+                        agg_method,
+                        f=num_poisoned
+                    )
+
+                    # MTT objective for THIS checkpoint, against the DIFFERENTIABLE
+                    # expert_next_param (E2, points 1/2a) instead of the real,
+                    # non-differentiable post-step expert_params -- there is no real expert
+                    # optimizer step in this module any more (point 2b).
+                    param_loss = torch.tensor(0.0, device=device)
+                    param_dist = torch.tensor(0.0, device=device)
+
+                    if attack in ["backdoor", "untargeted"]:
+                        for init_p, student, grad, grad_e, state in zip(
+                            expert_start,
+                            student_params,
+                            agg_student_grads,
+                            agg_expert_grads,
+                            state_dict["state"].values(),
+                        ):
+                            student_update = sgd_step(
+                                student, grad, state, state_dict["param_groups"][0]
+                            )
+                            # Independent copy of this parameter's optimizer state for the
+                            # expert-side differentiable step -- sgd_step only WRITES a
+                            # momentum_buffer back when one is not already present, so this call
+                            # can never perturb `state` (also read by the student's own sgd_step
+                            # call above). `init_p` (from expert_start, cloned before this
+                            # checkpoint's own cid loop) is BOTH the pre-update value sgd_step
+                            # steps from AND param_dist's baseline.
+                            state_expert_copy = {
+                                kk: (v.clone() if torch.is_tensor(v) else v)
+                                for kk, v in state.items()
+                            }
+                            expert_next_param = sgd_step(
+                                init_p, grad_e, state_expert_copy, state_dict["param_groups"][0]
+                            )
+
+                            param_loss += total_mse_distance(student_update, expert_next_param)
+                            param_dist += total_mse_distance(init_p, expert_next_param)
+
+                        mtt_term_k = param_loss / param_dist
+
+                    # Multi-checkpoint averaging (see run() docstring): collect this
+                    # checkpoint's own differentiable contributions (mtt_term_k, L_gradmatch_k)
+                    # for averaging OUTSIDE the k-loop -- reg_term/trigger-regularizers/
+                    # anti-collapse terms below do NOT depend on the checkpoint, so they are
+                    # computed/added exactly ONCE, after the k-loop, not per checkpoint.
+                    mtt_term_list.append(mtt_term_k)
+                    gradmatch_list.append(L_gradmatch_k)
+                    matching_term_list.append(
+                        (param_loss / param_dist).item() if param_dist.item() != 0 else 0.0
+                    )
+                    L_bd_mean_list.append(
+                        (L_bd_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
+                    )
 
                 # Step 5 instrumentation: snapshot of delta.grad from JUST the L_bd path
-                # (accumulated across the cid loop above, point 3), taken BEFORE grand_loss.
-                # backward() adds the MTT/param_loss-path contribution on top -- lets
-                # mtt_delta_grad_norm below isolate each path's magnitude without a separate
-                # lambda_bd=0 run.
+                # (accumulated across ALL n_checkpoints_per_step checkpoints' cid loops above,
+                # point 3, each already scaled by 1/n_checkpoints_per_step -- see that scaling's
+                # own comment), taken BEFORE grand_loss.backward() adds the MTT/param_loss-path
+                # contribution on top -- lets mtt_delta_grad_norm below isolate each path's
+                # magnitude without a separate lambda_bd=0 run.
                 L_bd_only_delta_grad = (
                     delta.grad.detach().clone() if delta.grad is not None
                     else torch.zeros_like(delta)
                 )
 
-                # Gradient-mismatch penalty (see run() docstring): means-of-contributing-chunks
-                # per expert_model parameter, then flattened/combined into a single ratio.
-                # Falls back to 0.0 (no-op on grand_loss) whenever disabled, or whenever this
-                # batch happened to draw zero clean or zero poisoned examples for some parameter
-                # (e.g. num_honests==0 and no poisoned client's batch had any clean rows).
-                if track_gradmatch and all(len(c) > 0 for c in clean_grad_chunks) and all(
-                    len(c) > 0 for c in poison_grad_chunks
-                ):
-                    clean_grad_mean = [
-                        torch.stack(c, dim=0).mean(dim=0) for c in clean_grad_chunks
-                    ]
-                    poison_grad_mean = [
-                        torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks
-                    ]
-                    penalty_fn = (
-                        grad_cosine_penalty if gradmatch_metric == "cosine"
-                        else grad_mismatch_penalty
-                    )
-                    L_gradmatch = penalty_fn(
-                        clean_grad_mean, poison_grad_mean, eps=gradmatch_eps,
-                    )
-                else:
-                    L_gradmatch = torch.tensor(0.0, device=device)
-
-                # Aggregate student gradients (DIFFERENTIABLE)
-                agg_student_grads = agg(
-                    student_params,
-                    student_grad_buf,
-                    agg_method,
-                    f=num_poisoned
-                )
-                # Aggregate expert gradients across ALL clients (DIFFERENTIABLE w.r.t. delta
-                # through every poisoned client's contribution) -- E2, point 2a. Replaces the
-                # old "last-poisoned-client-wins" grads_e_last. Sets expert_params[i].grad as a
-                # side effect, harmlessly -- see point 2a in the docstring above.
-                agg_expert_grads = agg(
-                    expert_params,
-                    expert_grad_buf,
-                    agg_method,
-                    f=num_poisoned
-                )
-
-                # MTT objective, against the DIFFERENTIABLE expert_next_param (E2, points 1/2a)
-                # instead of the real, non-differentiable post-step expert_params -- there is no
-                # real expert optimizer step in this module any more (point 2b).
-                param_loss = torch.tensor(0.0, device=device)
-                param_dist = torch.tensor(0.0, device=device)
-
+                # reg_term depends only on labels_syn (not on any checkpoint) -- computed once.
                 reg_term = lam * torch.linalg.vector_norm(
                     softmax(labels_syn) - labels_init,
                     ord=1,
                     dim=1
                 ).mean()
 
-                if attack in ["backdoor", "untargeted"]:
-                    for init_p, student, grad, grad_e, state in zip(
-                        expert_start,
-                        student_params,
-                        agg_student_grads,
-                        agg_expert_grads,
-                        state_dict["state"].values(),
-                    ):
-                        student_update = sgd_step(
-                            student, grad, state, state_dict["param_groups"][0]
-                        )
-                        # Independent copy of this parameter's optimizer state for the
-                        # expert-side differentiable step -- sgd_step only WRITES a
-                        # momentum_buffer back when one is not already present, so this call
-                        # can never perturb `state` (also read by the student's own sgd_step
-                        # call above). `init_p` (from expert_start, cloned before this batch's
-                        # cid loop) is BOTH the pre-update value sgd_step steps from AND
-                        # param_dist's baseline.
-                        state_expert_copy = {
-                            k: (v.clone() if torch.is_tensor(v) else v)
-                            for k, v in state.items()
-                        }
-                        expert_next_param = sgd_step(
-                            init_p, grad_e, state_expert_copy, state_dict["param_groups"][0]
-                        )
+                # Multi-checkpoint averaging (see run() docstring): mean over the
+                # n_checkpoints_per_step checkpoints' own mtt_term_k/L_gradmatch_k --
+                # n_checkpoints_per_step==1 makes this exactly the single value it always was
+                # (mean of one element), so grand_loss is bit-for-bit unchanged in that case.
+                mtt_term_avg = torch.stack(mtt_term_list).mean()
+                L_gradmatch_avg = torch.stack(gradmatch_list).mean()
 
-                        param_loss += total_mse_distance(student_update, expert_next_param)
-                        param_dist += total_mse_distance(init_p, expert_next_param)
-
-                    grand_loss = (param_loss / param_dist) + reg_term
-                    grand_loss = gamma_stealth * grand_loss
+                grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
                 # Trigger regularizers (optional, default 0) -- same terms/names as
                 # federated_optimizing_trigger_policy, reused unchanged. L_pen/kappa is the
                 # STEALTH ceiling on cos(delta, mu_target-mu_source) (trigger_penalty_hinge,
                 # shared/unmodified file) -- unrelated to the anti-collapse floor below.
+                # Checkpoint-independent -- computed/added exactly ONCE.
                 L_pen = trigger_penalty_hinge(delta, mu, mu_source, kappa)
                 L_tv = tv_loss(delta)
                 grand_loss = grand_loss + (
@@ -949,12 +1102,13 @@ def run(experiment_name, module_name, **kwargs):
                 # only ADDED to grand_loss under trigger_constraint=="penalty" -- under
                 # "projection" they are enforced as hard constraints after optimizer_delta.step()
                 # instead (see below), and adding them here too would double-enforce them.
+                # Checkpoint-independent -- computed/added exactly ONCE.
                 L_align, _ = directional_floor_penalty(delta, mu, align_kappa)
                 L_mag, _ = magnitude_floor_penalty(delta, delta_min)
                 if trigger_constraint == "penalty":
                     grand_loss = grand_loss + (lambda_align * L_align + lambda_mag * L_mag)
 
-                grand_loss = grand_loss + lambda_gradmatch * L_gradmatch
+                grand_loss = grand_loss + lambda_gradmatch * L_gradmatch_avg
 
                 # Optimize labels and trigger. delta.grad already holds the per-client L_bd
                 # contributions accumulated above (point 3) -- grand_loss.backward() ADDS the
@@ -990,16 +1144,21 @@ def run(experiment_name, module_name, **kwargs):
                     else:
                         delta.clamp_(-epsilon, epsilon)
 
-                # No real expert optimizer step any more (E2, point 2b) -- expert_model is
-                # reloaded fresh from disk at the top of the NEXT batch regardless, and nothing
-                # in THIS batch reads expert_params[i].grad past this point. .eval() is kept for
-                # continuity with the prior behavior (expert_model spends most of its life in
-                # eval mode, e.g. for BatchNorm running-stats use) even though it no longer
+                # No real expert optimizer step any more (E2, point 2b) -- every
+                # expert_models[k] is reloaded fresh from disk (or the pool) at the top of the
+                # NEXT batch's k-loop regardless, and nothing in THIS batch reads
+                # expert_params[i].grad past this point. .eval() is kept on each of the K models
+                # for continuity with the prior behavior (expert_model spends most of its life
+                # in eval mode, e.g. for BatchNorm running-stats use) even though it no longer
                 # follows a real .step() call.
-                expert_model.eval()
+                for m in expert_models:
+                    m.eval()
 
-                L_bd_mean = (L_bd_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
-                matching_term = (param_loss / param_dist).item() if param_dist.item() != 0 else 0.0
+                # Multi-checkpoint averaging (see run() docstring): mean of the
+                # n_checkpoints_per_step per-checkpoint values collected during the k-loop above
+                # -- n_checkpoints_per_step==1 makes this exactly the single value it always was.
+                L_bd_mean = float(np.mean(L_bd_mean_list))
+                matching_term = float(np.mean(matching_term_list))
 
                 # Anti-collapse instrumentation (§2): recomputed AFTER the step and the
                 # clamp_/projection, on the delta the NEXT batch will actually start from --
@@ -1034,25 +1193,33 @@ def run(experiment_name, module_name, **kwargs):
 
                     # expert_asr / expert_asr_frozen (Step 3 fix): evaluated on the FIXED
                     # source-class set (asr_eval_raw, built once before the loop) instead of
-                    # whichever small poisoned-row subset landed in this batch -- current
-                    # expert_model (this batch's checkpoint, in eval mode) triggered with the
-                    # CURRENT delta vs. the frozen delta_init, same rows both times.
+                    # whichever small poisoned-row subset landed in this batch -- each of the K
+                    # expert_models[k] (this batch's checkpoints, in eval mode, weights
+                    # UNCHANGED since the k-loop populated them -- nothing between there and here
+                    # mutates a model's own parameters, only delta/labels_syn) triggered with
+                    # the CURRENT delta vs. the frozen delta_init, same rows both times, then
+                    # averaged across the K checkpoints (see run() docstring "Averaging the loss
+                    # over multiple checkpoints") -- n_checkpoints_per_step==1 makes this exactly
+                    # the single value it always was.
                     x_trig_eval = raw_to_trigger_preprocess(
                         asr_eval_raw, delta, dataset_flag=dataset_flag,
                         model_flag=expert_model_flag,
-                    )
-                    asr_mean = (
-                        (expert_model(x_trig_eval).argmax(dim=1) == target_label)
-                        .float().mean().item()
                     )
                     x_trig_eval_frozen = raw_to_trigger_preprocess(
                         asr_eval_raw, delta_init, dataset_flag=dataset_flag,
                         model_flag=expert_model_flag,
                     )
-                    asr_frozen_mean = (
-                        (expert_model(x_trig_eval_frozen).argmax(dim=1) == target_label)
+                    asr_mean_list = [
+                        (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item()
+                        for m in expert_models
+                    ]
+                    asr_frozen_mean_list = [
+                        (m(x_trig_eval_frozen).argmax(dim=1) == target_label)
                         .float().mean().item()
-                    )
+                        for m in expert_models
+                    ]
+                    asr_mean = float(np.mean(asr_mean_list))
+                    asr_frozen_mean = float(np.mean(asr_frozen_mean_list))
 
                 align_active_window.append(L_align_post > 0)
                 mag_active_window.append(L_mag_post > 0)
@@ -1084,7 +1251,16 @@ def run(experiment_name, module_name, **kwargs):
                         "mag_active_rate": mag_active_rate,
                         "reg_term": reg_term.item(),
                         "mtt_delta_grad_norm": mtt_delta_grad_norm,
-                        "L_gradmatch": L_gradmatch.item(),
+                        "L_gradmatch": L_gradmatch_avg.item(),
+                        # Multi-checkpoint spread diagnostics (see run() docstring "Averaging
+                        # the loss over multiple checkpoints"): std across the
+                        # n_checkpoints_per_step checkpoints used THIS step -- 0.0 by
+                        # construction when n_checkpoints_per_step==1. A persistently large
+                        # spread means the checkpoints disagree a lot on this step's matching
+                        # term / ASR, worth knowing alongside the mean.
+                        "matching_term_std": float(np.std(matching_term_list)),
+                        "L_bd_mean_std": float(np.std(L_bd_mean_list)),
+                        "expert_asr_std": float(np.std(asr_mean_list)),
                     })
                 tracker.log(
                     it,
@@ -1097,7 +1273,7 @@ def run(experiment_name, module_name, **kwargs):
                     L_align=L_align_post,
                     L_mag=L_mag_post,
                     mtt_delta_grad_norm=mtt_delta_grad_norm,
-                    L_gradmatch=L_gradmatch.item(),
+                    L_gradmatch=L_gradmatch_avg.item(),
                 )
 
                 pbar.update(batch_size)
@@ -1116,7 +1292,7 @@ def run(experiment_name, module_name, **kwargs):
                     align_rate=f"{align_active_rate:.2f}",
                     mag_rate=f"{mag_active_rate:.2f}",
                     mtt_grad=f"{mtt_delta_grad_norm:.4g}",
-                    gradmatch=f"{L_gradmatch.item():.4g}",
+                    gradmatch=f"{L_gradmatch_avg.item():.4g}",
                 )
 
     # Save results
