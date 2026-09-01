@@ -1,20 +1,31 @@
 """
-gradmatch_metric comparison generator for federated_generate_labels_trigger_joint.
+Trigger-init comparison generator for federated_generate_labels_trigger_joint.
 
-Purpose: isolate the effect of L_gradmatch's distance choice (see run_module.py's run()
-docstring, "Gradient-mismatch penalty") -- "relerr" (the original relative-squared-error ratio)
-vs "cosine" (1 - cos(.,.), scale-invariant) -- in the 1-poisoned/0-honest proof-of-concept
-regime, at the SAME full budget sweep as the main campaign (gen_configs.py's BUDGETS), against
-"mean" aggregation only (the only aggregator that means anything with a single worker total).
-A SEPARATE file from gen_configs.py on purpose, so the real (3-poisoned/7-honest) campaign's
-axes/behavior there are left untouched -- this script only READS gen_configs.py (templates,
-write_config, validate_config, check_delta_min_feasible, and every regularization/optimization
-constant EXCEPT the ones this comparison explicitly varies).
+Purpose: isolate the effect of the trigger's initialization (see init_delta,
+modules/federated_optimizing_trigger/utils.py) -- "stripe" (the module's original default: a
+deterministic sinusoidal pattern) vs "random" (strength * torch.rand(mu_shape), drawn from
+torch's GLOBAL RNG -- NOT reproducible across runs/processes unless torch itself is seeded
+beforehand) -- in the 1-poisoned/0-honest proof-of-concept regime, at the SAME full budget
+sweep as the main campaign (gen_configs.py's BUDGETS), against "mean" aggregation only (the
+only aggregator that means anything with a single worker total). A SEPARATE file from
+gen_configs.py on purpose, so the real (3-poisoned/7-honest) campaign's axes/behavior there are
+left untouched -- this script only READS gen_configs.py (templates, write_config,
+validate_config, check_delta_min_feasible, and every regularization/optimization constant
+EXCEPT the one this comparison explicitly varies). Structurally identical to
+gen_configs_gradmatch_metric.py (its own sibling comparison, over gradmatch_metric instead of
+init) -- kept deliberately so, to be easy to diff/compare.
 
-Two cells (one per gradmatch_metric value), sharing every other hyperparameter -- including
-LAMBDA_GRADMATCH=1.0 (gen_configs.py's own value: the term is ACTIVE in both cells, only the
-distance it measures differs) -- so any CTA/ASR/L_gradmatch difference between the two cells is
-attributable to gradmatch_metric alone, not a confounded hyperparameter change.
+Two cells (one per init value), sharing every other hyperparameter, so any CTA/ASR difference
+between the two cells is attributable to init alone, not a confounded hyperparameter change.
+gradmatch_metric is left at gen_configs.py's own default ("relerr") in both cells -- this
+comparison is orthogonal to that one.
+
+NOTE (feasibility check, see gen_configs.py's check_delta_min_feasible docstring): for
+init="random", delta_min = delta_min_frac * ||delta_init||_2 is computed against a torch-seeded
+(seed=0, locally forked) draw for a STABLE printed pre-check number -- the actual training
+run's own delta_init draw is unseeded (global RNG) and will differ slightly in exact value,
+though a uniform random vector's norm concentrates tightly around its expectation for this
+trigger shape (numel~3000), so the feasibility verdict itself is a stable proxy in practice.
 """
 import argparse
 from pathlib import Path
@@ -33,6 +44,7 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     EXPERT_RETRAIN_INTERVAL,
     GAMMA_STEALTH,
     GRADMATCH_EPS,
+    GRADMATCH_METRIC,
     JOINT_TRIGGER_TEMPLATE,
     LAMBDA_ALIGN,
     LAMBDA_BD,
@@ -75,39 +87,40 @@ SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 
 # The axis this comparison varies -- see module docstring.
-GRADMATCH_METRICS = ["relerr", "cosine"]
+INITS = ["stripe", "random"]
 
 EXP_BASE = Path(
-    "experiments/federated_experiments/threat_model_direct_trigger_joint_gradmatch_metric"
+    "experiments/federated_experiments/threat_model_direct_trigger_joint_init_compare"
 ).resolve()
 
-MODULE_NAME = "federated_generate_labels_trigger_joint_gradmatch_metric"
+MODULE_NAME = "federated_generate_labels_trigger_joint_init_compare"
 
 
-def cell_name(metric, seed):
-    return f"{MODEL_FLAG}/{DATASET}/{NUM_POISONED}vs{NUM_HONESTS}/{AGG_METHOD}/{metric}/seed{seed}"
+def cell_name(init, seed):
+    return f"{MODEL_FLAG}/{DATASET}/{NUM_POISONED}vs{NUM_HONESTS}/{AGG_METHOD}/{init}/seed{seed}"
 
 
-def generate_cell(metric, seed, budgets, dry_run=False):
+def generate_cell(init, seed, budgets, dry_run=False):
     feasible, delta_min, max_reachable = check_delta_min_feasible(
-        DATASET, EPSILON, DELTA_MIN_FRAC,
+        DATASET, EPSILON, DELTA_MIN_FRAC, init=init,
     )
     if not feasible:
         reason = (
             f"delta_min_frac={DELTA_MIN_FRAC} -> delta_min={delta_min:.4f} > "
-            f"epsilon*sqrt(numel)={max_reachable:.4f} at epsilon={EPSILON} -- structurally "
-            "unreachable post-clamp; refusing to generate this cell."
+            f"epsilon*sqrt(numel)={max_reachable:.4f} at epsilon={EPSILON}, init={init!r} -- "
+            "structurally unreachable post-clamp; refusing to generate this cell."
         )
-        print(f"REFUSED [{metric} seed{seed}]: {reason}")
+        print(f"REFUSED [{init} seed{seed}]: {reason}")
         return [], reason
 
     lr = LEARNING_RATE.get(MODEL_FLAG, 0.1)
     wd = WEIGHT_DECAY.get(MODEL_FLAG, 2e-4)
     milestones = MILESTONE.get(MODEL_FLAG, [75, 125])
 
-    cell_dir = EXP_BASE / cell_name(metric, seed)
-    # Shared across both metric cells of this seed (gradmatch_metric doesn't affect expert
-    # training at all) -- one train_expert per seed for the whole comparison, not per cell.
+    cell_dir = EXP_BASE / cell_name(init, seed)
+    # Shared across both init cells of this seed (init doesn't affect expert training at all --
+    # only the LABEL-generation step's own trigger optimization) -- one train_expert per seed
+    # for the whole comparison, not per cell.
     train_expert_dir = EXP_BASE / f"train_expert/{MODEL_FLAG}_1xs/seed{seed}"
     module_dir = cell_dir / "gen_labels_trigger_joint"
     flips_dir = cell_dir / "select_flips"
@@ -145,7 +158,7 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             lambda_delta=LAMBDA_DELTA,
             lambda_gradmatch=LAMBDA_GRADMATCH,
             gradmatch_eps=GRADMATCH_EPS,
-            gradmatch_metric=metric,
+            gradmatch_metric=GRADMATCH_METRIC,
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -159,12 +172,7 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             lambda_align=LAMBDA_ALIGN,
             lambda_mag=LAMBDA_MAG,
             delta_min_frac=DELTA_MIN_FRAC,
-            # init (added to gen_configs.py after this comparison script was written,
-            # schema-optional, "stripe" is the module's own original default): pinned to
-            # "stripe" here so gradmatch_metric stays the only axis varying between this
-            # script's two cells -- the stripe-vs-random comparison lives in
-            # gen_configs_init_compare.py instead.
-            init="stripe",
+            init=init,
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
@@ -173,7 +181,7 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             milestones=milestones,
             wandb_block_module=wandb_block(
                 "federated_generate_labels_trigger_joint",
-                f"{MODULE_NAME}/{metric}/seed{seed}",
+                f"{MODULE_NAME}/{init}/seed{seed}",
                 enabled=WANDB_ENABLED, project=WANDB_PROJECT,
                 mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
             ),
@@ -204,7 +212,7 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             milestones=milestones,
             wandb_block_train_user=wandb_block(
                 "federated_train_user",
-                f"train_user/{MODEL_FLAG}/{DATASET}/{metric}/{budget}/seed{seed}",
+                f"train_user/{MODEL_FLAG}/{DATASET}/{init}/{budget}/seed{seed}",
                 enabled=WANDB_ENABLED, project=WANDB_PROJECT,
                 mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
             ),
@@ -228,11 +236,11 @@ def generate_cell(metric, seed, budgets, dry_run=False):
 def generate_all_configs(dry_run=False):
     all_paths, refused = [], []
     for seed in SEEDS:
-        for metric in GRADMATCH_METRICS:
-            paths, reason = generate_cell(metric, seed, BUDGETS, dry_run=dry_run)
+        for init in INITS:
+            paths, reason = generate_cell(init, seed, BUDGETS, dry_run=dry_run)
             all_paths += paths
             if reason:
-                refused.append((metric, seed, reason))
+                refused.append((init, seed, reason))
     return all_paths, refused
 
 
@@ -245,18 +253,18 @@ if __name__ == "__main__":
 
     if args.dry_run:
         print(
-            f"\n[DRY RUN] {MODULE_NAME}: {len(GRADMATCH_METRICS)} metric(s) x {len(SEEDS)} "
+            f"\n[DRY RUN] {MODULE_NAME}: {len(INITS)} init(s) x {len(SEEDS)} "
             f"seed(s), {len(paths)} config files would be written."
         )
         for p in paths:
             print(f"  {p}")
     else:
         print(
-            f"\n{MODULE_NAME}: {len(GRADMATCH_METRICS)} metric(s) x {len(SEEDS)} seed(s), "
+            f"\n{MODULE_NAME}: {len(INITS)} init(s) x {len(SEEDS)} seed(s), "
             f"{len(paths)} config files written and schema-validated."
         )
 
     if refused:
         print(f"\n{len(refused)} cell(s) REFUSED (delta_min infeasible):")
-        for metric, seed, reason in refused:
-            print(f"  [{metric} seed{seed}] {reason}")
+        for init, seed, reason in refused:
+            print(f"  [{init} seed{seed}] {reason}")

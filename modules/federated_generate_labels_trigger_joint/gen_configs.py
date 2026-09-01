@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 
 import toml
+import torch
 
 from modules.federated_optimizing_trigger.utils import init_delta
 from modules.base_utils.gen_configs import wandb_block
@@ -164,6 +165,15 @@ LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reaso
 # DELTA_MIN_FRAC, or the init constants (_STRENGTH/_FREQ) change again.
 DELTA_MIN_FRAC = 0.01
 
+# Trigger initialization (2026-09-01): init_delta (modules/federated_optimizing_trigger/utils.py)
+# supports "stripe" (sinusoidal, deterministic -- this campaign's own prior default, now made
+# explicit) and "random" (uniform torch.rand(mu_shape)*strength, drawn from the GLOBAL torch RNG
+# -- unseeded here, so it varies run to run unless the caller seeds torch itself beforehand).
+# "stripe" kept as this campaign's default so its results stay unchanged by exposing this knob --
+# the stripe-vs-random comparison itself lives in the dedicated gen_configs_init_compare.py
+# (mirrors gen_configs_gradmatch_metric.py's pattern).
+INIT = "stripe"
+
 # Gradient-mismatch penalty (2026-08-31, see run_module.py's run() docstring): new term being
 # validated by THIS campaign -- ||grad(L_c)(theta_k) - grad(L_p)(theta_k)(delta)||^2 /
 # ||grad(L_c)(theta_k)||^2, added to grand_loss with weight LAMBDA_GRADMATCH. 0.0 is a full
@@ -198,7 +208,7 @@ _STRENGTH, _FREQ = 6.0, 16  # must match init_delta's call in run_module.py exac
 
 
 
-def check_delta_min_feasible(dataset, epsilon, delta_min_frac):
+def check_delta_min_feasible(dataset, epsilon, delta_min_frac, init="stripe"):
     """
     docs/threat_models_audit.md's delta_min-unreachable bug, checked BEFORE generating a
     config: delta_min = delta_min_frac * ||delta_init||_2 (computed pre-clamp, strength=6.0,
@@ -206,6 +216,17 @@ def check_delta_min_feasible(dataset, epsilon, delta_min_frac):
     epsilon*sqrt(numel), the max ||delta||_2 reachable once delta IS clamped to
     [-epsilon,epsilon] post-init. Returns (feasible: bool, delta_min: float, max_reachable:
     float) -- never raises itself, callers decide whether to refuse.
+
+    `init` (2026-09-01): passed straight to init_delta, same as run_module.py's own call --
+    "stripe" is deterministic, but "random" draws from torch's GLOBAL RNG (see init_delta),
+    so ||delta_init||_2 would otherwise differ on every call/process. Seeded locally here (via
+    torch.random.fork_rng, which restores whatever the global RNG state was before returning --
+    no side effect on any OTHER randomness this script uses, e.g. checkpoint sampling) purely to
+    make this PRE-CHECK's printed delta_min/max_reachable numbers reproducible across
+    --dry-run/real invocations; the actual run's own (unseeded) delta_init draw will differ
+    slightly, but a uniform random vector's norm concentrates tightly around its expectation for
+    a shape this size (numel~3000), so the feasibility verdict itself is a stable proxy in
+    practice.
     """
     if dataset not in _TRIGGER_SHAPE:
         raise ValueError(
@@ -213,14 +234,16 @@ def check_delta_min_feasible(dataset, epsilon, delta_min_frac):
             f"add it to _TRIGGER_SHAPE (only {list(_TRIGGER_SHAPE)} are supported)."
         )
     shape = _TRIGGER_SHAPE[dataset]
-    delta_init = init_delta(
-        shape,
-        horizontal=True,
-        strength=_STRENGTH,
-        freq=_FREQ,
-        device="cpu",
-        init="stripe",
-    )
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        delta_init = init_delta(
+            shape,
+            horizontal=True,
+            strength=_STRENGTH,
+            freq=_FREQ,
+            device="cpu",
+            init=init,
+        )
     delta_min = delta_min_frac * delta_init.detach().norm().item()
     numel = shape[0] * shape[1] * shape[2]
     max_reachable = epsilon * math.sqrt(numel)
@@ -267,6 +290,8 @@ attack = "backdoor"
 gamma_stealth = {gamma_stealth}
 checkpoint_sampling = "{checkpoint_sampling}"
 alpha_ckpt = {alpha_ckpt}
+
+init = "{init}"
 
 trigger_constraint = "{trigger_constraint}"
 align_kappa = {align_kappa}
@@ -325,9 +350,11 @@ def cell_name(model_flag, dataset, agg_method, seed):
 
 
 def generate_cell(
-    model_flag, dataset, agg_method, seed, budgets, dry_run=False, delta_min_frac=None
+    model_flag, dataset, agg_method, seed, budgets, dry_run=False, delta_min_frac=None,
+    init=None,
 ):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
+    init = INIT if init is None else init
 
     if CHECKPOINT_SAMPLING != INDIRECT_MODULE_CHECKPOINT_SAMPLING:
         print(
@@ -341,6 +368,7 @@ def generate_cell(
         dataset,
         EPSILON,
         delta_min_frac,
+        init=init,
     )
     if not feasible:
         reason = (
@@ -411,6 +439,7 @@ def generate_cell(
             lambda_align=LAMBDA_ALIGN,
             lambda_mag=LAMBDA_MAG,
             delta_min_frac=delta_min_frac,
+            init=init,
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,

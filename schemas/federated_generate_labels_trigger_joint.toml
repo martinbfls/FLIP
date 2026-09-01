@@ -61,7 +61,7 @@ agg_method = "str: aggregation method for the (differentiable) student gradient 
 attack = "str: attack performed."
 gamma_stealth = "float: [0, 1]. Scalar stealth/backdoor loss weight multiplying grand_loss. UNRELATED to federated_optimizing_trigger_policy's gamma = num_poisoned/(num_poisoned+num_honests) -- disjoint concept, same name previously (see docs/threat_models_audit.md). Defaults to 1.0."
 gamma = "[DEPRECATED] float: [0, 1]. Old name for gamma_stealth -- still accepted (with a DeprecationWarning) so existing configs keep working. Mutually exclusive with gamma_stealth. Prefer gamma_stealth."
-init = "str. Trigger initialization. Defaults to 'stripe' (sinusoidal)."
+init = "str: {stripe, random}. Trigger initialization (init_delta, modules/federated_optimizing_trigger/utils.py). 'stripe' (default): deterministic sinusoidal pattern (uses freq/horizontal). 'random': strength * torch.rand(mu_shape) -- drawn from torch's GLOBAL RNG, so it is NOT reproducible across runs/processes unless the caller seeds torch itself beforehand; ignores freq/horizontal."
 lambda_penalty = "float: [0, +infty). Weight for the hinge trigger penalty relative to mu. Defaults to 0.0."
 lambda_delta = "float: [0, +infty). Weight for L2 norm penalty on delta. Defaults to 0.0."
 lambda_tv = "float: [0, +infty). Weight for total-variation penalty on delta. Defaults to 0.0."

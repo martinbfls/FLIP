@@ -213,6 +213,12 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             lambda_align=params["lambda_align"],
             lambda_mag=params["lambda_mag"],
             delta_min_frac=params["delta_min_frac"],
+            # init (added to gen_configs.py after this sweep script was written,
+            # schema-optional, "stripe" is the module's own original default): pinned to
+            # "stripe" here so this OFAT hyperparameter search's own axes stay the only thing
+            # varying between cells -- the stripe-vs-random comparison lives in
+            # gen_configs_init_compare.py instead.
+            init="stripe",
             # expert_retrain_* is a gen_configs.py feature added after this sweep script was
             # written (schema-optional, 0 = disabled); pinned to disabled here so this
             # exploratory HP sweep's frozen-trajectory behavior is unchanged by its addition.
