@@ -25,6 +25,7 @@ Two guardrails specific to this module (docs/policy_module_audit_report.md, Bloc
 import argparse
 import math
 import os
+import random
 from pathlib import Path
 
 import toml
@@ -36,6 +37,37 @@ from modules.base_utils.config_validation import (
     write_config,
     validate_config_file as validate_config,
 )
+
+# Actual RNG seed, drawn at CONFIG-GENERATION time (2026-09-02) -- distinct from the `seed`
+# loop variable used everywhere else in this file for CELL/PATH naming ("seed0", "seed1", ...,
+# unchanged, still a literal path-naming convention). THIS is the real value written into
+# train_expert's and this module's own `seed` TOML field (see schemas/train_expert.toml and
+# schemas/federated_generate_labels_trigger_joint.toml's own `seed` docs) -- what
+# torch.manual_seed/np.random.seed/random.seed actually get called with.
+#
+# draw_rng_seed(model_flag, path_seed) caches its draw per (model_flag, path_seed) pair for the
+# remainder of THIS PROCESS's run: every cell that shares the same underlying train_expert
+# checkpoint (e.g. every agg_method/tag/metric/init for a fixed path_seed) must write the SAME
+# actual seed into its own config, or expert_retrain_interval's seed-matching (see
+# run_module.py's run() docstring, "seed") silently breaks for whichever cell drew a
+# DIFFERENT value than the train_expert config it actually depends on. Shared across every
+# gen_configs*.py generator in this module (they all import this function) rather than
+# reimplemented per file, since the correctness requirement is identical everywhere.
+#
+# CAVEAT: re-running a generator in a NEW process draws fresh random values. If train_expert
+# checkpoints already exist on disk from a PRIOR generation's seed, regenerating configs later
+# (e.g. to add a budget) will desync the newly-written `seed` field from how those checkpoints
+# were actually produced -- re-train them, or keep the old configs, if that desync matters for
+# your comparison.
+_RNG_SEED_CACHE = {}
+
+
+def draw_rng_seed(model_flag, path_seed):
+    key = (model_flag, path_seed)
+    if key not in _RNG_SEED_CACHE:
+        _RNG_SEED_CACHE[key] = random.randint(0, 2**31 - 1)
+    return _RNG_SEED_CACHE[key]
+
 
 # Weights & Biases mirroring (see modules/base_utils/experiment_tracker.py). Off by
 # default -- flip WANDB_ENABLED to True to have every config in this campaign carry a
@@ -262,7 +294,7 @@ checkpoint_iters = {checkpoint_iters}
 epochs = {epochs}
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-seed = {seed}
+seed = {rng_seed}
 {wandb_block_train_expert}"""
 
 JOINT_TRIGGER_TEMPLATE = """[federated_generate_labels_trigger_joint]
@@ -305,7 +337,7 @@ expert_retrain_epochs = {expert_retrain_epochs}
 expert_retrain_checkpoint_iters = {expert_retrain_checkpoint_iters}
 expert_retrain_optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
-seed = {seed}
+seed = {rng_seed}
 {wandb_block_module}
 [federated_generate_labels_trigger_joint.expert_config]
 experts = 1
@@ -385,6 +417,10 @@ def generate_cell(
     lr = LEARNING_RATE.get(model_flag, 0.1)
     wd = WEIGHT_DECAY.get(model_flag, 2e-4)
     milestones = MILESTONE.get(model_flag, [75, 125])
+    # Real RNG seed (see draw_rng_seed's own docstring above) -- cached per (model_flag, seed)
+    # so both configs below (and any other agg_method sharing this same train_expert cell) get
+    # the SAME actual value, required for expert_retrain_interval's seed-matching to be correct.
+    rng_seed = draw_rng_seed(model_flag, seed)
 
     cell_dir = EXP_BASE / cell_name(model_flag, dataset, agg_method, seed)
     # One train_expert per seed (not shared/deduped across seeds): a real proof-of-concept
@@ -400,6 +436,7 @@ def generate_cell(
             model_flag=model_flag,
             dataset=dataset,
             seed=seed,
+            rng_seed=rng_seed,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
             checkpoint_iters=CHECKPOINT_ITERS,
@@ -418,6 +455,7 @@ def generate_cell(
             model_flag=model_flag,
             dataset=dataset,
             seed=seed,
+            rng_seed=rng_seed,
             cell_dir=module_dir,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,

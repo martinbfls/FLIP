@@ -68,6 +68,7 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     WANDB_PROJECT,
     WEIGHT_DECAY,
     check_delta_min_feasible,
+    draw_rng_seed,
     validate_config,
     wandb_block,
     write_config,
@@ -116,6 +117,10 @@ def generate_cell(init, seed, budgets, dry_run=False):
     lr = LEARNING_RATE.get(MODEL_FLAG, 0.1)
     wd = WEIGHT_DECAY.get(MODEL_FLAG, 2e-4)
     milestones = MILESTONE.get(MODEL_FLAG, [75, 125])
+    # Real RNG seed (see gen_configs.py's draw_rng_seed docstring) -- cached per
+    # (MODEL_FLAG, seed) so both init cells sharing this same train_expert cell (see
+    # train_expert_dir below) get the SAME actual value.
+    rng_seed = draw_rng_seed(MODEL_FLAG, seed)
 
     cell_dir = EXP_BASE / cell_name(init, seed)
     # Shared across both init cells of this seed (init doesn't affect expert training at all --
@@ -131,6 +136,7 @@ def generate_cell(init, seed, budgets, dry_run=False):
             model_flag=MODEL_FLAG,
             dataset=DATASET,
             seed=seed,
+            rng_seed=rng_seed,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
             checkpoint_iters=CHECKPOINT_ITERS,
@@ -149,6 +155,7 @@ def generate_cell(init, seed, budgets, dry_run=False):
             model_flag=MODEL_FLAG,
             dataset=DATASET,
             seed=seed,
+            rng_seed=rng_seed,
             cell_dir=module_dir,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
