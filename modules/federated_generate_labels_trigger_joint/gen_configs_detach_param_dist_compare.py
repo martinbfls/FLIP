@@ -1,31 +1,25 @@
 """
-Trigger-init comparison generator for federated_generate_labels_trigger_joint.
+detach_param_dist comparison generator for federated_generate_labels_trigger_joint.
 
-Purpose: isolate the effect of the trigger's initialization (see init_delta,
-modules/federated_optimizing_trigger/utils.py) -- "stripe" (the module's original default: a
-deterministic sinusoidal pattern) vs "random" (strength * torch.rand(mu_shape), drawn from
-torch's GLOBAL RNG -- NOT reproducible across runs/processes unless torch itself is seeded
-beforehand) -- in the 1-poisoned/0-honest proof-of-concept regime, at the SAME full budget
-sweep as the main campaign (gen_configs.py's BUDGETS), against "mean" aggregation only (the
-only aggregator that means anything with a single worker total). A SEPARATE file from
-gen_configs.py on purpose, so the real (3-poisoned/7-honest) campaign's axes/behavior there are
-left untouched -- this script only READS gen_configs.py (templates, write_config,
-validate_config, check_delta_min_feasible, and every regularization/optimization constant
-EXCEPT the one this comparison explicitly varies). Structurally identical to
-gen_configs_gradmatch_metric.py (its own sibling comparison, over gradmatch_metric instead of
-init) -- kept deliberately so, to be easy to diff/compare.
+Purpose: isolate the effect of detaching param_dist from mtt_term_k's denominator (see
+run_module.py's run() docstring, "Detaching param_dist") -- False (the module's original
+behavior: mtt_term_k = param_loss / param_dist, with BOTH numerator and denominator
+differentiable w.r.t. delta) vs True (mtt_term_k = param_loss / param_dist.detach(), so delta
+can only lower the ratio by improving the numerator, not by shrinking the denominator) -- in the
+1-poisoned/0-honest proof-of-concept regime, at the SAME full budget sweep as the main campaign
+(gen_configs.py's BUDGETS), against "mean" aggregation only (the only aggregator that means
+anything with a single worker total). A SEPARATE file from gen_configs.py on purpose, so the
+real (3-poisoned/7-honest) campaign's axes/behavior there are left untouched -- this script only
+READS gen_configs.py (templates, write_config, validate_config, check_delta_min_feasible,
+trigger_output_path, and every regularization/optimization constant EXCEPT the one this
+comparison explicitly varies). Structurally identical to gen_configs_init_compare.py/
+gen_configs_expert_retrain_compare.py (its own siblings), kept deliberately so, to be easy to
+diff/compare.
 
-Two cells (one per init value), sharing every other hyperparameter, so any CTA/ASR difference
-between the two cells is attributable to init alone, not a confounded hyperparameter change.
-gradmatch_metric is left at gen_configs.py's own default ("relerr") in both cells -- this
-comparison is orthogonal to that one.
-
-NOTE (feasibility check, see gen_configs.py's check_delta_min_feasible docstring): for
-init="random", delta_min = delta_min_frac * ||delta_init||_2 is computed against a torch-seeded
-(seed=0, locally forked) draw for a STABLE printed pre-check number -- the actual training
-run's own delta_init draw is unseeded (global RNG) and will differ slightly in exact value,
-though a uniform random vector's norm concentrates tightly around its expectation for this
-trigger shape (numel~3000), so the feasibility verdict itself is a stable proxy in practice.
+Two cells (one per detach_param_dist value), sharing every other hyperparameter -- including
+delta_min_frac=0.0, epsilon=1.0, lambda_align=0.0 (gen_configs.py's own current defaults,
+imported rather than overridden) -- so any CTA/ASR difference between the two cells is
+attributable to detach_param_dist alone, not a confounded hyperparameter change.
 """
 import argparse
 from pathlib import Path
@@ -45,6 +39,7 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     GAMMA_STEALTH,
     GRADMATCH_EPS,
     GRADMATCH_METRIC,
+    INIT,
     JOINT_TRIGGER_TEMPLATE,
     LAMBDA_ALIGN,
     LAMBDA_BD,
@@ -54,6 +49,7 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     LEARNING_RATE,
     LR_DELTA,
     MILESTONE,
+    N_CHECKPOINTS_PER_STEP,
     N_ITERATIONS,
     SELECT_FLIPS_TEMPLATE,
     SOURCE_LABEL,
@@ -88,45 +84,54 @@ MODEL_FLAG = "r32p"
 SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 
-# The axis this comparison varies -- see module docstring.
-INITS = ["stripe", "random"]
+# The axis this comparison varies -- see module docstring. False = param_dist stays fully
+# differentiable (this module's original behavior). True = param_dist.detach() in the
+# denominator, closing off the "shrink the denominator" shortcut.
+DETACH_PARAM_DISTS = [False, True]
 
 EXP_BASE = Path(
-    "experiments/federated_experiments/threat_model_direct_trigger_joint_init_compare"
+    "experiments/federated_experiments/threat_model_direct_trigger_joint_detach_param_dist_compare"
 ).resolve()
 
-MODULE_NAME = "federated_generate_labels_trigger_joint_init_compare"
+MODULE_NAME = "federated_generate_labels_trigger_joint_detach_param_dist_compare"
 
 
-def cell_name(init, seed):
-    return f"{MODEL_FLAG}/{DATASET}/{NUM_POISONED}vs{NUM_HONESTS}/{AGG_METHOD}/{init}/seed{seed}"
+def _tag(detach_param_dist):
+    return f"detach_{str(detach_param_dist).lower()}"
 
 
-def generate_cell(init, seed, budgets, dry_run=False):
+def cell_name(detach_param_dist, seed):
+    return (
+        f"{MODEL_FLAG}/{DATASET}/{NUM_POISONED}vs{NUM_HONESTS}/{AGG_METHOD}/"
+        f"{_tag(detach_param_dist)}/seed{seed}"
+    )
+
+
+def generate_cell(detach_param_dist, seed, budgets, dry_run=False):
     feasible, delta_min, max_reachable = check_delta_min_feasible(
-        DATASET, EPSILON, DELTA_MIN_FRAC, init=init,
+        DATASET, EPSILON, DELTA_MIN_FRAC, init=INIT,
     )
     if not feasible:
         reason = (
             f"delta_min_frac={DELTA_MIN_FRAC} -> delta_min={delta_min:.4f} > "
-            f"epsilon*sqrt(numel)={max_reachable:.4f} at epsilon={EPSILON}, init={init!r} -- "
+            f"epsilon*sqrt(numel)={max_reachable:.4f} at epsilon={EPSILON} -- "
             "structurally unreachable post-clamp; refusing to generate this cell."
         )
-        print(f"REFUSED [{init} seed{seed}]: {reason}")
+        print(f"REFUSED [{_tag(detach_param_dist)} seed{seed}]: {reason}")
         return [], reason
 
     lr = LEARNING_RATE.get(MODEL_FLAG, 0.1)
     wd = WEIGHT_DECAY.get(MODEL_FLAG, 2e-4)
     milestones = MILESTONE.get(MODEL_FLAG, [75, 125])
     # Real RNG seed (see gen_configs.py's draw_rng_seed docstring) -- cached per
-    # (MODEL_FLAG, seed) so both init cells sharing this same train_expert cell (see
-    # train_expert_dir below) get the SAME actual value.
+    # (MODEL_FLAG, seed) so both detach_param_dist cells sharing this same train_expert cell
+    # (see train_expert_dir below) get the SAME actual value.
     rng_seed = draw_rng_seed(MODEL_FLAG, seed)
 
-    cell_dir = EXP_BASE / cell_name(init, seed)
-    # Shared across both init cells of this seed (init doesn't affect expert training at all --
-    # only the LABEL-generation step's own trigger optimization) -- one train_expert per seed
-    # for the whole comparison, not per cell.
+    cell_dir = EXP_BASE / cell_name(detach_param_dist, seed)
+    # Shared across both cells of this seed (detach_param_dist doesn't affect the INITIAL
+    # train_expert step at all, only the label/trigger-generation step's own backward graph) --
+    # one train_expert per seed for the whole comparison, not per cell.
     train_expert_dir = EXP_BASE / f"train_expert/{MODEL_FLAG}_1xs/seed{seed}"
     module_dir = cell_dir / "gen_labels_trigger_joint"
     flips_dir = cell_dir / "select_flips"
@@ -167,12 +172,8 @@ def generate_cell(init, seed, budgets, dry_run=False):
             lambda_gradmatch=LAMBDA_GRADMATCH,
             gradmatch_eps=GRADMATCH_EPS,
             gradmatch_metric=GRADMATCH_METRIC,
-            # detach_param_dist (added to gen_configs.py/run_module.py after this comparison
-            # script was written, schema-optional, false = the module's original,
-            # fully-differentiable-denominator behavior): pinned off here so init stays the only
-            # axis varying between this script's two cells -- the detach comparison lives in
-            # gen_configs_detach_param_dist_compare.py instead.
-            detach_param_dist="false",
+            # The axis this comparison varies -- see module docstring.
+            detach_param_dist=str(detach_param_dist).lower(),
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -186,22 +187,17 @@ def generate_cell(init, seed, budgets, dry_run=False):
             lambda_align=LAMBDA_ALIGN,
             lambda_mag=LAMBDA_MAG,
             delta_min_frac=DELTA_MIN_FRAC,
-            init=init,
+            init=INIT,
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
-            # n_checkpoints_per_step (added to gen_configs.py/run_module.py after this
-            # comparison script was written, schema-optional, 1 = single-checkpoint-per-step,
-            # unchanged): pinned to 1 here so init stays the only axis varying between this
-            # script's two cells -- the 5-checkpoint real test lives in gen_configs.py's own
-            # main campaign instead.
-            n_checkpoints_per_step=1,
+            n_checkpoints_per_step=N_CHECKPOINTS_PER_STEP,
             lr=lr,
             wd=wd,
             milestones=milestones,
             wandb_block_module=wandb_block(
                 "federated_generate_labels_trigger_joint",
-                f"{MODULE_NAME}/{init}/seed{seed}",
+                f"{MODULE_NAME}/{_tag(detach_param_dist)}/seed{seed}",
                 enabled=WANDB_ENABLED, project=WANDB_PROJECT,
                 mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
             ),
@@ -214,7 +210,7 @@ def generate_cell(init, seed, budgets, dry_run=False):
             num_poisoned=NUM_POISONED,
         ),
     }
-    trigger_path = trigger_output_path(module_dir, MODEL_FLAG, DATASET, NUM_POISONED, NUM_HONESTS, init)
+    trigger_path = trigger_output_path(module_dir, MODEL_FLAG, DATASET, NUM_POISONED, NUM_HONESTS, INIT)
     for budget in budgets:
         train_user_dir = cell_dir / f"train_user_{budget}"
         configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
@@ -234,7 +230,7 @@ def generate_cell(init, seed, budgets, dry_run=False):
             milestones=milestones,
             wandb_block_train_user=wandb_block(
                 "federated_train_user",
-                f"train_user/{MODEL_FLAG}/{DATASET}/{init}/{budget}/seed{seed}",
+                f"train_user/{MODEL_FLAG}/{DATASET}/{_tag(detach_param_dist)}/{budget}/seed{seed}",
                 enabled=WANDB_ENABLED, project=WANDB_PROJECT,
                 mode=WANDB_MODE, entity=WANDB_ENTITY, group=MODULE_NAME,
             ),
@@ -258,11 +254,11 @@ def generate_cell(init, seed, budgets, dry_run=False):
 def generate_all_configs(dry_run=False):
     all_paths, refused = [], []
     for seed in SEEDS:
-        for init in INITS:
-            paths, reason = generate_cell(init, seed, BUDGETS, dry_run=dry_run)
+        for detach_param_dist in DETACH_PARAM_DISTS:
+            paths, reason = generate_cell(detach_param_dist, seed, BUDGETS, dry_run=dry_run)
             all_paths += paths
             if reason:
-                refused.append((init, seed, reason))
+                refused.append((detach_param_dist, seed, reason))
     return all_paths, refused
 
 
@@ -275,18 +271,18 @@ if __name__ == "__main__":
 
     if args.dry_run:
         print(
-            f"\n[DRY RUN] {MODULE_NAME}: {len(INITS)} init(s) x {len(SEEDS)} "
+            f"\n[DRY RUN] {MODULE_NAME}: {len(DETACH_PARAM_DISTS)} value(s) x {len(SEEDS)} "
             f"seed(s), {len(paths)} config files would be written."
         )
         for p in paths:
             print(f"  {p}")
     else:
         print(
-            f"\n{MODULE_NAME}: {len(INITS)} init(s) x {len(SEEDS)} seed(s), "
+            f"\n{MODULE_NAME}: {len(DETACH_PARAM_DISTS)} value(s) x {len(SEEDS)} seed(s), "
             f"{len(paths)} config files written and schema-validated."
         )
 
     if refused:
         print(f"\n{len(refused)} cell(s) REFUSED (delta_min infeasible):")
-        for init, seed, reason in refused:
-            print(f"  [{init} seed{seed}] {reason}")
+        for detach_param_dist, seed, reason in refused:
+            print(f"  [{_tag(detach_param_dist)} seed{seed}] {reason}")

@@ -46,6 +46,7 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     WEIGHT_DECAY,
     check_delta_min_feasible,
     draw_rng_seed,
+    trigger_output_path,
     validate_config,
     wandb_block,
     write_config,
@@ -207,6 +208,12 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             lambda_gradmatch=0.0,
             gradmatch_eps=1e-8,
             gradmatch_metric="relerr",
+            # detach_param_dist (added to gen_configs.py/run_module.py after this sweep script
+            # was written, schema-optional, false = denominator stays fully differentiable, the
+            # module's original behavior): pinned off here so this OFAT hyperparameter search's
+            # own axes stay the only thing varying between cells -- the detach comparison lives
+            # in gen_configs_detach_param_dist_compare.py instead.
+            detach_param_dist="false",
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -256,6 +263,10 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             num_poisoned=NUM_POISONED,
         ),
     }
+    # init pinned to "stripe" throughout this OFAT sweep (see the JOINT_TRIGGER_TEMPLATE.format
+    # call above) -- match that here so train_user points at the trigger this cell actually
+    # wrote.
+    trigger_path = trigger_output_path(module_dir, MODEL_FLAG, DATASET, NUM_POISONED, NUM_HONESTS, "stripe")
     for budget in BUDGETS:
         train_user_dir = cell_dir / f"train_user_{budget}"
         configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
@@ -265,6 +276,7 @@ def generate_cell(tag, overrides, seed, dry_run=False):
             dataset=DATASET,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
+            trigger_path=trigger_path,
             budget=budget,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,

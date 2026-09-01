@@ -57,6 +57,7 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     WEIGHT_DECAY,
     check_delta_min_feasible,
     draw_rng_seed,
+    trigger_output_path,
     validate_config,
     wandb_block,
     write_config,
@@ -153,6 +154,12 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             lambda_gradmatch=LAMBDA_GRADMATCH,
             gradmatch_eps=GRADMATCH_EPS,
             gradmatch_metric=metric,
+            # detach_param_dist (added to gen_configs.py/run_module.py after this comparison
+            # script was written, schema-optional, false = the module's original,
+            # fully-differentiable-denominator behavior): pinned off here so gradmatch_metric
+            # stays the only axis varying between this script's two cells -- the detach
+            # comparison lives in gen_configs_detach_param_dist_compare.py instead.
+            detach_param_dist="false",
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -199,6 +206,9 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             num_poisoned=NUM_POISONED,
         ),
     }
+    # init pinned to "stripe" in this comparison (see the JOINT_TRIGGER_TEMPLATE.format call
+    # above) -- match that here so train_user points at the trigger this cell actually wrote.
+    trigger_path = trigger_output_path(module_dir, MODEL_FLAG, DATASET, NUM_POISONED, NUM_HONESTS, "stripe")
     for budget in budgets:
         train_user_dir = cell_dir / f"train_user_{budget}"
         configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
@@ -208,6 +218,7 @@ def generate_cell(metric, seed, budgets, dry_run=False):
             dataset=DATASET,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
+            trigger_path=trigger_path,
             budget=budget,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,

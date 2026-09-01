@@ -34,7 +34,7 @@ set -u
 # Tuned for the cypress_dgx partition (single node dgx-n01: 8xA100, 128 CPU,
 # ~2 TB RAM, MaxTime=1-00:00:00).
 # ---------------------------------------------------------------------------
-SLURM_PARTITION="${SLURM_PARTITION:-cypress_dgx}"
+SLURM_PARTITION="${SLURM_PARTITION:-rtx6k}"
 
 # Space-separated list of partitions to spread GPU jobs across (round-robin
 # in submit_job_pool_slurm), to maximize the number of GPUs available to a

@@ -86,15 +86,15 @@ WANDB_MODE = "online"
 # axis is shared (num_poisoned/num_honests/budgets/agg_method/epsilon/expert provenance) --
 # see the checkpoint_sampling note below for the one axis that is NOT aligned by default.
 # --------------------------------------------------------------------------- #
-NUM_POISONED = 3
-NUM_HONESTS = 7
+NUM_POISONED = 1
+NUM_HONESTS = 0
 SEEDS = [0]
 BUDGETS = [150, 300, 500, 1000, 2000, 2500, 5000]
 # grad-mismatch-penalty validation run (2026-08-31): single seed, full budget sweep, both
 # aggregators -- NUM_POISONED=3/NUM_HONESTS=7 makes "mean" vs "multikrum" a real,
 # non-degenerate comparison (unlike the NUM_HONESTS=0 validation run this comment used to
 # describe).
-AGG_METHODS = ["mean", "multikrum"]
+AGG_METHODS = ["mean"]
 DATASETS = ["cifar"]
 MODEL_FLAGS = ["r32p"]
 SOURCE_LABEL = 9
@@ -105,9 +105,7 @@ TARGET_LABEL = 4
 # a cross-module comparison MUST set both to the SAME value; see the warning this generator
 # prints when they differ.
 CHECKPOINT_SAMPLING = "biased"
-INDIRECT_MODULE_CHECKPOINT_SAMPLING = (
-    "uniform"  # mirrors the sibling generator's default
-)
+INDIRECT_MODULE_CHECKPOINT_SAMPLING = "uniform"  # mirrors the sibling generator's default
 
 ALPHA_CKPT = 0.01
 TRAIN_PCT = 1.0
@@ -126,7 +124,7 @@ N_ITERATIONS = 25  # Validation run (2026-08-30): sweep's best value for this ax
 # default to the SAME values as the initial train_expert step above (EPOCHS_EXPERT/
 # CHECKPOINT_ITERS) so the retrained trajectory is comparable in depth/granularity to the one
 # it replaces -- override independently below if a shorter/longer retrain is wanted.
-EXPERT_RETRAIN_INTERVAL = 5
+EXPERT_RETRAIN_INTERVAL = 1
 EXPERT_RETRAIN_EPOCHS = EPOCHS_EXPERT
 EXPERT_RETRAIN_CHECKPOINT_ITERS = CHECKPOINT_ITERS
 
@@ -156,9 +154,7 @@ N_CHECKPOINTS_PER_STEP = 5
 # best-per-axis value substituted in for each axis that beat the 2026-08-28 baseline) --
 # NOTE this combination was never itself a sweep cell (one-at-a-time sweeps don't see axis
 # interactions): this run (SEEDS/BUDGETS above, full budget sweep) IS that confirmation run.
-EPSILON = (
-    0.05  # L_infinity bound on the trigger delta. Sweep's best value for this axis
-)
+EPSILON = 1.0  # L_infinity bound on the trigger delta. Sweep's best value for this axis
 # (ASR 0.9900 vs baseline's 0.9860 at epsilon=1.0) -- counterintuitively SMALLER than the
 # 2026-08-28 baseline, not larger; a tighter perturbation bound apparently helped THIS
 # checkpoint/init combination rather than hurting it. CAUTION: at DELTA_MIN_FRAC=0.01 below,
@@ -166,16 +162,12 @@ EPSILON = (
 # thin enough that a small change to init strength/freq could flip the A3-style feasibility
 # guard below to REFUSED; re-check its printed delta_min/max_reachable if this generator's
 # init constants ever change. (was 1.0)
-LR_DELTA = (
-    1e-2  # Adam learning rate for the trigger optimization. Sweep confirmed baseline
-)
+LR_DELTA = 1e-2  # Adam learning rate for the trigger optimization. Sweep confirmed baseline
 # already best on this axis -- unchanged.
 LAMBDA_BD = 2.0  # weight of the backdoor-efficacy loss (kappa in the P^mean/P^direct
 # formulas) -- higher pushes harder for backdoor success at the cost of
 # the matching term. Sweep confirmed baseline already best on this axis -- unchanged.
-GAMMA_STEALTH = (
-    1.0  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
-)
+GAMMA_STEALTH = 1.0  # scalar stealth/backdoor loss weight multiplying grand_loss (UNRELATED
 # to federated_optimizing_trigger_policy's gamma -- disjoint concept). Sweep's best value for
 # this axis (ASR 0.9940 vs baseline's 0.9860 at gamma_stealth=0.3) -- back up at the ORIGINAL
 # (pre-2026-08-28) value: at NUM_HONESTS=0/NUM_POISONED=1 this proof-of-concept apparently
@@ -194,13 +186,9 @@ LAMBDA_DELTA = 1.0
 # 2026-08-28 baseline already best on every one of these axes -- left unchanged for this
 # confirmation run.
 TRIGGER_CONSTRAINT = "penalty"
-ALIGN_KAPPA = (
-    0.3  # directional floor on cos(delta, mu_target) -- lowered (was 0.6): easier
-)
+ALIGN_KAPPA = 0.3  # directional floor on cos(delta, mu_target) -- lowered (was 0.6): easier
 # to satisfy, so L_align stays inactive more of the time instead of competing with L_bd.
-LAMBDA_ALIGN = (
-    0.3  # weight of the (now easier-to-satisfy) directional floor. Lowered (was
-)
+LAMBDA_ALIGN = 0.0  # weight of the (now easier-to-satisfy) directional floor. Lowered (was
 # 1.0) so it still guards against collapse without dominating the loss.
 LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reasoning.
 # NOTE (updated 2026-08-30 for EPSILON=0.05 above, was EPSILON=0.3's ~14x/EPSILON=0.1's ~2x):
@@ -208,7 +196,7 @@ LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reaso
 # only a ~1.2x feasibility margin now, thin enough to be worth re-reading the feasibility
 # guard's printed values below rather than assuming this comment stays accurate if EPSILON,
 # DELTA_MIN_FRAC, or the init constants (_STRENGTH/_FREQ) change again.
-DELTA_MIN_FRAC = 0.01
+DELTA_MIN_FRAC = 0.00
 
 # Trigger initialization (2026-09-01): init_delta (modules/federated_optimizing_trigger/utils.py)
 # supports "stripe" (sinusoidal, deterministic -- this campaign's own prior default, now made
@@ -233,15 +221,21 @@ GRADMATCH_EPS = 1e-8
 # 1-poisoned/0-honest sweep -- see gen_configs_gradmatch_metric.py.
 GRADMATCH_METRIC = "relerr"
 
+# detach_param_dist (2026-09-03, see run_module.py's run() docstring "Detaching param_dist"):
+# mtt_term_k = param_loss / param_dist, and param_dist is itself differentiable w.r.t. delta --
+# False (default) keeps that denominator fully in the graph (this module's original behavior,
+# unchanged). The True arm (param_loss / param_dist.detach(), closing off the "shrink the
+# denominator instead of improving the numerator" shortcut) is validated separately, in the
+# dedicated 1-poisoned/0-honest comparison -- see gen_configs_detach_param_dist_compare.py.
+DETACH_PARAM_DIST = False
+
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
 MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
 
 CLUSTER_ROOT = "/shared/data1/Projects/DLWP/j1067582/martin/FLIP"
 
-EXP_BASE = Path(
-    "experiments/federated_experiments/threat_model_direct_trigger_joint"
-).resolve()
+EXP_BASE = Path("experiments/federated_experiments/threat_model_direct_trigger_joint").resolve()
 
 MODULE_NAME = "federated_generate_labels_trigger_joint"
 
@@ -250,7 +244,6 @@ MODULE_NAME = "federated_generate_labels_trigger_joint"
 # not in the default sweep, see MODEL_FLAGS/DATASETS above).
 _TRIGGER_SHAPE = {"cifar": (3, 32, 32), "cifar_100": (3, 32, 32), "svhn": (3, 32, 32)}
 _STRENGTH, _FREQ = 6.0, 16  # must match init_delta's call in run_module.py exactly
-
 
 
 def check_delta_min_feasible(dataset, epsilon, delta_min_frac, init="stripe"):
@@ -327,6 +320,7 @@ lambda_delta = {lambda_delta}
 lambda_gradmatch = {lambda_gradmatch}
 gradmatch_eps = {gradmatch_eps}
 gradmatch_metric = "{gradmatch_metric}"
+detach_param_dist = {detach_param_dist}
 
 train_pct = {train_pct}
 num_honests = {num_honests}
@@ -382,7 +376,8 @@ trainer = "sgd"
 dataset = "{dataset}"
 source_label = {source_label}
 target_label = {target_label}
-poisoner = "1xs"
+poisoner = "optimized"
+delta = "{trigger_path}"
 budget = {budget}
 num_honests = {num_honests}
 num_poisoned = {num_poisoned}
@@ -392,18 +387,41 @@ schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 {wandb_block_train_user}"""
 
 
-def cell_name(model_flag, dataset, agg_method, seed):
+def trigger_output_path(module_dir, model_flag, dataset, num_poisoned, num_honests, init):
+    """Path to the .pt trigger this campaign's own gen_labels_trigger_joint step will save
+    (see run_module.py's run(): torch.save(delta, output_dir_trigger/f"opt_trig_direct_joint_
+    {init}_{model_flag}_{dataset}_{num_poisoned}vs{num_honests}.pt")) -- train_user needs this
+    path to actually poison its test-time images with the OPTIMIZED trigger (poisoner=
+    "optimized", delta=<this path>) instead of the fixed "1xs" stripe pattern the template used
+    before this was wired up (a bug: budgets/flips were selected against the optimized delta,
+    but train_user was evaluating a completely different, un-optimized trigger). `module_dir` is
+    a cell's own gen_labels_trigger_joint directory -- output_dir_trigger in JOINT_TRIGGER_TEMPLATE
+    is set to f"{{cell_dir}}/trigger" where cell_dir IS module_dir, so this must match exactly."""
     return (
-        f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
+        module_dir
+        / "trigger"
+        / f"opt_trig_direct_joint_{init}_{model_flag}_{dataset}_{num_poisoned}vs{num_honests}.pt"
     )
 
 
+def cell_name(model_flag, dataset, agg_method, seed):
+    return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
+
+
 def generate_cell(
-    model_flag, dataset, agg_method, seed, budgets, dry_run=False, delta_min_frac=None,
+    model_flag,
+    dataset,
+    agg_method,
+    seed,
+    budgets,
+    dry_run=False,
+    delta_min_frac=None,
     init=None,
+    detach_param_dist=None,
 ):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
     init = INIT if init is None else init
+    detach_param_dist = DETACH_PARAM_DIST if detach_param_dist is None else detach_param_dist
 
     if CHECKPOINT_SAMPLING != INDIRECT_MODULE_CHECKPOINT_SAMPLING:
         print(
@@ -460,9 +478,13 @@ def generate_cell(
             wd=wd,
             milestones=milestones,
             wandb_block_train_expert=wandb_block(
-                "train_expert", f"train_expert/{model_flag}/{dataset}/seed{seed}",
-                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
-                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                "train_expert",
+                f"train_expert/{model_flag}/{dataset}/seed{seed}",
+                enabled=WANDB_ENABLED,
+                project=WANDB_PROJECT,
+                mode=WANDB_MODE,
+                entity=WANDB_ENTITY,
+                group=model_flag,
             ),
         ),
         module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
@@ -481,6 +503,7 @@ def generate_cell(
             lambda_gradmatch=LAMBDA_GRADMATCH,
             gradmatch_eps=GRADMATCH_EPS,
             gradmatch_metric=GRADMATCH_METRIC,
+            detach_param_dist=str(detach_param_dist).lower(),
             train_pct=TRAIN_PCT,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -505,8 +528,11 @@ def generate_cell(
             wandb_block_module=wandb_block(
                 MODULE_NAME,
                 f"{MODULE_NAME}/{model_flag}/{dataset}/{agg_method}/seed{seed}",
-                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
-                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                enabled=WANDB_ENABLED,
+                project=WANDB_PROJECT,
+                mode=WANDB_MODE,
+                entity=WANDB_ENTITY,
+                group=model_flag,
             ),
         ),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
@@ -517,6 +543,9 @@ def generate_cell(
             num_poisoned=NUM_POISONED,
         ),
     }
+    trigger_path = trigger_output_path(
+        module_dir, model_flag, dataset, NUM_POISONED, NUM_HONESTS, init,
+    )
     for budget in budgets:
         train_user_dir = cell_dir / f"train_user_{budget}"
         configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
@@ -526,6 +555,7 @@ def generate_cell(
             dataset=dataset,
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
+            trigger_path=trigger_path,
             budget=budget,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -536,16 +566,17 @@ def generate_cell(
             wandb_block_train_user=wandb_block(
                 "federated_train_user",
                 f"train_user/{model_flag}/{dataset}/{agg_method}/{budget}/seed{seed}",
-                enabled=WANDB_ENABLED, project=WANDB_PROJECT,
-                mode=WANDB_MODE, entity=WANDB_ENTITY, group=model_flag,
+                enabled=WANDB_ENABLED,
+                project=WANDB_PROJECT,
+                mode=WANDB_MODE,
+                entity=WANDB_ENTITY,
+                group=model_flag,
             ),
         )
 
     paths = []
     for path, content in configs.items():
-        assert "out/checkpoints" not in str(path), (
-            f"Refusing to write under out/checkpoints/: {path}"
-        )
+        assert "out/checkpoints" not in str(path), f"Refusing to write under out/checkpoints/: {path}"
         if dry_run:
             paths.append(path)
             continue
@@ -568,11 +599,7 @@ def generate_single_cell(dry_run=True):
         BUDGETS[:1],
         dry_run=dry_run,
     )
-    refused = (
-        [(MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], reason)]
-        if reason
-        else []
-    )
+    refused = [(MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], reason)] if reason else []
     return paths, refused
 
 
@@ -633,29 +660,26 @@ def list_grid():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--minimal", action="store_true", help="B3 minimal campaign only"
-    )
+    parser.add_argument("--minimal", action="store_true", help="B3 minimal campaign only")
     parser.add_argument(
         "--single-cell",
         action="store_true",
-        help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal "
-        "preliminary campaign",
+        help="exactly one cell, REGULARIZATION_GRID fixed at defaults -- the minimal preliminary campaign",
     )
     parser.add_argument(
-        "--print-grid", action="store_true",
+        "--print-grid",
+        action="store_true",
         help="print this campaign's sweep cells as JSON and exit, without writing configs",
     )
     args = parser.parse_args()
 
     if args.print_grid:
         import json
+
         print(json.dumps(list_grid(), indent=2))
         raise SystemExit(0)
 
-    assert not (args.minimal and args.single_cell), (
-        "pass at most one of --minimal/--single-cell"
-    )
+    assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
 
     if args.single_cell:
         gen_fn = generate_single_cell
@@ -670,9 +694,7 @@ if __name__ == "__main__":
         for p in paths:
             print(f"  {p}")
     else:
-        print(
-            f"\n{MODULE_NAME}: {len(paths)} config files written and schema-validated."
-        )
+        print(f"\n{MODULE_NAME}: {len(paths)} config files written and schema-validated.")
 
     if refused:
         print(f"\n{len(refused)} cell(s) REFUSED (delta_min infeasible):")

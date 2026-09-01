@@ -285,6 +285,28 @@ def run(experiment_name, module_name, **kwargs):
     only when lambda_gradmatch != 0 (`track_gradmatch` below) -- the clean-subset-only forward
     pass this requires for poisoned clients is pure overhead otherwise.
 
+    Detaching param_dist (2026-09-03, `detach_param_dist`, optional, off by default):
+    mtt_term_k = param_loss / param_dist -- param_dist = sum_p total_mse_distance(init_p,
+    expert_next_param) is itself a function of delta (through agg_expert_grads ->
+    expert_next_param, same as param_loss's numerator), so by default BOTH the numerator and the
+    denominator of this ratio carry gradient w.r.t. delta, and mtt_term_k's backward pass
+    includes the denominator's own contribution (d/d_delta of 1/param_dist, scaled by
+    param_loss). Standard MTT normalizes by a trajectory-distance term precisely so the loss is
+    scale-invariant across checkpoints of differing distance-per-step -- but here, because that
+    denominator is itself differentiable w.r.t. the thing being optimized, delta could in
+    principle reduce mtt_term_k by shrinking param_dist (moving expert_next_param closer to
+    init_p) rather than by making student_update track expert_next_param better, a shortcut with
+    nothing to do with the matching objective the term is meant to encode. Setting
+    detach_param_dist=True computes mtt_term_k against `param_dist.detach()` instead -- the
+    denominator still reflects this step's true trajectory distance (used as a normalizer, exactly
+    as intended), but no gradient flows through it, so delta can only lower mtt_term_k by
+    improving the numerator (student_update actually tracking expert_next_param), closing off the
+    shortcut above. False (default) leaves the prior, fully-differentiable-denominator behavior
+    unchanged -- this is a validation axis (see gen_configs_detach_param_dist_compare.py), not
+    yet promoted to gen_configs.py's own default. Only affects gradient flow, never
+    matching_term/matching_term_std logged to metrics_log_path/tracker (both already read
+    (param_loss / param_dist).item(), never differentiated).
+
     Comparability across the three arms (prerequisite before any campaign, not just doc):
       - checkpoint sampling: this module draws its expert-trajectory index via
         `extract_experts_biased` (own utils.py), the SAME exponentially-biased distribution
@@ -403,6 +425,11 @@ def run(experiment_name, module_name, **kwargs):
             f"gradmatch_metric must be 'relerr' or 'cosine', got {gradmatch_metric!r}"
         )
     track_gradmatch = lambda_gradmatch != 0
+
+    # detach_param_dist (2026-09-03, see run() docstring "Detaching param_dist"): off by
+    # default (False = no-op, identical to the module's behavior before this flag existed --
+    # param_dist stays part of mtt_term_k's live graph).
+    detach_param_dist = args.get("detach_param_dist", False)
 
     output_dir_trigger = slurmify_path(
         args.get("output_dir_trigger", "optimized_trigger"), slurm_id,
@@ -1041,7 +1068,8 @@ def run(experiment_name, module_name, **kwargs):
                             param_loss += total_mse_distance(student_update, expert_next_param)
                             param_dist += total_mse_distance(init_p, expert_next_param)
 
-                        mtt_term_k = param_loss / param_dist
+                        mtt_denom = param_dist.detach() if detach_param_dist else param_dist
+                        mtt_term_k = param_loss / mtt_denom
 
                     # Multi-checkpoint averaging (see run() docstring): collect this
                     # checkpoint's own differentiable contributions (mtt_term_k, L_gradmatch_k)
