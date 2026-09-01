@@ -199,6 +199,17 @@ def run(experiment_name, module_name, **kwargs):
     because of trajectory staleness -- a persistent gap then points at delta/L_bd itself,
     not this design difference.
 
+    `seed` (2026-09-01, isolates the trigger as retraining's only source of difference): if
+    set, every retraining round reseeds Python's random/numpy/torch RNGs to this SAME value
+    BEFORE building that round's poisoned dataset and initializing the fresh model -- pass the
+    ORIGINAL train_expert step's own `seed` (schemas/train_expert.toml) here so a retrained
+    expert's weight init and data order replicate the original expert's exactly. Without this,
+    each retraining round's fresh model rode on whatever the ambient torch RNG state happened
+    to be at that point in the run -- confounding "did retraining change the expert because of
+    the poisoned trigger" with "did it change merely because of a different random init/data
+    order," which this field removes as a factor. No effect when unset or when
+    expert_retrain_interval=0 (both leave the prior, unseeded behavior unchanged).
+
     Two Step-3 corrections relative to the original H1 instrumentation (see
     docs/threat_models_audit.md for the original run's refuted-but-confounded result): (1)
     `delta_init` is now captured INSIDE the training loop, the first time execution reaches
@@ -386,6 +397,12 @@ def run(experiment_name, module_name, **kwargs):
     expert_retrain_checkpoint_iters = args.get("expert_retrain_checkpoint_iters", 50)
     expert_retrain_optim_kwargs = args.get("expert_retrain_optim_kwargs", {})
     expert_retrain_scheduler_kwargs = args.get("expert_retrain_scheduler_kwargs", {})
+    # Real RNG seed (see schemas/federated_generate_labels_trigger_joint.toml's `seed` doc) --
+    # reused ONLY by _retrain_expert_with_trigger below (when expert_retrain_interval>0), to
+    # reseed torch/numpy/random to the SAME value the original train_expert step used (its own
+    # `seed`, see schemas/train_expert.toml), so a retrained expert's weight init/data order
+    # replicate the ORIGINAL expert's -- isolating the poisoned trigger as the only difference.
+    seed = args.get("seed", None)
 
     # P3: pool_size checkpoints preloaded into RAM once, then drawn from uniformly at random
     # per outer step (`it`), instead of a single checkpoint indexed sequentially by `it` --
@@ -565,6 +582,21 @@ def run(experiment_name, module_name, **kwargs):
             f"{expert_retrain_epochs} epochs against the CURRENT trigger "
             f"(||delta||_inf={delta_snapshot.abs().max().item():.4f})..."
         )
+
+        # Reseed to the ORIGINAL train_expert step's own seed (see schemas/
+        # federated_generate_labels_trigger_joint.toml's `seed` doc), BEFORE building this
+        # round's poisoned dataset and initializing the fresh model -- same placement (relative
+        # to dataset construction/model init) as train_expert/run_module.py's own seeding call,
+        # so this round's weight init and data order replicate the ORIGINAL expert's exactly,
+        # leaving the poisoned trigger (via `poisoner` below) as the only source of difference.
+        # No-op (unseeded, as before this field existed) if `seed` was never set.
+        if seed is not None:
+            print(f"[expert_retrain] round {round_idx}: reseeding RNGs to seed={seed} "
+                  "(matching the original train_expert step) before this round's dataset/model.")
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
         poisoner = pick_poisoner(
             "optimized", dataset_flag, target_label, delta=delta_snapshot.detach().cpu(),
         )

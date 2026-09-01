@@ -3,8 +3,12 @@ Trains an expert model on a traditionally backdoored dataset.
 """
 
 from pathlib import Path
+import random
 import sys
 import time as _time
+
+import numpy as np
+import torch
 
 from modules.train_expert.utils import checkpoint_callback
 from modules.base_utils.datasets import (
@@ -52,6 +56,19 @@ def run(experiment_name, module_name, **kwargs):
     scheduler_kwargs = args.get("scheduler_kwargs", {})
     output_dir = slurmify_path(args["output_dir"], slurm_id)
     budget = args.get("budget", None)
+    # Real RNG seed (see schemas/train_expert.toml's `seed` doc) -- NOT the same thing as the
+    # "seedN" segment conventionally used in this run's own output_dir path, which was never
+    # actually wired to torch.manual_seed before this field existed. Seeded here, before dataset
+    # construction/model init, so a later reproduction (e.g.
+    # federated_generate_labels_trigger_joint's expert_retrain_interval, which reseeds to this
+    # SAME value before retraining a fresh expert mid-run) can replicate this run's weight init
+    # and data order exactly, isolating whatever else differs (e.g. a poisoned trigger) as the
+    # only source of divergence.
+    seed = args.get("seed", None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 

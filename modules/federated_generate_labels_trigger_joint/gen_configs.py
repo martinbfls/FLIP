@@ -262,6 +262,7 @@ checkpoint_iters = {checkpoint_iters}
 epochs = {epochs}
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
+seed = {seed}
 {wandb_block_train_expert}"""
 
 JOINT_TRIGGER_TEMPLATE = """[federated_generate_labels_trigger_joint]
@@ -304,6 +305,7 @@ expert_retrain_epochs = {expert_retrain_epochs}
 expert_retrain_checkpoint_iters = {expert_retrain_checkpoint_iters}
 expert_retrain_optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
+seed = {seed}
 {wandb_block_module}
 [federated_generate_labels_trigger_joint.expert_config]
 experts = 1
