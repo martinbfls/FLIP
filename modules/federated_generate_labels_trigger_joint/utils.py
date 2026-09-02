@@ -237,6 +237,25 @@ def grad_cosine_penalty(clean_grads, poison_grads, eps=1e-8):
     return 1 - cos
 
 
+def lpips_penalty(delta, x_raw_clean, lpips_model):
+    '''
+    Perceptual (LPIPS) distance between the clean raw image(s) and their triggered
+    counterpart, both in the RAW [0,1] pixel space (the same space `raw_to_trigger_preprocess`
+    starts from, NOT the per-dataset normalized space it eventually produces for the
+    classifier) -- rescaled to [-1, 1] here, LPIPS's own expected input range. `delta` is not
+    detached, so this term is differentiable w.r.t. the trigger being optimized, exactly like
+    L_bd in run_module.py (see the L_bd block this term is meant to sit next to). `lpips_model`
+    is a pre-instantiated, frozen lpips.LPIPS(net=...), already moved to x_raw_clean's device.
+    '''
+    if x_raw_clean.dim() == 3:
+        x_trig_raw = (x_raw_clean + delta).clamp(0, 1)
+    else:
+        x_trig_raw = (x_raw_clean + delta.unsqueeze(0)).clamp(0, 1)
+    x_clean_scaled = x_raw_clean * 2 - 1
+    x_trig_scaled = x_trig_raw * 2 - 1
+    return lpips_model(x_trig_scaled, x_clean_scaled).mean()
+
+
 def project_trigger_constraints(delta, mu_target, epsilon, align_kappa, delta_min, n_iters=8, eps=1e-8):
     '''
     Alternating-projection heuristic (see run_module.py's run() docstring,

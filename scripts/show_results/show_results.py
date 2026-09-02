@@ -93,6 +93,71 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_detach_param_di
     cell_name as dpd_cell_name,
 )
 from modules.federated_generate_labels_trigger_joint.gen_configs import INIT as DPD_INIT
+# grad_match ablation campaign (relerr / cosine / off, see gen_configs_gradmatch_ablation.py's
+# own docstring) -- a SEPARATE, 1-poisoned/0-honest campaign, distinct from the two-cell
+# gradmatch_metric comparison above (this one adds the lambda_gradmatch=0.0 "off" cell and
+# runs a smaller BUDGETS list). Aliased (GA_ prefix) for the same reason as the others.
+from modules.federated_generate_labels_trigger_joint.gen_configs_gradmatch_ablation import (
+    EXP_BASE as GA_EXP_BASE,
+    MODEL_FLAG as GA_MODEL_FLAG,
+    DATASET as GA_DATASET,
+    NUM_POISONED as GA_NUM_POISONED,
+    NUM_HONESTS as GA_NUM_HONESTS,
+    SEEDS as GA_SEEDS,
+    BUDGETS as GA_BUDGETS,
+    GRADMATCH_VARIANTS,
+    cell_name as ga_cell_name,
+)
+# epsilon (trigger L_infinity budget) sweep campaign (1.0 down to 16/255, see
+# gen_configs_epsilon_sweep.py's own docstring) -- another SEPARATE, 1-poisoned/0-honest
+# campaign. Aliased (EPS_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_epsilon_sweep import (
+    EXP_BASE as EPS_EXP_BASE,
+    MODEL_FLAG as EPS_MODEL_FLAG,
+    DATASET as EPS_DATASET,
+    NUM_POISONED as EPS_NUM_POISONED,
+    NUM_HONESTS as EPS_NUM_HONESTS,
+    SEEDS as EPS_SEEDS,
+    BUDGETS as EPS_BUDGETS,
+    EPSILON_VALUES,
+    cell_name as eps_cell_name,
+    _eps_tag,
+)
+# LPIPS perceptual-loss comparison campaign (base vs +LPIPS, see gen_configs_lpips_compare.py's
+# own docstring) -- another SEPARATE, 1-poisoned/0-honest campaign. Aliased (LP_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_lpips_compare import (
+    EXP_BASE as LP_EXP_BASE,
+    MODEL_FLAG as LP_MODEL_FLAG,
+    DATASET as LP_DATASET,
+    NUM_POISONED as LP_NUM_POISONED,
+    NUM_HONESTS as LP_NUM_HONESTS,
+    SEEDS as LP_SEEDS,
+    BUDGETS as LP_BUDGETS,
+    LPIPS_VARIANTS,
+    cell_name as lp_cell_name,
+)
+# single-user vs federated Multi-Krum comparison campaign (see
+# gen_configs_federated_multikrum_compare.py's own docstring) -- the attack is generated ONCE
+# (1-poisoned/0-honest/mean) and deployed via TWO branches per cell: the existing single-user
+# convention (cell_dir/train_user_{budget}) and a NEW federated one nested under
+# cell_dir/{FED_TAG}/train_user_{budget} (3-poisoned/7-honest, multikrum, with
+# track_poison_selection=true -- see modules/base_utils/util.py's mini_train_multi). Aliased
+# (FM_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_federated_multikrum_compare import (
+    EXP_BASE as FM_EXP_BASE,
+    MODEL_FLAG as FM_MODEL_FLAG,
+    DATASET as FM_DATASET,
+    NUM_POISONED as FM_NUM_POISONED,
+    NUM_HONESTS as FM_NUM_HONESTS,
+    SEEDS as FM_SEEDS,
+    BUDGETS as FM_BUDGETS,
+    FED_NUM_POISONED,
+    FED_NUM_HONESTS,
+    FED_AGG_METHOD,
+    FED_TAG,
+    cell_name as fm_cell_name,
+)
+import json as _json
 
 
 # =========================
@@ -143,6 +208,22 @@ EXPERT_RETRAIN_INTERVAL_COLORS = {
 DETACH_PARAM_DIST_COLORS = {
     False: "tab:blue",
     True: "tab:red",
+}
+
+GRADMATCH_ABLATION_COLORS = {
+    "relerr": "tab:blue",
+    "cosine": "tab:red",
+    "off": "tab:gray",
+}
+
+LPIPS_COLORS = {
+    "base": "tab:blue",
+    "lpips": "tab:red",
+}
+
+FEDERATED_MULTIKRUM_COLORS = {
+    "single_user": "tab:blue",
+    FED_TAG: "tab:purple",
 }
 
 
@@ -388,6 +469,335 @@ def compute_cta_pta_mean_var_detach_param_dist(
         )
 
     return pd.DataFrame.from_records(records)
+
+
+def _branch_run_dir(cell_dir, budget, mode):
+    """Resolves a cell's train_user_{budget} directory for either branch a study campaign can
+    generate: "single_user" (cell_dir/train_user_{budget}, that study's own 1-poisoned/
+    0-honest/mean setting) or FED_TAG (cell_dir/FED_TAG/train_user_{budget}, the federated
+    3-poisoned/7-honest/multikrum deployment of the SAME attack -- see
+    _federated_branch.federated_branch_configs). Shared by every compute_cta_pta_mean_var_*
+    function below that supports both branches."""
+    if mode == "single_user":
+        return cell_dir / f"train_user_{budget}"
+    return cell_dir / mode / f"train_user_{budget}"
+
+
+def compute_cta_pta_mean_var_gradmatch_ablation(
+    tag,
+    budgets,
+    seeds,
+    mode="single_user",
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var, for the grad_match ablation campaign instead
+    (1-poisoned/0-honest, "mean" aggregation only, tag in {relerr, cosine, off} -- see
+    gen_configs_gradmatch_ablation.py's own docstring). Directory layout matches that module's
+    generate_cell() exactly: GA_EXP_BASE / ga_cell_name(tag, seed) /
+    train_user_{budget}/{caccs,paccs}.npy (single_user) or .../FED_TAG/train_user_{budget}/...
+    (mode=FED_TAG, the federated Multi-Krum branch of the SAME attack -- see
+    _federated_branch.py).
+    """
+    records = []
+
+    for budget in budgets:
+        run_dir_fn = lambda seed, budget=budget: (
+            _branch_run_dir(GA_EXP_BASE / ga_cell_name(tag, seed), budget, mode)
+        )
+        cta_mean, cta_var, pta_mean, pta_var = _cta_pta_mean_var(
+            run_dir_fn, seeds, cta_file, pta_file
+        )
+        records.append(
+            {
+                "dataset": GA_DATASET,
+                "gradmatch_variant": tag,
+                "mode": mode,
+                "budget": budget,
+                "model": GA_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_cta_pta_mean_var_epsilon(
+    epsilon,
+    budgets,
+    seeds,
+    mode="single_user",
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var, for the epsilon sweep campaign instead
+    (1-poisoned/0-honest, "mean" aggregation only, epsilon-swept from 1.0 down to 16/255 --
+    see gen_configs_epsilon_sweep.py's own docstring). Directory layout matches that module's
+    generate_cell() exactly: EPS_EXP_BASE / eps_cell_name(_eps_tag(epsilon), seed) /
+    train_user_{budget}/{caccs,paccs}.npy (single_user) or .../FED_TAG/train_user_{budget}/...
+    (mode=FED_TAG, the federated Multi-Krum branch of the SAME attack).
+    """
+    records = []
+    eps_tag = _eps_tag(epsilon)
+
+    for budget in budgets:
+        run_dir_fn = lambda seed, budget=budget: (
+            _branch_run_dir(EPS_EXP_BASE / eps_cell_name(eps_tag, seed), budget, mode)
+        )
+        cta_mean, cta_var, pta_mean, pta_var = _cta_pta_mean_var(
+            run_dir_fn, seeds, cta_file, pta_file
+        )
+        records.append(
+            {
+                "dataset": EPS_DATASET,
+                "epsilon": epsilon,
+                "mode": mode,
+                "budget": budget,
+                "model": EPS_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_cta_pta_mean_var_lpips(
+    tag,
+    budgets,
+    seeds,
+    mode="single_user",
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var, for the LPIPS comparison campaign instead
+    (1-poisoned/0-honest, "mean" aggregation only, tag in {base, lpips} -- see
+    gen_configs_lpips_compare.py's own docstring). Directory layout matches that module's
+    generate_cell() exactly: LP_EXP_BASE / lp_cell_name(tag, seed) /
+    train_user_{budget}/{caccs,paccs}.npy (single_user) or .../FED_TAG/train_user_{budget}/...
+    (mode=FED_TAG, the federated Multi-Krum branch of the SAME attack).
+    """
+    records = []
+
+    for budget in budgets:
+        run_dir_fn = lambda seed, budget=budget: (
+            _branch_run_dir(LP_EXP_BASE / lp_cell_name(tag, seed), budget, mode)
+        )
+        cta_mean, cta_var, pta_mean, pta_var = _cta_pta_mean_var(
+            run_dir_fn, seeds, cta_file, pta_file
+        )
+        records.append(
+            {
+                "dataset": LP_DATASET,
+                "lpips_variant": tag,
+                "mode": mode,
+                "budget": budget,
+                "model": LP_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_cta_pta_mean_var_federated_multikrum(
+    mode,
+    budgets,
+    seeds,
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var, for the single-user vs federated Multi-Krum comparison
+    campaign instead (see gen_configs_federated_multikrum_compare.py's own docstring). `mode` is
+    "single_user" (cell_dir/train_user_{budget}, 1-poisoned/0-honest/mean) or FED_TAG
+    (cell_dir/{FED_TAG}/train_user_{budget}, 3-poisoned/7-honest/multikrum) -- the two branches
+    read the SAME underlying attack (same seed's gen_labels_trigger_joint output), so they are
+    directly comparable at fixed budget/seed. Never mixed with any other campaign's DataFrame in
+    the same plot (see plot_cta_vs_pta's per-campaign call sites below).
+    """
+    records = []
+
+    for budget in budgets:
+        run_dir_fn = lambda seed, budget=budget: (
+            _branch_run_dir(FM_EXP_BASE / fm_cell_name(seed), budget, mode)
+        )
+        cta_mean, cta_var, pta_mean, pta_var = _cta_pta_mean_var(
+            run_dir_fn, seeds, cta_file, pta_file
+        )
+        records.append(
+            {
+                "dataset": FM_DATASET,
+                "mode": mode,
+                "budget": budget,
+                "model": FM_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+# =========================
+# MULTI-KRUM POISON-SELECTION STATS
+# =========================
+def load_multikrum_poison_stats(cell_dir_fn, budgets, seeds):
+    """Loads every federated branch's multikrum_poison_stats.json (written by
+    modules/federated_train_user/run_module.py when track_poison_selection=true -- see
+    modules/base_utils/util.py's mini_train_multi). `cell_dir_fn(seed)` resolves the base
+    cell_dir (the one whose FED_TAG/ subdirectory holds the federated branch) for ANY campaign
+    in this family (fm_cell_name for federated_multikrum_compare, ga_cell_name(tag, ...) /
+    eps_cell_name(...) / lp_cell_name(...) for the isolated-factor studies -- pass a lambda
+    binding the fixed axis value). Returns a list of (budget, seed, stats_dict) tuples,
+    skipping any (budget, seed) whose file doesn't exist yet (partial campaigns never crash
+    this, same convention as get_final_value elsewhere in this file)."""
+    out = []
+    for seed in seeds:
+        cell_dir = cell_dir_fn(seed)
+        for budget in budgets:
+            path = cell_dir / FED_TAG / f"train_user_{budget}" / "multikrum_poison_stats.json"
+            if not path.exists():
+                continue
+            try:
+                with open(path) as f:
+                    stats = _json.load(f)
+            except Exception:
+                continue
+            out.append((budget, seed, stats))
+    return out
+
+
+def _poison_selection_rates(cell_dir_fn, budgets, seeds):
+    """Shared aggregation core: returns (global_ratio_by_budget, worker_rate_by_budget), both
+    dicts keyed by budget -- global_ratio_by_budget[b] is a list of per-seed
+    any_poisoned_selected_given_flip/total_aggregations ratios, worker_rate_by_budget[b] is a
+    dict worker_id -> list of per-seed times_selected_given_flip/batches_with_flip ratios.
+    Used by both the single-series and multi-series plot functions below."""
+    runs = load_multikrum_poison_stats(cell_dir_fn, budgets, seeds)
+
+    global_ratio_by_budget = {b: [] for b in budgets}
+    worker_rate_by_budget = {b: {} for b in budgets}
+
+    for budget, seed, stats in runs:
+        total = stats.get("total_aggregations", 0)
+        any_selected = stats.get("any_poisoned_selected_given_flip", 0)
+        if total > 0:
+            global_ratio_by_budget[budget].append(any_selected / total)
+
+        for w_str, w_stats in stats.get("workers", {}).items():
+            w = int(w_str)
+            batches_with_flip = w_stats.get("batches_with_flip", 0)
+            selected_given_flip = w_stats.get("times_selected_given_flip", 0)
+            if batches_with_flip > 0:
+                worker_rate_by_budget[budget].setdefault(w, []).append(
+                    selected_given_flip / batches_with_flip
+                )
+
+    return global_ratio_by_budget, worker_rate_by_budget
+
+
+def plot_multikrum_poison_selection(cell_dir_fn, budgets, seeds, save_dir=None, filename=None,
+                                     title_suffix=""):
+    """Two-panel figure for ONE campaign's federated branch:
+      (a) global ratio, per budget, of aggregation steps where a poisoned worker's
+          flipped-label gradient was actually selected by Multi-Krum
+          (any_poisoned_selected_given_flip / total_aggregations), averaged over seeds;
+      (b) per-poisoned-worker selection rate (times_selected_given_flip / batches_with_flip,
+          NaN if that worker never saw a flipped-label batch), one line per worker id, x-axis
+          budget -- kept in its own dedicated figure (never overlaid on the CTA/ASR plots
+          above, which are a different axis entirely)."""
+    global_ratio_by_budget, worker_rate_by_budget = _poison_selection_rates(
+        cell_dir_fn, budgets, seeds
+    )
+    if not any(global_ratio_by_budget.values()):
+        print("[INFO] No multikrum_poison_stats.json files found -- skipping poison-selection plot.")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    xs = sorted(b for b in budgets if global_ratio_by_budget[b])
+    ys = [np.mean(global_ratio_by_budget[b]) * 100 for b in xs]
+    ax1.plot(xs, ys, marker="o", color="tab:purple")
+    ax1.set_xlabel("Budget")
+    ax1.set_ylabel("Aggregations w/ a poisoned+flipped gradient selected (%)")
+    ax1.set_ylim(0, 100)
+    ax1.grid(True, linestyle="--", alpha=0.25)
+    ax1.set_title(f"Multi-Krum: global poisoned-selection rate{title_suffix}")
+
+    all_workers = sorted({w for b in budgets for w in worker_rate_by_budget[b]})
+    for w in all_workers:
+        xs_w = sorted(b for b in budgets if w in worker_rate_by_budget[b])
+        ys_w = [np.mean(worker_rate_by_budget[b][w]) * 100 for b in xs_w]
+        ax2.plot(xs_w, ys_w, marker="o", label=f"worker {w}")
+    ax2.set_xlabel("Budget")
+    ax2.set_ylabel("Selection rate given a flip this batch (%)")
+    ax2.set_ylim(0, 100)
+    ax2.grid(True, linestyle="--", alpha=0.25)
+    ax2.legend(frameon=True, fontsize=9)
+    ax2.set_title(f"Multi-Krum: per-poisoned-worker selection rate{title_suffix}")
+
+    plt.tight_layout()
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, filename or "multikrum_poison_selection.png")
+        plt.savefig(path, dpi=300)
+        print(f"[INFO] Saved plot: {path}")
+
+    plt.close()
+
+
+def plot_multikrum_poison_selection_by_series(series, budgets, seeds, save_dir=None,
+                                                filename=None, title=""):
+    """One-panel figure comparing the GLOBAL poisoned-selection ratio across several variants
+    of the SAME isolated-factor study (e.g. grad_match relerr/cosine/off, or each epsilon
+    value, or base/lpips) -- `series` is a dict: series label -> cell_dir_fn(seed), one entry
+    per variant. This is the axis the isolated-factor studies actually want to compare (does
+    THIS factor change how often Multi-Krum accepts the poisoned gradient), kept separate from
+    the per-worker breakdown (still available per-variant via plot_multikrum_poison_selection)
+    since overlaying per-worker lines across variants would be unreadable."""
+    plt.figure(figsize=(7.5, 6))
+    any_data = False
+
+    for label, cell_dir_fn in series.items():
+        global_ratio_by_budget, _ = _poison_selection_rates(cell_dir_fn, budgets, seeds)
+        xs = sorted(b for b in budgets if global_ratio_by_budget[b])
+        if not xs:
+            continue
+        any_data = True
+        ys = [np.mean(global_ratio_by_budget[b]) * 100 for b in xs]
+        plt.plot(xs, ys, marker="o", label=str(label))
+
+    if not any_data:
+        print("[INFO] No multikrum_poison_stats.json files found -- skipping poison-selection comparison plot.")
+        plt.close()
+        return
+
+    plt.xlabel("Budget")
+    plt.ylabel("Aggregations w/ a poisoned+flipped gradient selected (%)")
+    plt.ylim(0, 100)
+    plt.grid(True, linestyle="--", alpha=0.25)
+    plt.legend(frameon=True, fontsize=10)
+    plt.title(title or "Multi-Krum: global poisoned-selection rate by variant")
+    plt.tight_layout()
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, filename or "multikrum_poison_selection_by_variant.png")
+        plt.savefig(path, dpi=300)
+        print(f"[INFO] Saved plot: {path}")
+
+    plt.close()
 
 
 # =========================
@@ -1089,4 +1499,310 @@ if __name__ == "__main__":
     plot_cta_vs_pta(
         all_data_dpd, dataset=DPD_DATASET, save_dir=f"{PLOT_DIR}/detach_param_dist_compare/",
         colors=DETACH_PARAM_DIST_COLORS, filename=f"{DPD_DATASET}_detach_param_dist_compare.png",
+    )
+
+    # -------------------------------------------------------------------
+    # grad_match ablation campaign (1-poisoned/0-honest, "mean" only, relerr / cosine / off --
+    # see gen_configs_gradmatch_ablation.py's own docstring). Same graceful-empty behavior as
+    # the sections above if this campaign hasn't been run yet.
+    # -------------------------------------------------------------------
+    print(f"\n=== [gradmatch_ablation] {GA_MODEL_FLAG} / {GA_DATASET} ({GA_NUM_POISONED}vs{GA_NUM_HONESTS}) ===")
+
+    all_data_ga = {}
+    block_ga = {}
+    ga_tags = [tag for tag, _, _ in GRADMATCH_VARIANTS]
+
+    for tag in ga_tags:
+        print(f"   -> {tag}")
+
+        df = compute_cta_pta_mean_var_gradmatch_ablation(
+            tag=tag, budgets=GA_BUDGETS, seeds=GA_SEEDS,
+        )
+
+        df.to_csv(
+            f"{CSV_DIR}/gradmatch_ablation_{GA_MODEL_FLAG}_{GA_DATASET}_{tag}.csv",
+            index=False,
+        )
+
+        all_data_ga[tag] = df
+
+        for _, row in df.iterrows():
+            block_ga[(row["budget"], tag)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_ga = build_table(
+        block_ga, GA_BUDGETS, ga_tags,
+        name=f"{GA_MODEL_FLAG}/{GA_DATASET} gradmatch_ablation",
+    )
+    with open(f"{TABLE_DIR}/gradmatch_ablation_{GA_MODEL_FLAG}_{GA_DATASET}.tex", "w") as f:
+        f.write(latex_table_ga)
+    print(f"[INFO] Saved LaTeX table for gradmatch_ablation comparison")
+
+    plot_cta_vs_pta(
+        all_data_ga, dataset=GA_DATASET, save_dir=f"{PLOT_DIR}/gradmatch_ablation/",
+        colors=GRADMATCH_ABLATION_COLORS, filename=f"{GA_DATASET}_gradmatch_ablation.png",
+    )
+
+    # Federated Multi-Krum branch of the SAME grad_match variants (see
+    # _federated_branch.federated_branch_configs) -- kept in its OWN plot/table, never mixed
+    # with the single-user CTA/ASR plot above (different worker-count/aggregator regime).
+    all_data_ga_fed = {}
+    block_ga_fed = {}
+    for tag in ga_tags:
+        df = compute_cta_pta_mean_var_gradmatch_ablation(
+            tag=tag, budgets=GA_BUDGETS, seeds=GA_SEEDS, mode=FED_TAG,
+        )
+        df.to_csv(
+            f"{CSV_DIR}/gradmatch_ablation_{GA_MODEL_FLAG}_{GA_DATASET}_{tag}_{FED_TAG}.csv",
+            index=False,
+        )
+        all_data_ga_fed[tag] = df
+        for _, row in df.iterrows():
+            block_ga_fed[(row["budget"], tag)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_ga_fed = build_table(
+        block_ga_fed, GA_BUDGETS, ga_tags,
+        name=f"{GA_MODEL_FLAG}/{GA_DATASET} gradmatch_ablation ({FED_TAG})",
+    )
+    with open(f"{TABLE_DIR}/gradmatch_ablation_{GA_MODEL_FLAG}_{GA_DATASET}_{FED_TAG}.tex", "w") as f:
+        f.write(latex_table_ga_fed)
+    print(f"[INFO] Saved LaTeX table for gradmatch_ablation ({FED_TAG})")
+
+    plot_cta_vs_pta(
+        all_data_ga_fed, dataset=GA_DATASET, save_dir=f"{PLOT_DIR}/gradmatch_ablation/",
+        colors=GRADMATCH_ABLATION_COLORS,
+        filename=f"{GA_DATASET}_gradmatch_ablation_{FED_TAG}.png",
+    )
+
+    print(f"   -> Multi-Krum poison-selection stats by grad_match variant")
+    plot_multikrum_poison_selection_by_series(
+        {tag: (lambda seed, tag=tag: GA_EXP_BASE / ga_cell_name(tag, seed)) for tag in ga_tags},
+        GA_BUDGETS, GA_SEEDS, save_dir=f"{PLOT_DIR}/gradmatch_ablation/",
+        filename=f"{GA_DATASET}_gradmatch_ablation_poison_selection.png",
+        title="Multi-Krum poisoned-selection rate by grad_match variant",
+    )
+
+    # -------------------------------------------------------------------
+    # epsilon (trigger L_infinity budget) sweep campaign (1-poisoned/0-honest, "mean" only,
+    # 1.0 down to 16/255 -- see gen_configs_epsilon_sweep.py's own docstring). Same
+    # graceful-empty behavior as the sections above if this campaign hasn't been run yet.
+    # -------------------------------------------------------------------
+    print(f"\n=== [epsilon_sweep] {EPS_MODEL_FLAG} / {EPS_DATASET} ({EPS_NUM_POISONED}vs{EPS_NUM_HONESTS}) ===")
+
+    all_data_eps = {}
+    block_eps = {}
+    eps_tags = [_eps_tag(e) for e in EPSILON_VALUES]
+
+    for epsilon, eps_tag in zip(EPSILON_VALUES, eps_tags):
+        print(f"   -> epsilon={epsilon:.4f}")
+
+        df = compute_cta_pta_mean_var_epsilon(
+            epsilon=epsilon, budgets=EPS_BUDGETS, seeds=EPS_SEEDS,
+        )
+
+        df.to_csv(
+            f"{CSV_DIR}/epsilon_sweep_{EPS_MODEL_FLAG}_{EPS_DATASET}_{eps_tag}.csv",
+            index=False,
+        )
+
+        all_data_eps[eps_tag] = df
+
+        for _, row in df.iterrows():
+            block_eps[(row["budget"], eps_tag)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_eps = build_table(
+        block_eps, EPS_BUDGETS, eps_tags,
+        name=f"{EPS_MODEL_FLAG}/{EPS_DATASET} epsilon_sweep",
+    )
+    with open(f"{TABLE_DIR}/epsilon_sweep_{EPS_MODEL_FLAG}_{EPS_DATASET}.tex", "w") as f:
+        f.write(latex_table_eps)
+    print(f"[INFO] Saved LaTeX table for epsilon_sweep comparison")
+
+    plot_cta_vs_pta(
+        all_data_eps, dataset=EPS_DATASET, save_dir=f"{PLOT_DIR}/epsilon_sweep/",
+        filename=f"{EPS_DATASET}_epsilon_sweep.png",
+    )
+
+    # Federated Multi-Krum branch of the SAME epsilon values -- kept in its OWN plot/table,
+    # never mixed with the single-user CTA/ASR plot above.
+    all_data_eps_fed = {}
+    block_eps_fed = {}
+    for epsilon, eps_tag in zip(EPSILON_VALUES, eps_tags):
+        df = compute_cta_pta_mean_var_epsilon(
+            epsilon=epsilon, budgets=EPS_BUDGETS, seeds=EPS_SEEDS, mode=FED_TAG,
+        )
+        df.to_csv(
+            f"{CSV_DIR}/epsilon_sweep_{EPS_MODEL_FLAG}_{EPS_DATASET}_{eps_tag}_{FED_TAG}.csv",
+            index=False,
+        )
+        all_data_eps_fed[eps_tag] = df
+        for _, row in df.iterrows():
+            block_eps_fed[(row["budget"], eps_tag)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_eps_fed = build_table(
+        block_eps_fed, EPS_BUDGETS, eps_tags,
+        name=f"{EPS_MODEL_FLAG}/{EPS_DATASET} epsilon_sweep ({FED_TAG})",
+    )
+    with open(f"{TABLE_DIR}/epsilon_sweep_{EPS_MODEL_FLAG}_{EPS_DATASET}_{FED_TAG}.tex", "w") as f:
+        f.write(latex_table_eps_fed)
+    print(f"[INFO] Saved LaTeX table for epsilon_sweep ({FED_TAG})")
+
+    plot_cta_vs_pta(
+        all_data_eps_fed, dataset=EPS_DATASET, save_dir=f"{PLOT_DIR}/epsilon_sweep/",
+        filename=f"{EPS_DATASET}_epsilon_sweep_{FED_TAG}.png",
+    )
+
+    print(f"   -> Multi-Krum poison-selection stats by epsilon")
+    plot_multikrum_poison_selection_by_series(
+        {
+            f"eps={epsilon:.4f}": (lambda seed, eps_tag=eps_tag: EPS_EXP_BASE / eps_cell_name(eps_tag, seed))
+            for epsilon, eps_tag in zip(EPSILON_VALUES, eps_tags)
+        },
+        EPS_BUDGETS, EPS_SEEDS, save_dir=f"{PLOT_DIR}/epsilon_sweep/",
+        filename=f"{EPS_DATASET}_epsilon_sweep_poison_selection.png",
+        title="Multi-Krum poisoned-selection rate by epsilon",
+    )
+
+    # -------------------------------------------------------------------
+    # LPIPS perceptual-loss comparison campaign (1-poisoned/0-honest, "mean" only, base vs
+    # +LPIPS -- see gen_configs_lpips_compare.py's own docstring). Same graceful-empty behavior
+    # as the sections above if this campaign hasn't been run yet.
+    # -------------------------------------------------------------------
+    print(f"\n=== [lpips_compare] {LP_MODEL_FLAG} / {LP_DATASET} ({LP_NUM_POISONED}vs{LP_NUM_HONESTS}) ===")
+
+    all_data_lp = {}
+    block_lp = {}
+    lp_tags = [tag for tag, _ in LPIPS_VARIANTS]
+
+    for tag in lp_tags:
+        print(f"   -> {tag}")
+
+        df = compute_cta_pta_mean_var_lpips(
+            tag=tag, budgets=LP_BUDGETS, seeds=LP_SEEDS,
+        )
+
+        df.to_csv(
+            f"{CSV_DIR}/lpips_compare_{LP_MODEL_FLAG}_{LP_DATASET}_{tag}.csv",
+            index=False,
+        )
+
+        all_data_lp[tag] = df
+
+        for _, row in df.iterrows():
+            block_lp[(row["budget"], tag)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_lp = build_table(
+        block_lp, LP_BUDGETS, lp_tags,
+        name=f"{LP_MODEL_FLAG}/{LP_DATASET} lpips_compare",
+    )
+    with open(f"{TABLE_DIR}/lpips_compare_{LP_MODEL_FLAG}_{LP_DATASET}.tex", "w") as f:
+        f.write(latex_table_lp)
+    print(f"[INFO] Saved LaTeX table for lpips comparison")
+
+    plot_cta_vs_pta(
+        all_data_lp, dataset=LP_DATASET, save_dir=f"{PLOT_DIR}/lpips_compare/",
+        colors=LPIPS_COLORS, filename=f"{LP_DATASET}_lpips_compare.png",
+    )
+
+    # Federated Multi-Krum branch of the SAME base/lpips variants -- kept in its OWN
+    # plot/table, never mixed with the single-user CTA/ASR plot above.
+    all_data_lp_fed = {}
+    block_lp_fed = {}
+    for tag in lp_tags:
+        df = compute_cta_pta_mean_var_lpips(
+            tag=tag, budgets=LP_BUDGETS, seeds=LP_SEEDS, mode=FED_TAG,
+        )
+        df.to_csv(
+            f"{CSV_DIR}/lpips_compare_{LP_MODEL_FLAG}_{LP_DATASET}_{tag}_{FED_TAG}.csv",
+            index=False,
+        )
+        all_data_lp_fed[tag] = df
+        for _, row in df.iterrows():
+            block_lp_fed[(row["budget"], tag)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_lp_fed = build_table(
+        block_lp_fed, LP_BUDGETS, lp_tags,
+        name=f"{LP_MODEL_FLAG}/{LP_DATASET} lpips_compare ({FED_TAG})",
+    )
+    with open(f"{TABLE_DIR}/lpips_compare_{LP_MODEL_FLAG}_{LP_DATASET}_{FED_TAG}.tex", "w") as f:
+        f.write(latex_table_lp_fed)
+    print(f"[INFO] Saved LaTeX table for lpips comparison ({FED_TAG})")
+
+    plot_cta_vs_pta(
+        all_data_lp_fed, dataset=LP_DATASET, save_dir=f"{PLOT_DIR}/lpips_compare/",
+        colors=LPIPS_COLORS, filename=f"{LP_DATASET}_lpips_compare_{FED_TAG}.png",
+    )
+
+    print(f"   -> Multi-Krum poison-selection stats by lpips variant")
+    plot_multikrum_poison_selection_by_series(
+        {tag: (lambda seed, tag=tag: LP_EXP_BASE / lp_cell_name(tag, seed)) for tag in lp_tags},
+        LP_BUDGETS, LP_SEEDS, save_dir=f"{PLOT_DIR}/lpips_compare/",
+        filename=f"{LP_DATASET}_lpips_compare_poison_selection.png",
+        title="Multi-Krum poisoned-selection rate: base vs LPIPS",
+    )
+
+    # -------------------------------------------------------------------
+    # single-user vs federated Multi-Krum comparison campaign (attack generated ONCE at
+    # 1-poisoned/0-honest/mean, deployed via two branches -- see
+    # gen_configs_federated_multikrum_compare.py's own docstring). Same graceful-empty
+    # behavior as the sections above if this campaign hasn't been run yet. Kept in its OWN
+    # plot (never mixed with the main campaign's agg_method-swept plot above, which is a
+    # different worker-count regime entirely).
+    # -------------------------------------------------------------------
+    print(
+        f"\n=== [federated_multikrum_compare] {FM_MODEL_FLAG} / {FM_DATASET} -- single_user "
+        f"({FM_NUM_POISONED}vs{FM_NUM_HONESTS}) vs {FED_TAG} ({FED_NUM_POISONED}vs{FED_NUM_HONESTS}) ==="
+    )
+
+    all_data_fm = {}
+    block_fm = {}
+    fm_modes = ["single_user", FED_TAG]
+
+    for mode in fm_modes:
+        print(f"   -> {mode}")
+
+        df = compute_cta_pta_mean_var_federated_multikrum(
+            mode=mode, budgets=FM_BUDGETS, seeds=FM_SEEDS,
+        )
+
+        df.to_csv(
+            f"{CSV_DIR}/federated_multikrum_compare_{FM_MODEL_FLAG}_{FM_DATASET}_{mode}.csv",
+            index=False,
+        )
+
+        all_data_fm[mode] = df
+
+        for _, row in df.iterrows():
+            block_fm[(row["budget"], mode)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_fm = build_table(
+        block_fm, FM_BUDGETS, fm_modes,
+        name=f"{FM_MODEL_FLAG}/{FM_DATASET} single_user vs {FED_TAG}",
+    )
+    with open(f"{TABLE_DIR}/federated_multikrum_compare_{FM_MODEL_FLAG}_{FM_DATASET}.tex", "w") as f:
+        f.write(latex_table_fm)
+    print(f"[INFO] Saved LaTeX table for federated_multikrum comparison")
+
+    plot_cta_vs_pta(
+        all_data_fm, dataset=FM_DATASET, save_dir=f"{PLOT_DIR}/federated_multikrum_compare/",
+        colors=FEDERATED_MULTIKRUM_COLORS, filename=f"{FM_DATASET}_federated_multikrum_compare.png",
+    )
+
+    print(f"\n=== [federated_multikrum_compare] Multi-Krum poison-selection stats ===")
+    plot_multikrum_poison_selection(
+        lambda seed: FM_EXP_BASE / fm_cell_name(seed),
+        FM_BUDGETS, FM_SEEDS, save_dir=f"{PLOT_DIR}/federated_multikrum_compare/",
     )

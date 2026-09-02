@@ -36,7 +36,7 @@ def _compute_scores(gradients, f, m, **kwargs):
     m         Optional number of averaged gradients for Multi-Krum
     ...       Ignored keyword-arguments
   Returns:
-    List of (gradient, score) by sorted (increasing) scores
+    List of (score, gradient, original_index) by sorted (increasing) scores
   """
   n = len(gradients)
   # Compute all pairwise distances
@@ -57,29 +57,36 @@ def _compute_scores(gradients, f, m, **kwargs):
       grad_dists.append(distances[(2 * n - i - 3) * i // 2 + j - 1])
     # Select the n - f - 1 smallest distances
     grad_dists.sort()
-    scores.append((sum(grad_dists[:n - f - 1]), gradients[i]))
+    scores.append((sum(grad_dists[:n - f - 1]), gradients[i], i))
   # Sort the gradients by increasing scores
   scores.sort(key=lambda x: x[0])
   return scores
 
-def aggregate(gradients, f, m=None, **kwargs):
+def aggregate(gradients, f, m=None, return_selected=False, **kwargs):
   """ Multi-Krum rule.
   Args:
-    gradients Non-empty list of gradients to aggregate
-    f         Number of Byzantine gradients to tolerate
-    m         Optional number of averaged gradients for Multi-Krum
-    ...       Ignored keyword-arguments
+    gradients      Non-empty list of gradients to aggregate
+    f              Number of Byzantine gradients to tolerate
+    m              Optional number of averaged gradients for Multi-Krum
+    return_selected  If True, also return the list of original indices
+                     (into `gradients`) that were selected/averaged
+    ...            Ignored keyword-arguments
   Returns:
-    Aggregated gradient
+    Aggregated gradient, or (aggregated gradient, selected_indices) if
+    return_selected is True
   """
   # Defaults
   if m is None:
     m = len(gradients) - f - 2
   # Compute aggregated gradient
   scores = _compute_scores(gradients, f, m, **kwargs)
-  # return sum(grad for _, grad in scores[:m]).div_(m)
-  selected_grads = [grad for _, grad in scores[:m]]
-  return torch.stack(selected_grads).mean(dim=0)
+  selected = scores[:m]
+  selected_grads = [grad for _, grad, _ in selected]
+  result = torch.stack(selected_grads).mean(dim=0)
+  if return_selected:
+    selected_indices = [idx for _, _, idx in selected]
+    return result, selected_indices
+  return result
 
 def aggregate_native(gradients, f, m=None, **kwargs):
   """ Multi-Krum rule.
@@ -144,7 +151,7 @@ def influence(honests, attacks, f, m=None, **kwargs):
   scores = _compute_scores(gradients, f, m, **kwargs)
   # Compute the influence ratio
   count = 0
-  for _, gradient in scores[:m]:
+  for _, gradient, _ in scores[:m]:
     for attack in attacks:
       if gradient is attack:
         count += 1

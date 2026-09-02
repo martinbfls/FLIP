@@ -4,6 +4,7 @@ Trains a downstream (user) model on reconstructed datasets with input labels in 
 
 from pathlib import Path
 import sys
+import json
 import torch
 import numpy as np
 from torch.utils.data import Subset
@@ -13,6 +14,7 @@ from modules.base_utils.datasets import (
     get_n_classes,
     pick_poisoner,
     construct_user_dataset,
+    PoisonFlagDataset,
 )
 from modules.base_utils.util import (
     extract_toml,
@@ -56,6 +58,7 @@ def run(experiment_name, module_name, **kwargs):
     output_dir = Path(slurmify_path(args["output_dir"], slurm_id))
     output_dir.mkdir(parents=True, exist_ok=True)
     agg_method = args.get("agg_method", "mean")
+    track_poison_selection = args.get("track_poison_selection", False)
 
     print("Loading base datasets...")
     poisoner = pick_poisoner(poisoner_flag, dataset_flag, target_label, delta)
@@ -74,6 +77,11 @@ def run(experiment_name, module_name, **kwargs):
 
     print("Reconstructing worker datasets...")
     user_datasets = []
+
+    idx_flipped = None
+    if track_poison_selection:
+        idx_flipped_path = input_dir / f"{budget}_idx_flipped.npy"
+        idx_flipped = np.load(idx_flipped_path)
 
     for w in range(num_workers):
         idx = np.load(input_dir / f"worker{w}/{budget}_indices.npy")
@@ -95,6 +103,9 @@ def run(experiment_name, module_name, **kwargs):
             labels_d = labels_d.argmax(dim=1)
 
         user_dataset = construct_user_dataset(subset, labels_d)
+        if track_poison_selection:
+            is_flipped_mask = np.isin(idx, idx_flipped)
+            user_dataset = PoisonFlagDataset(user_dataset, is_flipped_mask)
         user_datasets.append(user_dataset)
 
     print("Training user model...")
@@ -110,7 +121,7 @@ def run(experiment_name, module_name, **kwargs):
         scheduler_kwargs,
     )
 
-    model_retrain, clean_metrics, poison_metrics = mini_train_multi(
+    train_result = mini_train_multi(
         model=model_retrain,
         train_datasets=user_datasets,
         test_data=[test, poison_test.poison_dataset],
@@ -122,11 +133,19 @@ def run(experiment_name, module_name, **kwargs):
         agg_method=agg_method,
         f=num_poisoned,
         epoch_callback=tracker.epoch_callback(),
+        track_poison_selection=track_poison_selection,
     )
+    if track_poison_selection:
+        model_retrain, poison_stats, clean_metrics, poison_metrics = train_result
+    else:
+        model_retrain, clean_metrics, poison_metrics = train_result
 
     print("Saving results...")
     np.save(output_dir / "paccs.npy", poison_metrics)
     np.save(output_dir / "caccs.npy", clean_metrics)
+    if track_poison_selection:
+        with open(output_dir / "multikrum_poison_stats.json", "w") as f:
+            json.dump(poison_stats, f, indent=2)
     #torch.save(model_retrain.state_dict(), output_dir / "model.pth")
 
     tracker.finalize()

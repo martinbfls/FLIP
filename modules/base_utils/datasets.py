@@ -898,6 +898,24 @@ def construct_user_dataset(distill_dataset, labels, mask=None, target_label=None
     dataset = LabelWrappedDataset(distill_dataset, labels, include_labels)
     return dataset
 
+
+class PoisonFlagDataset(Dataset):
+    '''Wraps a (x, y) dataset with a precomputed per-example boolean flag, yielding
+    (x, y, is_flipped). Used to trace which examples in a federated worker's shard carry a
+    flipped label, through training and into the aggregator (see mini_train_multi's
+    track_poison_selection).'''
+    def __init__(self, dataset: Dataset, is_flipped):
+        self.dataset = dataset
+        self.is_flipped = is_flipped
+        assert len(dataset) == len(is_flipped)
+
+    def __getitem__(self, i: int):
+        x, y = self.dataset[i]
+        return x, y, bool(self.is_flipped[i])
+
+    def __len__(self):
+        return len(self.dataset)
+
 def get_n_classes(dataset_flag):
     return N_CLASSES[dataset_flag]
 

@@ -16,3 +16,4 @@ osqp==1.1.3
 Pillow
 matplotlib
 wandb
+lpips

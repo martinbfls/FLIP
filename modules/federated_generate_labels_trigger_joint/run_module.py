@@ -33,7 +33,7 @@ from modules.federated_optimizing_trigger.utils import (
 from modules.federated_generate_labels_trigger_joint.utils import (
     TriggerMTTDataset, extract_experts_biased, build_expert_pool,
     directional_floor_penalty, magnitude_floor_penalty, project_trigger_constraints,
-    cosine_to, grad_mismatch_penalty, grad_cosine_penalty,
+    cosine_to, grad_mismatch_penalty, grad_cosine_penalty, lpips_penalty,
 )
 
 
@@ -442,6 +442,19 @@ def run(experiment_name, module_name, **kwargs):
         )
     track_gradmatch = lambda_gradmatch != 0
 
+    # Perceptual (LPIPS) penalty on the trigger (see utils.lpips_penalty): off by default
+    # (0.0 = no-op, identical to the module's behavior before this term existed -- lpips is
+    # imported lazily below, only if lambda_lpips > 0, so this remains an optional dependency
+    # for every other config).
+    lambda_lpips = args.get("lambda_lpips", 0.0)
+    lpips_model = None
+    if lambda_lpips > 0:
+        import lpips as _lpips_pkg
+        lpips_model = _lpips_pkg.LPIPS(net="alex")
+        lpips_model.eval()
+        for p in lpips_model.parameters():
+            p.requires_grad_(False)
+
     # detach_param_dist (2026-09-03, see run() docstring "Detaching param_dist"): off by
     # default (False = no-op, identical to the module's behavior before this flag existed --
     # param_dist stays part of mtt_term_k's live graph).
@@ -581,6 +594,9 @@ def run(experiment_name, module_name, **kwargs):
     ]
 
     device = get_module_device(student_models[0])
+
+    if lpips_model is not None:
+        lpips_model = lpips_model.to(device)
 
     mu = get_mu(dataset_flag, target_label, device, model_flag=expert_model_flag)
     mu_source = mu if clean_label == -1 else get_mu(
@@ -867,6 +883,7 @@ def run(experiment_name, module_name, **kwargs):
                 gradmatch_list = []
                 matching_term_list = []
                 L_bd_mean_list = []
+                L_lpips_mean_list = []
 
                 for k, (checkpoint, state_dict) in enumerate(checkpoints_k):
                     # expert_models[k]/student_models[k] are PERSISTENT, DISTINCT instances
@@ -896,6 +913,8 @@ def run(experiment_name, module_name, **kwargs):
 
                     L_bd_sum = torch.tensor(0.0, device=device)
                     n_bd_valid = 0
+                    L_lpips_sum = torch.tensor(0.0, device=device)
+                    n_lpips_valid = 0
 
                     for cid, batch in enumerate(batches):
 
@@ -1037,6 +1056,31 @@ def run(experiment_name, module_name, **kwargs):
                                 L_bd_sum = L_bd_sum + L_bd_cid.detach()
                                 n_bd_valid += 1
 
+                                # Perceptual (LPIPS) penalty on the trigger (see utils.
+                                # lpips_penalty): off by default (lambda_lpips=0.0, lpips_model
+                                # is None, this whole block is skipped -- no-op, identical
+                                # behavior to before this term existed). When active, follows
+                                # exactly the same manual delta.grad accumulation pattern as
+                                # L_bd above (retain_graph=True: x_trig's node is shared with
+                                # x_t_adv, still needed by grand_loss.backward() later this
+                                # batch).
+                                if lpips_model is not None:
+                                    L_lpips_cid = lpips_penalty(delta, x_raw_adv, lpips_model)
+                                    lpips_grad_raw = torch.autograd.grad(
+                                        L_lpips_cid, [delta],
+                                        retain_graph=True, allow_unused=True,
+                                    )[0]
+                                    if lpips_grad_raw is not None:
+                                        lpips_grad = (
+                                            lambda_lpips / n_checkpoints_per_step
+                                        ) * lpips_grad_raw.detach()
+                                        delta.grad = (
+                                            lpips_grad if delta.grad is None
+                                            else delta.grad + lpips_grad
+                                        )
+                                    L_lpips_sum = L_lpips_sum + L_lpips_cid.detach()
+                                    n_lpips_valid += 1
+
                             # Student
                             loss_s = clf_loss(student_model(x_d), softmax(y_d))
                             grads_s = torch.autograd.grad(
@@ -1141,6 +1185,9 @@ def run(experiment_name, module_name, **kwargs):
                     L_bd_mean_list.append(
                         (L_bd_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
                     )
+                    L_lpips_mean_list.append(
+                        (L_lpips_sum / n_lpips_valid).item() if n_lpips_valid > 0 else 0.0
+                    )
 
                 # Step 5 instrumentation: snapshot of delta.grad from JUST the L_bd path
                 # (accumulated across ALL n_checkpoints_per_step checkpoints' cid loops above,
@@ -1243,6 +1290,7 @@ def run(experiment_name, module_name, **kwargs):
                 # n_checkpoints_per_step per-checkpoint values collected during the k-loop above
                 # -- n_checkpoints_per_step==1 makes this exactly the single value it always was.
                 L_bd_mean = float(np.mean(L_bd_mean_list))
+                L_lpips_mean = float(np.mean(L_lpips_mean_list))
                 matching_term = float(np.mean(matching_term_list))
 
                 # Anti-collapse instrumentation (§2): recomputed AFTER the step and the
@@ -1322,6 +1370,7 @@ def run(experiment_name, module_name, **kwargs):
                         "grand_loss": grand_loss.item(),
                         "matching_term": matching_term,
                         "L_bd_mean": L_bd_mean,
+                        "L_lpips_mean": L_lpips_mean,
                         "expert_asr": asr_mean,
                         "expert_asr_frozen": asr_frozen_mean,
                         "cos_delta_to_init": cos_to_init,
@@ -1351,6 +1400,7 @@ def run(experiment_name, module_name, **kwargs):
                     it,
                     grand_loss=grand_loss.item(),
                     L_bd_mean=L_bd_mean,
+                    L_lpips_mean=L_lpips_mean,
                     expert_asr=asr_mean,
                     expert_asr_frozen=asr_frozen_mean,
                     delta_l2=delta_l2,

@@ -304,6 +304,7 @@ def mini_train_multi(
     agg_method="mean",
     f=1,
     epoch_callback=None,
+    track_poison_selection=False,
 ):
     device = get_module_device(model)
 
@@ -323,6 +324,25 @@ def mini_train_multi(
             test_data = [test_data]
         acc_loss = [[] for _ in range(len(test_data))]
 
+    if track_poison_selection:
+        # Worker ordering convention shared with partition_across_workers /
+        # build_federated_datasets: honest workers first, poisoned workers last (the last
+        # `f` entries of `dataloaders`).
+        num_workers_total = len(dataloaders)
+        poisoned_worker_ids = list(range(num_workers_total - f, num_workers_total))
+        poison_stats = {
+            "total_aggregations": 0,
+            "any_poisoned_selected_given_flip": 0,
+            "workers": {
+                w: {
+                    "batches_with_flip": 0,
+                    "times_selected_total": 0,
+                    "times_selected_given_flip": 0,
+                }
+                for w in poisoned_worker_ids
+            },
+        }
+
     with make_pbar(total=total_examples) as pbar:
         for epoch in range(1, epochs + 1):
             model.train()
@@ -336,7 +356,16 @@ def mini_train_multi(
                 batch_correct = 0
                 batch_samples = 0
 
-                for x, y in batches:
+                if track_poison_selection:
+                    batch_has_flip = {}
+
+                for w, batch in enumerate(batches):
+                    if track_poison_selection:
+                        x, y, is_flipped = batch
+                        if w in poison_stats["workers"]:
+                            batch_has_flip[w] = bool(is_flipped.any().item())
+                    else:
+                        x, y = batch
                     x, y = x.to(device), y.to(device)
                     batch_samples += len(x)
 
@@ -354,12 +383,18 @@ def mini_train_multi(
                     batch_loss += loss.item() * len(x)
                     batch_correct += correct.item()
 
+                if track_poison_selection:
+                    step_selected_workers = set()
+
                 model.zero_grad()
                 for i, p in enumerate(model.parameters()):
                     if not grad_buffer[i]:
                         continue
 
                     grads = torch.stack(grad_buffer[i], dim=0)
+                    track_this_param = (
+                        track_poison_selection and agg_method in ("multikrum", "krum")
+                    )
 
                     if agg_method == "mean":
                         g = grads.mean(dim=0)
@@ -368,11 +403,23 @@ def mini_train_multi(
                     elif agg_method == "trmean":
                         g = aggr_trmean(grads, f=f)
                     elif agg_method == "multikrum":
-                        g = aggr_multikrum(grads, f=f)
+                        if track_this_param:
+                            g, selected_idx = aggr_multikrum(
+                                grads, f=f, return_selected=True
+                            )
+                            step_selected_workers.update(selected_idx)
+                        else:
+                            g = aggr_multikrum(grads, f=f)
                     elif agg_method == "softmultikrum":
                         g = aggr_soft_multikrum(grads, f=f, m=grads.shape[0] - f - 2)
                     elif agg_method == "krum":
-                        g = aggr_multikrum(grads, f=f, m=1)
+                        if track_this_param:
+                            g, selected_idx = aggr_multikrum(
+                                grads, f=f, m=1, return_selected=True
+                            )
+                            step_selected_workers.update(selected_idx)
+                        else:
+                            g = aggr_multikrum(grads, f=f, m=1)
                     elif agg_method == "softkrum":
                         g = aggr_soft_multikrum(grads, f=f, m=1)
                     else:
@@ -381,6 +428,22 @@ def mini_train_multi(
                     p.grad = g
 
                 opt.step()
+
+                if track_poison_selection:
+                    poison_stats["total_aggregations"] += 1
+                    any_selected_given_flip = False
+                    for w in poison_stats["workers"]:
+                        has_flip = batch_has_flip.get(w, False)
+                        selected = w in step_selected_workers
+                        if has_flip:
+                            poison_stats["workers"][w]["batches_with_flip"] += 1
+                            if selected:
+                                poison_stats["workers"][w]["times_selected_given_flip"] += 1
+                                any_selected_given_flip = True
+                        if selected:
+                            poison_stats["workers"][w]["times_selected_total"] += 1
+                    if any_selected_given_flip:
+                        poison_stats["any_poisoned_selected_given_flip"] += 1
 
                 train_epoch_loss += batch_loss
                 train_epoch_correct += batch_correct
@@ -416,6 +479,10 @@ def mini_train_multi(
                     lr,
                 )
 
+    if track_poison_selection:
+        if record:
+            return model, poison_stats, *acc_loss
+        return model, poison_stats
     if record:
         return model, *acc_loss
     return model
