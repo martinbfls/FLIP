@@ -195,15 +195,22 @@ def run(experiment_name, module_name, **kwargs):
     train_expert checkpoints this run started from) replace the expert trajectory
     (`expert_starts`/`expert_opt_starts`, and `expert_pool` if pooling is on) for the remaining
     iterations. Default 0 leaves the frozen-trajectory behavior above completely unchanged.
-    If `n_checkpoints_per_step` > 1 (see below) and a late retraining round's `remaining_
-    iterations` is too small to redraw a pool with as many distinct checkpoints as the run
-    started with, `expert_pool`'s rebuilt `pool_size` is clamped down (warns) same as at
-    startup -- but if that clamp drops `pool_size` below `n_checkpoints_per_step` itself (only
-    possible from a retrain round, since startup already validates `n_checkpoints_per_step <=`
-    the initial `pool_size`), `n_checkpoints_per_step` is ALSO clamped down to match (warns) for
-    the remainder of the run, rather than letting the next `_load_experts_for_step` call raise
-    "Sample larger than population." A smaller multi-checkpoint average near the very end of a
-    run is preferable to losing an almost-complete one to this edge case.
+    When pooling is enabled (`pool_size` != 1), each retraining round's redraw of candidate
+    checkpoints for `expert_pool` is sized to comfortably exceed `pool_size` (`max(remaining_
+    iterations, pool_size)` draws requested from extract_experts/extract_experts_biased),
+    NOT tied to `remaining_iterations` the way the `pool_size==1` fallback's absolute-index
+    redraw still is -- a retrain round late in the run (small `remaining_iterations`) would
+    otherwise only ever generate `remaining_iterations * len(expert_config['trajectories'])`
+    raw candidate draws (as few as `len(trajectories)` with `remaining_iterations=1`), starving
+    the pool regardless of how many checkpoints this round's own `mini_train` actually wrote to
+    disk (`expert_config['max']-['min']` epochs * `len(trajectories)` distinct files are
+    typically available -- far more than `pool_size`). As a last-resort safety net for
+    configurations where even this still yields fewer distinct checkpoints than requested (e.g.
+    an unusually small `expert_config` epoch range relative to `pool_size`), `build_expert_pool`
+    still clamps `pool_size` down (warns) same as at startup, and if that clamp drops `pool_size`
+    below `n_checkpoints_per_step` itself, `n_checkpoints_per_step` is ALSO clamped down to match
+    (warns) for the remainder of the run, rather than letting the next `_load_experts_for_step`
+    call raise "Sample larger than population."
     With retraining on, `expert_asr` should stop drifting away from `expert_asr_frozen` purely
     because of trajectory staleness -- a persistent gap then points at delta/L_bd itself,
     not this design difference.
@@ -765,14 +772,32 @@ def run(experiment_name, module_name, **kwargs):
         round_opt_pths = str(
             retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}_opt.pth"
         )
+        # How many (iteration, trajectory-length) draws to request from extract_experts/
+        # extract_experts_biased for THIS round's redraw. When pool_size==1, new_starts is
+        # indexed directly by absolute outer iteration (`expert_starts[it]`, see
+        # _load_expert_for_step) -- it MUST have exactly `remaining_iterations` entries to cover
+        # every iteration through the end of the run, so it stays tied to remaining_iterations.
+        # When pool_size!=1 (pooling enabled -- this run's case), new_starts/new_opt_starts are
+        # used ONLY as raw candidate material for build_expert_pool below (deduped, then
+        # random.sample'd) -- expert_starts[it] is never read in that branch (guarded in
+        # _load_expert_for_step) -- so the draw count can be decoupled from remaining_iterations
+        # entirely and sized instead to comfortably exceed pool_size. Without this, a retrain
+        # round late in the run (small remaining_iterations, e.g. 1) would only ever generate
+        # remaining_iterations * len(trajectories) raw draws -- as few as 4 with a single
+        # trajectory-length list of 4 -- starving the pool regardless of how many checkpoints
+        # this round's mini_train actually wrote to disk (expert_config['max']-['min'] epochs *
+        # len(trajectories) distinct files are typically available, far more than pool_size).
+        extract_iterations = (
+            max(remaining_iterations, pool_size) if pool_size != 1 else remaining_iterations
+        )
         if checkpoint_sampling == "uniform":
             new_starts, new_opt_starts = extract_experts(
-                expert_config, round_input_pths, remaining_iterations,
+                expert_config, round_input_pths, extract_iterations,
                 expert_opt_path=round_opt_pths,
             )
         else:
             new_starts, new_opt_starts = extract_experts_biased(
-                expert_config, round_input_pths, remaining_iterations, alpha_ckpt,
+                expert_config, round_input_pths, extract_iterations, alpha_ckpt,
                 expert_opt_path=round_opt_pths,
             )
         expert_starts = expert_starts[:it] + new_starts
