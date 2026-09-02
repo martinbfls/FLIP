@@ -195,6 +195,15 @@ def run(experiment_name, module_name, **kwargs):
     train_expert checkpoints this run started from) replace the expert trajectory
     (`expert_starts`/`expert_opt_starts`, and `expert_pool` if pooling is on) for the remaining
     iterations. Default 0 leaves the frozen-trajectory behavior above completely unchanged.
+    If `n_checkpoints_per_step` > 1 (see below) and a late retraining round's `remaining_
+    iterations` is too small to redraw a pool with as many distinct checkpoints as the run
+    started with, `expert_pool`'s rebuilt `pool_size` is clamped down (warns) same as at
+    startup -- but if that clamp drops `pool_size` below `n_checkpoints_per_step` itself (only
+    possible from a retrain round, since startup already validates `n_checkpoints_per_step <=`
+    the initial `pool_size`), `n_checkpoints_per_step` is ALSO clamped down to match (warns) for
+    the remainder of the run, rather than letting the next `_load_experts_for_step` call raise
+    "Sample larger than population." A smaller multi-checkpoint average near the very end of a
+    run is preferable to losing an almost-complete one to this edge case.
     With retraining on, `expert_asr` should stop drifting away from `expert_asr_frozen` purely
     because of trajectory staleness -- a persistent gap then points at delta/L_bd itself,
     not this design difference.
@@ -700,7 +709,7 @@ def run(experiment_name, module_name, **kwargs):
     retrain_base_dir = Path(output_dir).parent / "expert_retrain"
 
     def _retrain_expert_with_trigger(round_idx, delta_snapshot, it, remaining_iterations):
-        nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size
+        nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size, n_checkpoints_per_step
 
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
@@ -777,6 +786,29 @@ def run(experiment_name, module_name, **kwargs):
             expert_pool, pool_size = build_expert_pool(
                 new_starts, new_opt_starts, pool_size,
             )
+            # build_expert_pool may have clamped pool_size down to fewer DISTINCT checkpoints
+            # than this retrained trajectory's own build_expert_pool call at startup had
+            # available (a short `remaining_iterations` near the end of the run yields fewer
+            # (iteration, trajectory-length) draws to pool from) -- the startup validation
+            # (n_checkpoints_per_step > pool_size raises ValueError) only ever checked the
+            # ORIGINAL pool_size, not this refreshed one, so _load_experts_for_step's
+            # random.sample(expert_pool, n_checkpoints_per_step) would otherwise raise
+            # "Sample larger than population" the next time it's called. Clamp
+            # n_checkpoints_per_step itself (nonlocal, so every reader -- _load_experts_for_step,
+            # the k-loop's own len(checkpoints_k), and every 1/n_checkpoints_per_step scaling
+            # below -- sees the same reduced value from here on) rather than raise: a smaller
+            # average over fewer checkpoints for the remainder of THIS run is preferable to
+            # losing a run that's otherwise almost done to a late-stage crash.
+            if n_checkpoints_per_step > pool_size:
+                print(
+                    f"WARNING: n_checkpoints_per_step={n_checkpoints_per_step} > refreshed "
+                    f"pool_size={pool_size} (round {round_idx} produced fewer distinct "
+                    "checkpoints than requested, likely because remaining_iterations= "
+                    f"{remaining_iterations} left too few (iteration, trajectory-length) draws "
+                    f"to pool from) -- clamping n_checkpoints_per_step to {pool_size} for the "
+                    "rest of this run."
+                )
+                n_checkpoints_per_step = pool_size
         print(f"[expert_retrain] round {round_idx}: done, trajectory refreshed from it={it}.")
 
     losses = []
