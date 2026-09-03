@@ -125,6 +125,25 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_gradmatch_lambd
     cell_name as gls_cell_name,
     _lambda_tag,
 )
+# lambda_match sweep campaign (gradmatch_metric/lambda_gradmatch pinned to gen_configs.py's own
+# defaults -- "relerr"/1.0 -- lambda_match swept instead, see
+# gen_configs_match_lambda_sweep.py's own docstring) -- another SEPARATE, 1-poisoned/0-honest
+# campaign, distinct from the lambda_gradmatch sweep above (which varies lambda_gradmatch
+# itself at lambda_match=0.0, the module's default). lambda_match is the "aggregate-gradient
+# alignment" term ported from federated_optimizing_trigger's old (pre-joint) L_match objective
+# -- see run_module.py's run() docstring, "Aggregate-gradient alignment". Aliased (MLS_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_match_lambda_sweep import (
+    EXP_BASE as MLS_EXP_BASE,
+    MODEL_FLAG as MLS_MODEL_FLAG,
+    DATASET as MLS_DATASET,
+    NUM_POISONED as MLS_NUM_POISONED,
+    NUM_HONESTS as MLS_NUM_HONESTS,
+    SEEDS as MLS_SEEDS,
+    BUDGETS as MLS_BUDGETS,
+    LAMBDA_MATCH_VALUES,
+    cell_name as mls_cell_name,
+    _match_lambda_tag,
+)
 # epsilon (trigger L_infinity budget) sweep campaign (1.0 down to 16/255, see
 # gen_configs_epsilon_sweep.py's own docstring) -- another SEPARATE, 1-poisoned/0-honest
 # campaign. Aliased (EPS_ prefix).
@@ -575,6 +594,50 @@ def compute_cta_pta_mean_var_gradmatch_lambda_sweep(
                 "mode": mode,
                 "budget": budget,
                 "model": GLS_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_cta_pta_mean_var_match_lambda_sweep(
+    lambda_match,
+    budgets,
+    seeds,
+    mode="single_user",
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var, for the lambda_match sweep campaign instead
+    (1-poisoned/0-honest, "mean" aggregation only, gradmatch_metric/lambda_gradmatch pinned to
+    gen_configs.py's own defaults, lambda_match-swept -- see
+    gen_configs_match_lambda_sweep.py's own docstring). Directory layout matches that module's
+    generate_cell() exactly: MLS_EXP_BASE / mls_cell_name(match_lambda_tag, seed) /
+    train_user_{budget}/{caccs,paccs}.npy (single_user) or .../FED_TAG/train_user_{budget}/...
+    (mode=FED_TAG, the federated Multi-Krum branch of the SAME attack -- see
+    _federated_branch.py).
+    """
+    records = []
+    match_lambda_tag = _match_lambda_tag(lambda_match)
+
+    for budget in budgets:
+        run_dir_fn = lambda seed, budget=budget: (
+            _branch_run_dir(MLS_EXP_BASE / mls_cell_name(match_lambda_tag, seed), budget, mode)
+        )
+        cta_mean, cta_var, pta_mean, pta_var = _cta_pta_mean_var(
+            run_dir_fn, seeds, cta_file, pta_file
+        )
+        records.append(
+            {
+                "dataset": MLS_DATASET,
+                "lambda_match": lambda_match,
+                "mode": mode,
+                "budget": budget,
+                "model": MLS_MODEL_FLAG,
                 "cta_mean": cta_mean,
                 "cta_var": cta_var,
                 "pta_mean": pta_mean,
@@ -1168,6 +1231,36 @@ def save_all_trigger_visuals_gradmatch_lambda_sweep(lambda_values, seeds):
             module_dir = GLS_EXP_BASE / gls_cell_name(lambda_tag, seed) / "gen_labels_trigger_joint"
             print(
                 f"  {trigger_path_in(module_dir, GLS_MODEL_FLAG, GLS_DATASET, GLS_NUM_POISONED, GLS_NUM_HONESTS)}"
+            )
+    return saved
+
+
+def save_all_trigger_visuals_match_lambda_sweep(lambda_values, seeds):
+    """lambda_match sweep campaign wrapper: builds each cell's module_dir via
+    gen_configs_match_lambda_sweep.py's own cell_name/EXP_BASE and NUM_POISONED/NUM_HONESTS
+    (1vs0). init is fixed at "stripe" (that module's own default), gradmatch_metric/
+    lambda_gradmatch pinned to gen_configs.py's own defaults throughout -- only lambda_match
+    varies, same reasoning as save_all_trigger_visuals_gradmatch_lambda_sweep's fixed init."""
+    saved, missing = [], []
+    for lam in lambda_values:
+        match_lambda_tag = _match_lambda_tag(lam)
+        for seed in seeds:
+            module_dir = MLS_EXP_BASE / mls_cell_name(match_lambda_tag, seed) / "gen_labels_trigger_joint"
+            out_path = save_trigger_visual_in(
+                module_dir, MLS_MODEL_FLAG, MLS_DATASET, MLS_NUM_POISONED, MLS_NUM_HONESTS,
+                label=f"lambda_match={lam:g}, seed{seed}",
+            )
+            if out_path is None:
+                missing.append((lam, seed))
+            else:
+                saved.append(out_path)
+    if missing:
+        print(f"[INFO] {len(missing)} match_lambda_sweep trigger(s) not found yet (skipped):")
+        for lam, seed in missing:
+            match_lambda_tag = _match_lambda_tag(lam)
+            module_dir = MLS_EXP_BASE / mls_cell_name(match_lambda_tag, seed) / "gen_labels_trigger_joint"
+            print(
+                f"  {trigger_path_in(module_dir, MLS_MODEL_FLAG, MLS_DATASET, MLS_NUM_POISONED, MLS_NUM_HONESTS)}"
             )
     return saved
 
@@ -1920,6 +2013,105 @@ if __name__ == "__main__":
         GLS_BUDGETS, GLS_SEEDS, save_dir=f"{PLOT_DIR}/gradmatch_lambda_sweep/",
         filename=f"{GLS_DATASET}_gradmatch_lambda_sweep_poison_selection.png",
         title="Multi-Krum poisoned-selection rate by lambda_gradmatch",
+    )
+
+    # -------------------------------------------------------------------
+    # lambda_match sweep campaign (1-poisoned/0-honest, "mean" only, gradmatch_metric/
+    # lambda_gradmatch pinned to gen_configs.py's own defaults -- lambda_match swept instead,
+    # see gen_configs_match_lambda_sweep.py's own docstring). lambda_match is the
+    # "aggregate-gradient alignment" term ported from federated_optimizing_trigger's old
+    # (pre-joint) L_match objective -- see run_module.py's run() docstring. Same graceful-empty
+    # behavior as the sections above if this campaign hasn't been run yet.
+    # -------------------------------------------------------------------
+    print(f"\n=== [match_lambda_sweep] Trigger visuals ===")
+    save_all_trigger_visuals_match_lambda_sweep(LAMBDA_MATCH_VALUES, MLS_SEEDS)
+
+    print(
+        f"\n=== [match_lambda_sweep] {MLS_MODEL_FLAG} / {MLS_DATASET} "
+        f"({MLS_NUM_POISONED}vs{MLS_NUM_HONESTS}) ==="
+    )
+
+    mls_lam_labels = [f"lambda_match={lam:g}" for lam in LAMBDA_MATCH_VALUES]
+
+    all_data_mls = {}
+    block_mls = {}
+
+    for lam, lam_label in zip(LAMBDA_MATCH_VALUES, mls_lam_labels):
+        print(f"   -> {lam_label}")
+
+        df = compute_cta_pta_mean_var_match_lambda_sweep(
+            lambda_match=lam, budgets=MLS_BUDGETS, seeds=MLS_SEEDS,
+        )
+
+        df.to_csv(
+            f"{CSV_DIR}/match_lambda_sweep_{MLS_MODEL_FLAG}_{MLS_DATASET}_{lam:g}.csv",
+            index=False,
+        )
+
+        all_data_mls[lam_label] = df
+
+        for _, row in df.iterrows():
+            block_mls[(row["budget"], lam_label)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_mls = build_table(
+        block_mls, MLS_BUDGETS, mls_lam_labels,
+        name=f"{MLS_MODEL_FLAG}/{MLS_DATASET} match_lambda_sweep",
+    )
+    with open(f"{TABLE_DIR}/match_lambda_sweep_{MLS_MODEL_FLAG}_{MLS_DATASET}.tex", "w") as f:
+        f.write(latex_table_mls)
+    print(f"[INFO] Saved LaTeX table for match_lambda_sweep")
+
+    plot_cta_vs_pta(
+        all_data_mls, dataset=MLS_DATASET, save_dir=f"{PLOT_DIR}/match_lambda_sweep/",
+        filename=f"{MLS_DATASET}_match_lambda_sweep.png",
+    )
+
+    # Federated Multi-Krum branch of the SAME lambda_match values -- kept in its OWN
+    # plot/table, never mixed with the single-user CTA/ASR plot above.
+    all_data_mls_fed = {}
+    block_mls_fed = {}
+    for lam, lam_label in zip(LAMBDA_MATCH_VALUES, mls_lam_labels):
+        df = compute_cta_pta_mean_var_match_lambda_sweep(
+            lambda_match=lam, budgets=MLS_BUDGETS, seeds=MLS_SEEDS, mode=FED_TAG,
+        )
+        df.to_csv(
+            f"{CSV_DIR}/match_lambda_sweep_{MLS_MODEL_FLAG}_{MLS_DATASET}_{lam:g}_{FED_TAG}.csv",
+            index=False,
+        )
+        all_data_mls_fed[lam_label] = df
+        for _, row in df.iterrows():
+            block_mls_fed[(row["budget"], lam_label)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_mls_fed = build_table(
+        block_mls_fed, MLS_BUDGETS, mls_lam_labels,
+        name=f"{MLS_MODEL_FLAG}/{MLS_DATASET} match_lambda_sweep ({FED_TAG})",
+    )
+    with open(
+        f"{TABLE_DIR}/match_lambda_sweep_{MLS_MODEL_FLAG}_{MLS_DATASET}_{FED_TAG}.tex", "w"
+    ) as f:
+        f.write(latex_table_mls_fed)
+    print(f"[INFO] Saved LaTeX table for match_lambda_sweep ({FED_TAG})")
+
+    plot_cta_vs_pta(
+        all_data_mls_fed, dataset=MLS_DATASET, save_dir=f"{PLOT_DIR}/match_lambda_sweep/",
+        filename=f"{MLS_DATASET}_match_lambda_sweep_{FED_TAG}.png",
+    )
+
+    print(f"   -> Multi-Krum poison-selection stats by lambda_match")
+    plot_multikrum_poison_selection_by_series(
+        {
+            lam_label: (
+                lambda seed, lam=lam: MLS_EXP_BASE / mls_cell_name(_match_lambda_tag(lam), seed)
+            )
+            for lam, lam_label in zip(LAMBDA_MATCH_VALUES, mls_lam_labels)
+        },
+        MLS_BUDGETS, MLS_SEEDS, save_dir=f"{PLOT_DIR}/match_lambda_sweep/",
+        filename=f"{MLS_DATASET}_match_lambda_sweep_poison_selection.png",
+        title="Multi-Krum poisoned-selection rate by lambda_match",
     )
 
     # -------------------------------------------------------------------

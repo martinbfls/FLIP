@@ -384,7 +384,43 @@ def mini_train_multi(
                     batch_correct += correct.item()
 
                 if track_poison_selection:
+                    # Default for agg_method not in ("multikrum", "krum") -- "selection"
+                    # isn't a concept for mean/median/trmean/soft*, so every worker reads as
+                    # not-selected for those (same as before this fix).
                     step_selected_workers = set()
+
+                if track_poison_selection and agg_method in ("multikrum", "krum"):
+                    # True (Blanchard et al.) Multi-Krum selection, computed ONCE on each
+                    # worker's FULL gradient (every parameter tensor flattened and
+                    # concatenated) -- diagnostics ONLY, does not affect the actual per-
+                    # parameter aggregation loop below (kept bit-for-bit unchanged: same
+                    # aggr_multikrum(grads, f=f[, m=1]) call as before, its return value
+                    # never depended on return_selected).
+                    #
+                    # Before this fix, poison_stats used the UNION, across every parameter
+                    # tensor, of that tensor's OWN independent per-parameter Krum selection.
+                    # r32p has ~90 parameter tensors; at m = n - f - 2 (roughly half of n
+                    # selected per tensor), the probability that a given worker -- honest or
+                    # poisoned -- is selected in at least ONE of ~90 independent per-tensor
+                    # draws is essentially 1. That made "any_poisoned_selected_given_flip"
+                    # saturate near 100% regardless of the attack's actual strength, which is
+                    # why it didn't move across lambda_gradmatch/epsilon/etc. This block
+                    # instead runs Krum a single time on the concatenated full-model
+                    # gradient (one point per worker in the full parameter space), matching
+                    # what Multi-Krum is actually meant to measure.
+                    full_vectors = [
+                        torch.cat([
+                            grad_buffer[i][w].reshape(-1)
+                            for i in range(len(grad_buffer))
+                            if grad_buffer[i]
+                        ])
+                        for w in range(len(batches))
+                    ]
+                    krum_m = 1 if agg_method == "krum" else None
+                    _, step_selected_workers = aggr_multikrum(
+                        full_vectors, f=f, m=krum_m, return_selected=True
+                    )
+                    step_selected_workers = set(step_selected_workers)
 
                 model.zero_grad()
                 for i, p in enumerate(model.parameters()):
@@ -392,9 +428,6 @@ def mini_train_multi(
                         continue
 
                     grads = torch.stack(grad_buffer[i], dim=0)
-                    track_this_param = (
-                        track_poison_selection and agg_method in ("multikrum", "krum")
-                    )
 
                     if agg_method == "mean":
                         g = grads.mean(dim=0)
@@ -403,23 +436,11 @@ def mini_train_multi(
                     elif agg_method == "trmean":
                         g = aggr_trmean(grads, f=f)
                     elif agg_method == "multikrum":
-                        if track_this_param:
-                            g, selected_idx = aggr_multikrum(
-                                grads, f=f, return_selected=True
-                            )
-                            step_selected_workers.update(selected_idx)
-                        else:
-                            g = aggr_multikrum(grads, f=f)
+                        g = aggr_multikrum(grads, f=f)
                     elif agg_method == "softmultikrum":
                         g = aggr_soft_multikrum(grads, f=f, m=grads.shape[0] - f - 2)
                     elif agg_method == "krum":
-                        if track_this_param:
-                            g, selected_idx = aggr_multikrum(
-                                grads, f=f, m=1, return_selected=True
-                            )
-                            step_selected_workers.update(selected_idx)
-                        else:
-                            g = aggr_multikrum(grads, f=f, m=1)
+                        g = aggr_multikrum(grads, f=f, m=1)
                     elif agg_method == "softkrum":
                         g = aggr_soft_multikrum(grads, f=f, m=1)
                     else:

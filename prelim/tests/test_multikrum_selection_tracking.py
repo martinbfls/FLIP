@@ -74,6 +74,58 @@ def test_aggregate_default_unchanged_return_type():
 
 
 # --------------------------------------------------------------------------- #
+# 1b. Regression for the per-parameter-union saturation bug: mini_train_multi used to track
+# poison selection as the UNION, across every parameter tensor, of that tensor's OWN
+# independent Multi-Krum selection -- with O(90) parameter tensors for r32p and roughly half
+# the workers selected per tensor, the union tends towards including every worker, honest or
+# poisoned, even when each is a clear outlier considered on its full gradient. The fix computes
+# selection ONCE on each worker's full gradient (every parameter flattened and concatenated),
+# matching true (Blanchard et al.) Multi-Krum. This test reproduces that gap with synthetic
+# per-parameter values where workers 1 and 2 each carry one wildly outlying coordinate (on
+# param B and param A respectively) but are otherwise unremarkable: each is only an outlier on
+# ONE of the three params, so the per-parameter union still includes both (selected via the
+# other two params), while the full-vector selection -- which sees each worker's outlying
+# coordinate no matter which param it's on -- correctly excludes both.
+# --------------------------------------------------------------------------- #
+
+def test_full_vector_selection_vs_per_parameter_union():
+    f = 1  # n=5, m = n - f - 2 = 2 for both the per-parameter and full-vector computation.
+
+    # Each row is one "parameter", each column one worker (0..4).
+    param_values = [
+        [0.0, 0.10, -10.0, 0.20, 0.15],   # param A -- worker 2 is the outlier here
+        [0.0, -10.0, 0.05, 0.20, 0.15],   # param B -- worker 1 is the outlier here
+        [-10.0, 0.10, 0.05, 0.20, 0.15],  # param C -- worker 0 is the outlier here
+    ]
+    n_workers = 5
+
+    # Old (buggy) behavior: union of each parameter's OWN independent Krum selection.
+    union_selected = set()
+    for values in param_values:
+        grads = [torch.tensor([v]) for v in values]
+        _, selected = krum_aggregate(grads, f=f, return_selected=True)
+        union_selected.update(selected)
+
+    check("per-parameter union wrongly includes workers 1 and 2 (each an outlier on one "
+          "param, but selected via the other two)",
+          {1, 2} <= union_selected,
+          f"union_selected={sorted(union_selected)}")
+
+    # New (fixed) behavior: one Krum pass on each worker's full (concatenated) vector.
+    full_vectors = [
+        torch.tensor([param_values[p][w] for p in range(len(param_values))])
+        for w in range(n_workers)
+    ]
+    _, full_selected = krum_aggregate(full_vectors, f=f, return_selected=True)
+    full_selected = set(full_selected)
+
+    check("full-vector selection correctly rejects the single-coordinate outliers (1 and 2) "
+          "that the per-parameter union wrongly let through",
+          full_selected.isdisjoint({1, 2}),
+          f"full_selected={sorted(full_selected)}")
+
+
+# --------------------------------------------------------------------------- #
 # 2. mini_train_multi: track_poison_selection bookkeeping on a tiny synthetic federated setup
 # --------------------------------------------------------------------------- #
 
@@ -190,6 +242,7 @@ def test_mini_train_multi_default_path_unaffected():
 if __name__ == "__main__":
     test_aggregate_return_selected()
     test_aggregate_default_unchanged_return_type()
+    test_full_vector_selection_vs_per_parameter_union()
     test_mini_train_multi_poison_stats()
     test_mini_train_multi_default_path_unaffected()
 

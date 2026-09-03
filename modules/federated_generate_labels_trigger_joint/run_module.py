@@ -301,6 +301,24 @@ def run(experiment_name, module_name, **kwargs):
     only when lambda_gradmatch != 0 (`track_gradmatch` below) -- the clean-subset-only forward
     pass this requires for poisoned clients is pure overhead otherwise.
 
+    Aggregate-gradient alignment (2026-09-04, `lambda_match`, optional, off by default): an
+    additional term, L_match (`lambda_match * L_match` added to grand_loss, weight default 0.0
+    = no-op), porting federated_optimizing_trigger's old (pre-joint, trigger-then-labels)
+    L_match objective into this module: L_match = 1 - cos(agg_expert_grads,
+    grad(L_p)(theta_k)(delta)) (grad_cosine_penalty, reused as-is -- it is generic over any two
+    same-shaped per-parameter gradient lists, not specifically "clean vs poison"). Unlike
+    L_gradmatch (which pushes the poisoned gradient to look like a CLEAN gradient, a stealth
+    objective), L_match directly rewards delta for making the REALISTIC, already-aggregated
+    (agg_method-mixed, `agg()`-computed, see E2 point 2a) expert gradient at this checkpoint
+    point toward the poison-only direction -- i.e. maximizing the backdoor's influence on the
+    actual SGD update the expert trajectory takes, rather than relying solely on param_loss's
+    indirect trajectory-matching pressure to do so. agg_expert_grads is already computed and
+    DIFFERENTIABLE w.r.t. delta (needed by param_loss regardless); grad(L_p)(theta_k)(delta) is
+    poison_grad_mean, shared with the gradient-mismatch penalty above -- so enabling lambda_match
+    alone (lambda_gradmatch left at 0) still triggers the same clean-subset-free poison_grad_chunks
+    collection, but skips clean_grad_chunks/its extra forward pass entirely. Computed only when
+    lambda_match != 0 (`track_match` below).
+
     Detaching param_dist (2026-09-03, `detach_param_dist`, optional, off by default):
     mtt_term_k = param_loss / param_dist -- param_dist = sum_p total_mse_distance(init_p,
     expert_next_param) is itself a function of delta (through agg_expert_grads ->
@@ -441,6 +459,17 @@ def run(experiment_name, module_name, **kwargs):
             f"gradmatch_metric must be 'relerr' or 'cosine', got {gradmatch_metric!r}"
         )
     track_gradmatch = lambda_gradmatch != 0
+
+    # Aggregate-match penalty (see run() docstring, "Aggregate-gradient alignment"): off by
+    # default (0.0 = no-op). Ports federated_optimizing_trigger's old (pre-joint,
+    # trigger-then-labels) L_match term into this module: 1 - cos(agg_expert_grads,
+    # grad(L_p)(theta_k)(delta)) -- rewards delta for making the REALISTIC, already-aggregated
+    # (agg_method-mixed) gradient at this checkpoint point toward the poison-only direction,
+    # instead of only relying on param_loss's indirect trajectory-matching pressure to do so.
+    # Reuses poison_grad_chunks (see the gradient-mismatch penalty above) -- no separate forward
+    # pass, only the tiny extra agg_expert_grads-vs-poison_grad_mean cosine computed below.
+    lambda_match = args.get("lambda_match", 0.0)
+    track_match = lambda_match != 0
 
     # Perceptual (LPIPS) penalty on the trigger (see utils.lpips_penalty): off by default
     # (0.0 = no-op, identical to the module's behavior before this term existed -- lpips is
@@ -881,6 +910,7 @@ def run(experiment_name, module_name, **kwargs):
 
                 mtt_term_list = []
                 gradmatch_list = []
+                match_list = []
                 matching_term_list = []
                 L_bd_mean_list = []
                 L_lpips_mean_list = []
@@ -1023,7 +1053,12 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 logits_bd = expert_model(x_trig)
                                 L_bd_cid = clf_loss(logits_bd, y_t[is_poisoned_dev])
-                                grad_targets = [delta] + expert_params if track_gradmatch else [delta]
+                                # poison_grad_chunks (bd_grads[1:] below) feeds BOTH the
+                                # gradient-mismatch penalty (track_gradmatch) AND the
+                                # aggregate-match penalty (track_match) -- either one wanting it
+                                # is enough to ask for it here.
+                                track_poison_grad = track_gradmatch or track_match
+                                grad_targets = [delta] + expert_params if track_poison_grad else [delta]
                                 # retain_graph=True (unlike the indirect module): x_trig's node is
                                 # shared with x_t_adv (which fed loss_e/grads_e, still needed by
                                 # grand_loss.backward() later this batch) -- freeing it here would
@@ -1031,7 +1066,7 @@ def run(experiment_name, module_name, **kwargs):
                                 bd_grads = torch.autograd.grad(
                                     L_bd_cid, grad_targets,
                                     retain_graph=True, allow_unused=True,
-                                    create_graph=track_gradmatch,
+                                    create_graph=track_poison_grad,
                                 )
                                 delta_grad_raw = bd_grads[0]
                                 if delta_grad_raw is not None:
@@ -1049,7 +1084,7 @@ def run(experiment_name, module_name, **kwargs):
                                         delta_grad if delta.grad is None
                                         else delta.grad + delta_grad
                                     )
-                                if track_gradmatch:
+                                if track_poison_grad:
                                     for i, g in enumerate(bd_grads[1:]):
                                         if g is not None:
                                             poison_grad_chunks[i].append(g)
@@ -1090,20 +1125,31 @@ def run(experiment_name, module_name, **kwargs):
                             for i, g in enumerate(grads_s):
                                 student_grad_buf[i].append(g)
 
+                    # poison_grad_mean (mean of grad(L_p)(theta_k)(delta) over every
+                    # genuinely-poisoned row this batch, per expert_model parameter) feeds BOTH
+                    # the gradient-mismatch penalty below AND the aggregate-match penalty after
+                    # agg_expert_grads is computed -- shared here so it's computed at most once.
+                    # None whenever this batch happened to draw zero poisoned examples for some
+                    # parameter (e.g. no poisoned client's batch had any triggered rows).
+                    have_poison_grad = all(len(c) > 0 for c in poison_grad_chunks)
+                    poison_grad_mean = (
+                        [torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks]
+                        if (track_gradmatch or track_match) and have_poison_grad
+                        else None
+                    )
+
                     # Gradient-mismatch penalty for THIS checkpoint (see run() docstring):
                     # means-of-contributing-chunks per expert_model parameter, then
                     # flattened/combined into a single ratio. Falls back to 0.0 whenever
                     # disabled, or whenever this batch happened to draw zero clean or zero
                     # poisoned examples for some parameter (e.g. num_honests==0 and no poisoned
                     # client's batch had any clean rows).
-                    if track_gradmatch and all(len(c) > 0 for c in clean_grad_chunks) and all(
-                        len(c) > 0 for c in poison_grad_chunks
+                    if (
+                        track_gradmatch and poison_grad_mean is not None
+                        and all(len(c) > 0 for c in clean_grad_chunks)
                     ):
                         clean_grad_mean = [
                             torch.stack(c, dim=0).mean(dim=0) for c in clean_grad_chunks
-                        ]
-                        poison_grad_mean = [
-                            torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks
                         ]
                         penalty_fn = (
                             grad_cosine_penalty if gradmatch_metric == "cosine"
@@ -1132,6 +1178,20 @@ def run(experiment_name, module_name, **kwargs):
                         agg_method,
                         f=num_poisoned
                     )
+
+                    # Aggregate-match penalty for THIS checkpoint (see run() docstring,
+                    # "Aggregate-gradient alignment"): 1 - cos(agg_expert_grads,
+                    # poison_grad_mean) -- rewards delta for making the REALISTIC,
+                    # already-aggregated gradient point toward the poison-only direction,
+                    # instead of relying solely on param_loss's indirect trajectory-matching
+                    # pressure. agg_expert_grads is DIFFERENTIABLE w.r.t. delta (see above);
+                    # poison_grad_mean was computed above (shared with the gradient-mismatch
+                    # penalty). Falls back to 0.0 when disabled or when poison_grad_mean
+                    # couldn't be computed this batch (same fallback as L_gradmatch_k).
+                    if track_match and poison_grad_mean is not None:
+                        L_match_k = grad_cosine_penalty(agg_expert_grads, poison_grad_mean)
+                    else:
+                        L_match_k = torch.tensor(0.0, device=device)
 
                     # MTT objective for THIS checkpoint, against the DIFFERENTIABLE
                     # expert_next_param (E2, points 1/2a) instead of the real,
@@ -1173,12 +1233,13 @@ def run(experiment_name, module_name, **kwargs):
                         mtt_term_k = param_loss / mtt_denom
 
                     # Multi-checkpoint averaging (see run() docstring): collect this
-                    # checkpoint's own differentiable contributions (mtt_term_k, L_gradmatch_k)
-                    # for averaging OUTSIDE the k-loop -- reg_term/trigger-regularizers/
+                    # checkpoint's own differentiable contributions (mtt_term_k, L_gradmatch_k,
+                    # L_match_k) for averaging OUTSIDE the k-loop -- reg_term/trigger-regularizers/
                     # anti-collapse terms below do NOT depend on the checkpoint, so they are
                     # computed/added exactly ONCE, after the k-loop, not per checkpoint.
                     mtt_term_list.append(mtt_term_k)
                     gradmatch_list.append(L_gradmatch_k)
+                    match_list.append(L_match_k)
                     matching_term_list.append(
                         (param_loss / param_dist).item() if param_dist.item() != 0 else 0.0
                     )
@@ -1213,6 +1274,7 @@ def run(experiment_name, module_name, **kwargs):
                 # (mean of one element), so grand_loss is bit-for-bit unchanged in that case.
                 mtt_term_avg = torch.stack(mtt_term_list).mean()
                 L_gradmatch_avg = torch.stack(gradmatch_list).mean()
+                L_match_avg = torch.stack(match_list).mean()
 
                 grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
@@ -1241,6 +1303,7 @@ def run(experiment_name, module_name, **kwargs):
                     grand_loss = grand_loss + (lambda_align * L_align + lambda_mag * L_mag)
 
                 grand_loss = grand_loss + lambda_gradmatch * L_gradmatch_avg
+                grand_loss = grand_loss + lambda_match * L_match_avg
 
                 # Optimize labels and trigger. delta.grad already holds the per-client L_bd
                 # contributions accumulated above (point 3) -- grand_loss.backward() ADDS the
@@ -1386,6 +1449,7 @@ def run(experiment_name, module_name, **kwargs):
                         "reg_term": reg_term.item(),
                         "mtt_delta_grad_norm": mtt_delta_grad_norm,
                         "L_gradmatch": L_gradmatch_avg.item(),
+                        "L_match": L_match_avg.item(),
                         # Multi-checkpoint spread diagnostics (see run() docstring "Averaging
                         # the loss over multiple checkpoints"): std across the
                         # n_checkpoints_per_step checkpoints used THIS step -- 0.0 by
@@ -1409,6 +1473,7 @@ def run(experiment_name, module_name, **kwargs):
                     L_mag=L_mag_post,
                     mtt_delta_grad_norm=mtt_delta_grad_norm,
                     L_gradmatch=L_gradmatch_avg.item(),
+                    L_match=L_match_avg.item(),
                 )
 
                 pbar.update(batch_size)
@@ -1428,6 +1493,7 @@ def run(experiment_name, module_name, **kwargs):
                     mag_rate=f"{mag_active_rate:.2f}",
                     mtt_grad=f"{mtt_delta_grad_norm:.4g}",
                     gradmatch=f"{L_gradmatch_avg.item():.4g}",
+                    agg_match=f"{L_match_avg.item():.4g}",
                 )
 
     # Save results
