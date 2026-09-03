@@ -818,6 +818,37 @@ def trigger_path_in(module_dir, model_flag, dataset, num_poisoned, num_honests, 
     )
 
 
+def check_epsilon_compliance(
+    module_dir, model_flag, dataset, num_poisoned, num_honests, epsilon, init="stripe",
+    tol=1e-6,
+):
+    """Loads the saved trigger .pt and reports the measured L_infinity norm
+    (delta.abs().max()) against the `epsilon` this cell was configured with -- a direct,
+    numeric check that run_module.py's per-step `delta.clamp_(-epsilon, epsilon)` (or the
+    "projection" branch's Linf-ball projection, see project_trigger_constraints) actually held
+    for the FINAL saved delta, instead of eyeballing PNGs where a small epsilon's effect can be
+    visually subtle. Returns None if the .pt doesn't exist yet (same graceful-skip convention
+    as save_trigger_visual_in); otherwise returns (measured_linf, epsilon, within_bound: bool).
+    within_bound uses `tol` slack for float rounding -- anything measured > epsilon + tol would
+    mean the hard constraint was violated (a real bug), not just "hard to see"."""
+    trig_path = trigger_path_in(
+        module_dir, model_flag, dataset, num_poisoned, num_honests, init=init,
+    )
+    if not trig_path.exists():
+        return None
+
+    delta = torch.load(trig_path, map_location="cpu")
+    measured_linf = delta.abs().max().item()
+    within_bound = measured_linf <= epsilon + tol
+
+    status = "OK" if within_bound else "VIOLATION"
+    print(
+        f"[EPSILON CHECK] {trig_path.parent.parent.name}: measured max|delta|="
+        f"{measured_linf:.6f} vs configured epsilon={epsilon:.6f} -- {status}"
+    )
+    return measured_linf, epsilon, within_bound
+
+
 def save_trigger_visual_in(
     module_dir, model_flag, dataset, num_poisoned, num_honests, label, sample_seed=0,
     init="stripe",
@@ -1060,6 +1091,10 @@ def save_all_trigger_visuals_epsilon(epsilons, seeds):
         eps_tag = _eps_tag(epsilon)
         for seed in seeds:
             module_dir = EPS_EXP_BASE / eps_cell_name(eps_tag, seed) / "gen_labels_trigger_joint"
+            check_epsilon_compliance(
+                module_dir, EPS_MODEL_FLAG, EPS_DATASET, EPS_NUM_POISONED, EPS_NUM_HONESTS,
+                epsilon=epsilon,
+            )
             out_path = save_trigger_visual_in(
                 module_dir, EPS_MODEL_FLAG, EPS_DATASET, EPS_NUM_POISONED, EPS_NUM_HONESTS,
                 label=f"eps={epsilon:.4f}, seed{seed}",
