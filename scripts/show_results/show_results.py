@@ -1022,6 +1022,116 @@ def save_all_trigger_visuals_detach_param_dist(detach_param_dists, seeds):
     return saved
 
 
+def save_all_trigger_visuals_gradmatch_ablation(tags, seeds):
+    """grad_match ablation campaign wrapper: builds each cell's module_dir via
+    gen_configs_gradmatch_ablation.py's own cell_name/EXP_BASE and NUM_POISONED/NUM_HONESTS
+    (1vs0). init is fixed at "stripe" (that module's own default), same reasoning as
+    save_all_trigger_visuals_gradmatch's fixed init. The trigger is generated once per (tag,
+    seed) regardless of which branch (single_user/FED_TAG) reads it, so there's no `mode` here
+    -- same as the other isolated-factor studies below."""
+    saved, missing = [], []
+    for tag in tags:
+        for seed in seeds:
+            module_dir = GA_EXP_BASE / ga_cell_name(tag, seed) / "gen_labels_trigger_joint"
+            out_path = save_trigger_visual_in(
+                module_dir, GA_MODEL_FLAG, GA_DATASET, GA_NUM_POISONED, GA_NUM_HONESTS,
+                label=f"{tag}, seed{seed}",
+            )
+            if out_path is None:
+                missing.append((tag, seed))
+            else:
+                saved.append(out_path)
+    if missing:
+        print(f"[INFO] {len(missing)} gradmatch_ablation trigger(s) not found yet (skipped):")
+        for tag, seed in missing:
+            module_dir = GA_EXP_BASE / ga_cell_name(tag, seed) / "gen_labels_trigger_joint"
+            print(
+                f"  {trigger_path_in(module_dir, GA_MODEL_FLAG, GA_DATASET, GA_NUM_POISONED, GA_NUM_HONESTS)}"
+            )
+    return saved
+
+
+def save_all_trigger_visuals_epsilon(epsilons, seeds):
+    """epsilon sweep campaign wrapper: builds each cell's module_dir via
+    gen_configs_epsilon_sweep.py's own cell_name/EXP_BASE and NUM_POISONED/NUM_HONESTS (1vs0).
+    init is fixed at "stripe" (that module's own default)."""
+    saved, missing = [], []
+    for epsilon in epsilons:
+        eps_tag = _eps_tag(epsilon)
+        for seed in seeds:
+            module_dir = EPS_EXP_BASE / eps_cell_name(eps_tag, seed) / "gen_labels_trigger_joint"
+            out_path = save_trigger_visual_in(
+                module_dir, EPS_MODEL_FLAG, EPS_DATASET, EPS_NUM_POISONED, EPS_NUM_HONESTS,
+                label=f"eps={epsilon:.4f}, seed{seed}",
+            )
+            if out_path is None:
+                missing.append((epsilon, seed))
+            else:
+                saved.append(out_path)
+    if missing:
+        print(f"[INFO] {len(missing)} epsilon_sweep trigger(s) not found yet (skipped):")
+        for epsilon, seed in missing:
+            eps_tag = _eps_tag(epsilon)
+            module_dir = EPS_EXP_BASE / eps_cell_name(eps_tag, seed) / "gen_labels_trigger_joint"
+            print(
+                f"  {trigger_path_in(module_dir, EPS_MODEL_FLAG, EPS_DATASET, EPS_NUM_POISONED, EPS_NUM_HONESTS)}"
+            )
+    return saved
+
+
+def save_all_trigger_visuals_lpips(tags, seeds):
+    """LPIPS comparison campaign wrapper: builds each cell's module_dir via
+    gen_configs_lpips_compare.py's own cell_name/EXP_BASE and NUM_POISONED/NUM_HONESTS (1vs0).
+    init is fixed at "stripe" (that module's own default)."""
+    saved, missing = [], []
+    for tag in tags:
+        for seed in seeds:
+            module_dir = LP_EXP_BASE / lp_cell_name(tag, seed) / "gen_labels_trigger_joint"
+            out_path = save_trigger_visual_in(
+                module_dir, LP_MODEL_FLAG, LP_DATASET, LP_NUM_POISONED, LP_NUM_HONESTS,
+                label=f"{tag}, seed{seed}",
+            )
+            if out_path is None:
+                missing.append((tag, seed))
+            else:
+                saved.append(out_path)
+    if missing:
+        print(f"[INFO] {len(missing)} lpips_compare trigger(s) not found yet (skipped):")
+        for tag, seed in missing:
+            module_dir = LP_EXP_BASE / lp_cell_name(tag, seed) / "gen_labels_trigger_joint"
+            print(
+                f"  {trigger_path_in(module_dir, LP_MODEL_FLAG, LP_DATASET, LP_NUM_POISONED, LP_NUM_HONESTS)}"
+            )
+    return saved
+
+
+def save_all_trigger_visuals_federated_multikrum(seeds):
+    """single-user vs federated Multi-Krum comparison campaign wrapper: the attack is generated
+    ONCE per seed (see gen_configs_federated_multikrum_compare.py's own docstring), so there's
+    no per-mode/per-tag axis here -- just builds each cell's module_dir via that module's own
+    cell_name/EXP_BASE and NUM_POISONED/NUM_HONESTS (1vs0, the single_user generation settings).
+    init is fixed at "stripe" (that module's own default)."""
+    saved, missing = [], []
+    for seed in seeds:
+        module_dir = FM_EXP_BASE / fm_cell_name(seed) / "gen_labels_trigger_joint"
+        out_path = save_trigger_visual_in(
+            module_dir, FM_MODEL_FLAG, FM_DATASET, FM_NUM_POISONED, FM_NUM_HONESTS,
+            label=f"seed{seed}",
+        )
+        if out_path is None:
+            missing.append(seed)
+        else:
+            saved.append(out_path)
+    if missing:
+        print(f"[INFO] {len(missing)} federated_multikrum_compare trigger(s) not found yet (skipped):")
+        for seed in missing:
+            module_dir = FM_EXP_BASE / fm_cell_name(seed) / "gen_labels_trigger_joint"
+            print(
+                f"  {trigger_path_in(module_dir, FM_MODEL_FLAG, FM_DATASET, FM_NUM_POISONED, FM_NUM_HONESTS)}"
+            )
+    return saved
+
+
 def compute_best_second(block, budgets, series_labels):
     best = {}
     second = {}
@@ -1506,6 +1616,11 @@ if __name__ == "__main__":
     # see gen_configs_gradmatch_ablation.py's own docstring). Same graceful-empty behavior as
     # the sections above if this campaign hasn't been run yet.
     # -------------------------------------------------------------------
+    print(f"\n=== [gradmatch_ablation] Trigger visuals ===")
+    save_all_trigger_visuals_gradmatch_ablation(
+        [tag for tag, _, _ in GRADMATCH_VARIANTS], GA_SEEDS
+    )
+
     print(f"\n=== [gradmatch_ablation] {GA_MODEL_FLAG} / {GA_DATASET} ({GA_NUM_POISONED}vs{GA_NUM_HONESTS}) ===")
 
     all_data_ga = {}
@@ -1590,6 +1705,9 @@ if __name__ == "__main__":
     # 1.0 down to 16/255 -- see gen_configs_epsilon_sweep.py's own docstring). Same
     # graceful-empty behavior as the sections above if this campaign hasn't been run yet.
     # -------------------------------------------------------------------
+    print(f"\n=== [epsilon_sweep] Trigger visuals ===")
+    save_all_trigger_visuals_epsilon(EPSILON_VALUES, EPS_SEEDS)
+
     print(f"\n=== [epsilon_sweep] {EPS_MODEL_FLAG} / {EPS_DATASET} ({EPS_NUM_POISONED}vs{EPS_NUM_HONESTS}) ===")
 
     all_data_eps = {}
@@ -1675,11 +1793,15 @@ if __name__ == "__main__":
     # +LPIPS -- see gen_configs_lpips_compare.py's own docstring). Same graceful-empty behavior
     # as the sections above if this campaign hasn't been run yet.
     # -------------------------------------------------------------------
+    lp_tags = [tag for tag, _ in LPIPS_VARIANTS]
+
+    print(f"\n=== [lpips_compare] Trigger visuals ===")
+    save_all_trigger_visuals_lpips(lp_tags, LP_SEEDS)
+
     print(f"\n=== [lpips_compare] {LP_MODEL_FLAG} / {LP_DATASET} ({LP_NUM_POISONED}vs{LP_NUM_HONESTS}) ===")
 
     all_data_lp = {}
     block_lp = {}
-    lp_tags = [tag for tag, _ in LPIPS_VARIANTS]
 
     for tag in lp_tags:
         print(f"   -> {tag}")
@@ -1760,6 +1882,9 @@ if __name__ == "__main__":
     # plot (never mixed with the main campaign's agg_method-swept plot above, which is a
     # different worker-count regime entirely).
     # -------------------------------------------------------------------
+    print(f"\n=== [federated_multikrum_compare] Trigger visuals ===")
+    save_all_trigger_visuals_federated_multikrum(FM_SEEDS)
+
     print(
         f"\n=== [federated_multikrum_compare] {FM_MODEL_FLAG} / {FM_DATASET} -- single_user "
         f"({FM_NUM_POISONED}vs{FM_NUM_HONESTS}) vs {FED_TAG} ({FED_NUM_POISONED}vs{FED_NUM_HONESTS}) ==="
