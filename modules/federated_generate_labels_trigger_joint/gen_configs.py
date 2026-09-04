@@ -13,13 +13,17 @@ Two guardrails specific to this module (docs/policy_module_audit_report.md, Bloc
      from federated_generate_labels_trigger's own default ("uniform"), an indirect-vs-joint
      comparison crosses that factor too, confounding the direct-vs-joint comparison this
      threat-model family is meant to support.
-  2. delta_min_frac feasibility refusal: delta_min = delta_min_frac * ||delta_init||_2 is
-     computed BEFORE delta is ever clamped to [-epsilon, epsilon] (a known, NOT-corrected bug
-     in the module itself -- see docs/threat_models_audit.md) -- so it can demand a magnitude
-     the trigger can never reach post-clamp (max reachable ||delta||_2 = epsilon*sqrt(numel)).
-     A campaign generated against an infeasible delta_min_frac would measure nothing (expert_asr
-     collapses for reasons unrelated to whatever is being swept) -- refused outright, not just
-     warned about.
+  2. delta_min_frac feasibility refusal: delta_min = delta_min_frac * epsilon*sqrt(numel) (P0
+     FIX, 2026-09-04 -- see docs/threat_models_audit.md's D1 finding): run_module.py used to
+     compute delta_min = delta_min_frac * ||delta_init||_2 from delta's RAW, pre-clamp norm
+     (strength=6.0), which could demand a magnitude far above the max ||delta||_2 reachable
+     post-clamp (epsilon*sqrt(numel)) -- e.g. ~21x on a CIFAR/epsilon=0.1/strength=6.0
+     combination -- freezing delta at its clamped init sign for the whole run (a permanently
+     unsatisfiable L_mag floor's constant-norm gradient, normalized per-coordinate by Adam,
+     degenerates into `+lr*sign(delta_i)`). check_delta_min_feasible below now mirrors the
+     FIXED formula, so delta_min_frac<=1.0 is always feasible by construction; the refusal
+     path is kept as a guard against delta_min_frac>1.0 misconfiguration, mirroring
+     run_module.py's own startup ValueError.
 """
 
 import argparse
@@ -31,7 +35,6 @@ from pathlib import Path
 import toml
 import torch
 
-from modules.federated_optimizing_trigger.utils import init_delta
 from modules.base_utils.gen_configs import wandb_block
 from modules.base_utils.config_validation import (
     write_config,
@@ -191,11 +194,13 @@ ALIGN_KAPPA = 0.3  # directional floor on cos(delta, mu_target) -- lowered (was 
 LAMBDA_ALIGN = 0.0  # weight of the (now easier-to-satisfy) directional floor. Lowered (was
 # 1.0) so it still guards against collapse without dominating the loss.
 LAMBDA_MAG = 0.3  # weight of the magnitude floor. Lowered (was 1.0), same reasoning.
-# NOTE (updated 2026-08-30 for EPSILON=0.05 above, was EPSILON=0.3's ~14x/EPSILON=0.1's ~2x):
-# delta_min = 0.01*||delta_init||_2 ~= 2.31 vs max_reachable = 0.05*sqrt(3*32*32) ~= 2.77 --
-# only a ~1.2x feasibility margin now, thin enough to be worth re-reading the feasibility
-# guard's printed values below rather than assuming this comment stays accurate if EPSILON,
-# DELTA_MIN_FRAC, or the init constants (_STRENGTH/_FREQ) change again.
+# NOTE (P0 FIX, 2026-09-04, cf. docs/threat_models_audit.md's D1 finding): delta_min is now
+# delta_min_frac * epsilon*sqrt(numel) -- ALWAYS feasible (<= max_reachable) for
+# delta_min_frac<=1.0, regardless of EPSILON -- see check_delta_min_feasible's own updated
+# docstring. The previous version of this note described a ~1.2x feasibility margin computed
+# from the OLD (buggy, pre-clamp-norm-based) formula at DELTA_MIN_FRAC=0.01; kept at 0.00 here
+# (this campaign's own confirmed-best value, unaffected either way -- delta_min=0 is a full
+# no-op under both formulas).
 DELTA_MIN_FRAC = 0.00
 
 # Trigger initialization (2026-09-01): init_delta (modules/federated_optimizing_trigger/utils.py)
@@ -243,28 +248,25 @@ MODULE_NAME = "federated_generate_labels_trigger_joint"
 # datasets are supported here (needs_big_ims models/datasets would need a different shape;
 # not in the default sweep, see MODEL_FLAGS/DATASETS above).
 _TRIGGER_SHAPE = {"cifar": (3, 32, 32), "cifar_100": (3, 32, 32), "svhn": (3, 32, 32)}
-_STRENGTH, _FREQ = 6.0, 16  # must match init_delta's call in run_module.py exactly
 
 
 def check_delta_min_feasible(dataset, epsilon, delta_min_frac, init="stripe"):
     """
-    docs/threat_models_audit.md's delta_min-unreachable bug, checked BEFORE generating a
-    config: delta_min = delta_min_frac * ||delta_init||_2 (computed pre-clamp, strength=6.0,
-    exactly matching run_module.py's own init_delta call) must not exceed
-    epsilon*sqrt(numel), the max ||delta||_2 reachable once delta IS clamped to
-    [-epsilon,epsilon] post-init. Returns (feasible: bool, delta_min: float, max_reachable:
-    float) -- never raises itself, callers decide whether to refuse.
+    P0 FIX (2026-09-04, see docs/threat_models_audit.md's D1 finding): delta_min =
+    delta_min_frac * epsilon*sqrt(numel) -- the FEASIBLE ||delta||_2 ceiling under
+    ||delta||_inf<=epsilon, mirroring run_module.py's own (now fixed) formula exactly. Used to
+    be delta_min_frac * ||delta_init||_2 computed from delta's RAW, pre-clamp norm
+    (strength=6.0) -- a value that could exceed the feasible ceiling by an order of magnitude
+    and freeze delta at its clamped init sign for the whole run (see run_module.py's own
+    delta_min_frac comment). Returns (feasible: bool, delta_min: float, max_reachable: float)
+    -- never raises itself, callers decide whether to refuse. Under the fixed formula,
+    delta_min_frac<=1.0 is ALWAYS feasible by construction (delta_min_frac>1.0 is the only way
+    to trip `feasible=False` here, mirroring run_module.py's own startup ValueError guard).
 
-    `init` (2026-09-01): passed straight to init_delta, same as run_module.py's own call --
-    "stripe" is deterministic, but "random" draws from torch's GLOBAL RNG (see init_delta),
-    so ||delta_init||_2 would otherwise differ on every call/process. Seeded locally here (via
-    torch.random.fork_rng, which restores whatever the global RNG state was before returning --
-    no side effect on any OTHER randomness this script uses, e.g. checkpoint sampling) purely to
-    make this PRE-CHECK's printed delta_min/max_reachable numbers reproducible across
-    --dry-run/real invocations; the actual run's own (unseeded) delta_init draw will differ
-    slightly, but a uniform random vector's norm concentrates tightly around its expectation for
-    a shape this size (numel~3000), so the feasibility verdict itself is a stable proxy in
-    practice.
+    `init`/_STRENGTH/_FREQ are no longer read by this function (delta_init's own raw norm is
+    irrelevant to the fixed formula) -- `init` is kept as a parameter purely for call-site
+    backward compatibility (every existing caller passes it positionally/by keyword); it is
+    accepted and ignored.
     """
     if dataset not in _TRIGGER_SHAPE:
         raise ValueError(
@@ -272,19 +274,9 @@ def check_delta_min_feasible(dataset, epsilon, delta_min_frac, init="stripe"):
             f"add it to _TRIGGER_SHAPE (only {list(_TRIGGER_SHAPE)} are supported)."
         )
     shape = _TRIGGER_SHAPE[dataset]
-    with torch.random.fork_rng():
-        torch.manual_seed(0)
-        delta_init = init_delta(
-            shape,
-            horizontal=True,
-            strength=_STRENGTH,
-            freq=_FREQ,
-            device="cpu",
-            init=init,
-        )
-    delta_min = delta_min_frac * delta_init.detach().norm().item()
     numel = shape[0] * shape[1] * shape[2]
     max_reachable = epsilon * math.sqrt(numel)
+    delta_min = delta_min_frac * max_reachable
     return delta_min <= max_reachable, delta_min, max_reachable
 
 
