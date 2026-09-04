@@ -196,9 +196,10 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_federated_multi
 # P0-P7 robustness-hardening protocol (Etapes 1-4, see the accompanying diagnostic writeup's
 # "Protocole experimental") -- gen_configs_hardening_steps.py's own docstring. ONE cell per
 # step (seed=0, budgets=[500,2000]), deployed via a single-user (1v0/mean, undefended) branch
-# and a defended federated_3vs7_<agg> branch (agg configurable per step, see step_defense_agg
-# -- trmean for step 1 per the diagnostic's own instruction, multikrum for steps 2-4 by
-# default). Aliased (HS_ prefix).
+# and, for EVERY step, one defended federated_3vs7_<agg> branch per entry of DEFENSE_AGGS
+# (trmean AND multikrum by default -- comparing two steps' own single-defense numbers used to
+# confound the step's own fix with a harder/easier defense, see DEFENSE_AGGS's own comment).
+# Aliased (HS_ prefix).
 from modules.federated_generate_labels_trigger_joint.gen_configs_hardening_steps import (
     EXP_BASE as HS_EXP_BASE,
     MODEL_FLAG as HS_MODEL_FLAG,
@@ -206,9 +207,9 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_hardening_steps
     SEED as HS_SEED,
     BUDGETS as HS_BUDGETS,
     STEP_OVERRIDES as HS_STEP_OVERRIDES,
+    DEFENSE_AGGS as HS_DEFENSE_AGGS,
     cell_name as hs_cell_name,
     step_tag as hs_step_tag,
-    step_defense_agg as hs_step_defense_agg,
     _defense_dir_tag as hs_defense_dir_tag,
 )
 import json as _json
@@ -799,11 +800,11 @@ def compute_cta_pta_mean_var_hardening_steps(
 ):
     """Same as compute_cta_pta_mean_var_federated_multikrum, for the P0-P7 robustness-hardening
     protocol's Etapes 1-4 instead (see gen_configs_hardening_steps.py's own docstring). `mode` is
-    "single_user" (cell_dir/train_user_{budget}, 1-poisoned/0-honest/mean, undefended) or the
-    step's own defense_dir_tag (cell_dir/federated_3vs7_<agg>/train_user_{budget} -- pass
-    hs_defense_dir_tag(hs_step_defense_agg(step)) explicitly if the configs were generated with
-    --defense-agg overriding the step's own default, since this function has no way to recover
-    that override from disk). Only ONE seed exists per step in this protocol (SEED=0) -- seeds
+    "single_user" (cell_dir/train_user_{budget}, 1-poisoned/0-honest/mean, undefended) or
+    hs_defense_dir_tag(agg) for any agg the configs were actually generated with (every entry
+    of DEFENSE_AGGS by default -- pass hs_defense_dir_tag("trmean")/("multikrum") explicitly;
+    this function has no way to recover which aggs a given run was generated with from disk).
+    Only ONE seed exists per step in this protocol (SEED=0) -- seeds
     is still a list for interface parity with every other compute_cta_pta_mean_var_* function
     here (an empty/missing cell just yields NaN via _cta_pta_mean_var, not a crash).
     """
@@ -2410,10 +2411,12 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------
     # P0-P7 robustness-hardening protocol (Etapes 1-4, see gen_configs_hardening_steps.py's own
-    # docstring) -- ONE table+plot per step, single_user (1v0/mean, undefended) vs that step's
-    # own federated_3vs7_<agg> branch (agg from step_defense_agg -- trmean for step 1, multikrum
-    # for steps 2-4 by default). Gracefully produces "XXX" table cells / empty plot series for
-    # any step not yet generated/run (same convention as every other campaign above --
+    # docstring) -- ONE table+plot per step, single_user (1v0/mean, undefended) vs EVERY entry
+    # of HS_DEFENSE_AGGS's own federated_3vs7_<agg> branch (every step tests BOTH trmean and
+    # multikrum, 2026-09-05 fix -- comparing two steps' own single-defense numbers used to
+    # confound "did this step's fix help" with "is this just a harder defense than the other
+    # step was tested against"). Gracefully produces "XXX" table cells / empty plot series for
+    # any step/defense not yet generated/run (same convention as every other campaign above --
     # compute_cta_pta_mean_var_hardening_steps's own _cta_pta_mean_var call yields NaN for a
     # missing cell, never crashes) -- rerun this script as more steps land.
     # -------------------------------------------------------------------
@@ -2421,16 +2424,15 @@ if __name__ == "__main__":
 
     for step in sorted(HS_STEP_OVERRIDES):
         tag = hs_step_tag(step)
-        defense_agg = hs_step_defense_agg(step)
-        fed_tag = hs_defense_dir_tag(defense_agg)
+        fed_tags = [hs_defense_dir_tag(agg) for agg in HS_DEFENSE_AGGS]
 
         print(
-            f"\n=== [hardening_steps] step {step} ({tag}) -- single_user vs {fed_tag} ==="
+            f"\n=== [hardening_steps] step {step} ({tag}) -- single_user vs {', '.join(fed_tags)} ==="
         )
 
         all_data_hs = {}
         block_hs = {}
-        hs_modes = ["single_user", fed_tag]
+        hs_modes = ["single_user"] + fed_tags
 
         for mode in hs_modes:
             print(f"   -> {mode}")
@@ -2452,7 +2454,7 @@ if __name__ == "__main__":
 
         latex_table_hs = build_table(
             block_hs, HS_BUDGETS, hs_modes,
-            name=f"{HS_MODEL_FLAG}/{HS_DATASET} hardening step {step} ({tag}): single_user vs {fed_tag}",
+            name=f"{HS_MODEL_FLAG}/{HS_DATASET} hardening step {step} ({tag}): single_user vs {'/'.join(fed_tags)}",
         )
         with open(f"{TABLE_DIR}/hardening_steps_{tag}.tex", "w") as f:
             f.write(latex_table_hs)
@@ -2461,4 +2463,16 @@ if __name__ == "__main__":
         plot_cta_vs_pta(
             all_data_hs, dataset=HS_DATASET, save_dir=f"{PLOT_DIR}/hardening_steps/",
             filename=f"{HS_DATASET}_hardening_{tag}.png",
+        )
+
+    if "multikrum" in HS_DEFENSE_AGGS:
+        print("\n=== [hardening_steps] Multi-Krum poison-selection stats, by step ===")
+        plot_multikrum_poison_selection_by_series(
+            {
+                hs_step_tag(step): (lambda seed, step=step: HS_EXP_BASE / hs_cell_name(step, seed))
+                for step in sorted(HS_STEP_OVERRIDES)
+            },
+            HS_BUDGETS, HS_SEEDS, save_dir=f"{PLOT_DIR}/hardening_steps/",
+            filename=f"{HS_DATASET}_hardening_poison_selection.png",
+            title="Multi-Krum poisoned-selection rate by hardening step",
         )

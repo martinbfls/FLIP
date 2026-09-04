@@ -13,21 +13,28 @@ fields this campaign needs (metrics_log_path is set here for the FIRST time in t
 none of the other single-cell generators turn it on by default, but the whole point of this
 protocol is watching those diagnostics).
 
-Deployed against TWO branches per step, same convention as _federated_branch.py's
-federated_branch_configs (NOT reused directly -- that helper hardcodes agg_method="multikrum";
-this file needs a configurable defense per step, see D0's "Tester immediatement contre
-trimmed-mean" instruction for Etape 1 specifically):
+Deployed against 1 + len(DEFENSE_AGGS) branches per step, same convention as
+_federated_branch.py's federated_branch_configs (NOT reused directly -- that helper hardcodes
+agg_method="multikrum"; this file tests EVERY entry of DEFENSE_AGGS for EVERY step, see D0's
+"Tester immediatement contre trimmed-mean" instruction for Etape 1, and the 2026-09-05 fix
+below for why a single step-specific defense isn't enough):
   - single-user (cell_dir/train_user_{budget}): 1-poisoned/0-honest/mean, undefended --
     where cos_delta_to_init/mag_active_rate/delta_sign_flip_rate/expert_asr are read from
     metrics_log_path during/after GENERATION (no train_user needed for those, but the branch
     is still generated for comparability with the rest of this module's campaigns).
-  - defended (cell_dir/{DEFENSE_TAG}/train_user_{budget}): 3-poisoned/7-honest, agg_method
-    configurable per step (DEFENSE_AGG_METHOD below) -- what "tester contre trimmed-mean"
-    actually measures.
+  - defended (cell_dir/federated_3vs7_<agg>/train_user_{budget}), one per entry of
+    DEFENSE_AGGS: 3-poisoned/7-honest, track_poison_selection=true on all of them (real
+    selection stats for multikrum/krum, harmless no-op otherwise).
+
+Every step tests BOTH trmean and multikrum by default (DEFENSE_AGGS) -- originally each step
+tested a single, step-specific defense, which confounded "did this step's own fix help" with
+"is this just a harder defense than the previous step was tested against" (e.g. step 1 vs
+trmean and step 2 vs multikrum are NOT directly comparable on their own). Pass --defense-aggs
+to restrict to a subset for a quicker/cheaper run.
 
 Usage:
     python -m modules.federated_generate_labels_trigger_joint.gen_configs_hardening_steps \\
-        --step 1 [--defense-agg trmean] [--dry-run]
+        --step 1 [--defense-aggs trmean multikrum] [--dry-run]
 """
 import argparse
 from pathlib import Path
@@ -70,6 +77,16 @@ DATASET = "cifar"
 SEED = 0
 BUDGETS = [500, 2000]
 
+# Defended aggregators tested for EVERY step (2026-09-05 fix): originally each step tested a
+# single, step-specific defense (trmean for step 1 per D0's own instruction, multikrum for
+# steps 2-4) -- comparing step 1's trmean numbers against step 2's multikrum numbers to judge
+# P2/P6's own effect confounds "did the fix help" with "is this just a harder defense than the
+# other step was tested against". Every step now generates BOTH federated_3vs7_<agg> branches,
+# so any two steps are directly comparable on either defense.
+DEFENSE_AGGS = ["trmean", "multikrum"]
+FED_NUM_POISONED = 3
+FED_NUM_HONESTS = 7
+
 # Single-user (attack-generation) branch axes -- fixed across all 4 steps, matching the rest
 # of this module's campaigns (1-poisoned/0-honest/mean generation, deployed against a separate
 # defended branch below).
@@ -105,6 +122,24 @@ assert _JOINT_TRIGGER_TEMPLATE_HARDENING != JOINT_TRIGGER_TEMPLATE, (
     "update the splice."
 )
 
+# Locally-extended copy of TRAIN_USER_TEMPLATE -- adds `track_poison_selection = true`, same
+# splice convention _federated_branch.py's own _TRAIN_USER_TEMPLATE_TRACKED uses (not imported
+# from there: that module hardcodes agg_method="multikrum" for its own campaigns' federated
+# branch, this file needs the SAME template reused for every entry of DEFENSE_AGGS). Applied to
+# EVERY defended branch below, not just multikrum's -- harmless no-op for trmean/mean/median
+# (mini_train_multi's own track_poison_selection only computes a real "selection" concept for
+# agg_method in {"multikrum", "krum"}; every other worker just reads as not-selected, see
+# modules/base_utils/util.py's mini_train_multi), and keeps every branch's train_user config
+# shape identical regardless of which aggregator it deploys.
+_TRAIN_USER_TEMPLATE_TRACKED = TRAIN_USER_TEMPLATE.replace(
+    'agg_method = "{agg_method}"\n',
+    'agg_method = "{agg_method}"\n'
+    "track_poison_selection = true\n",
+)
+assert _TRAIN_USER_TEMPLATE_TRACKED != TRAIN_USER_TEMPLATE, (
+    "TRAIN_USER_TEMPLATE's agg_method line changed shape -- update the splice."
+)
+
 # --------------------------------------------------------------------------- #
 # Per-step overrides (see the diagnostic writeup's "Protocole experimental" for the exact
 # rationale of each). Every field not listed here is pinned to gen_configs.py's own current
@@ -122,7 +157,6 @@ STEP_OVERRIDES = {
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
         expert_retrain_interval=0, expert_retrain_agg_method=AGG_METHOD,
         lambda_margin=0.0, lambda_consistency=0.0, lambda_budget=0.0,
-        defense_agg="trmean",
     ),
     2: dict(
         # P2 (honest-client filtering -- code fix, no config knob) + P6 (live retraining under
@@ -138,21 +172,21 @@ STEP_OVERRIDES = {
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
         expert_retrain_interval=1, expert_retrain_epochs=20,
         lambda_margin=0.0, lambda_consistency=0.0, lambda_budget=0.0,
-        defense_agg="multikrum",
     ),
     3: dict(
         # P5 (coordinate budget) + lambda_match, agg_method stays "mean" in the differentiable
         # path (see P5's own doc: L_budget is the smooth substitute for robustness, not
-        # agg_method itself). z_budget here is a PLACEHOLDER (1.0) -- calibrate it first via
-        # prelim/calibrate_z_budget.py against the SAME defense_agg before trusting this run.
+        # agg_method itself). z_budget=1.5: CALIBRATED (2026-09-05, prelim/calibrate_z_budget.py
+        # against a real train_expert checkpoint, num_honests=7/num_poisoned=3, agg=multikrum --
+        # survival_fraction crosses the 0.5 cutoff between z=1.5 (0.61) and z=2 (0.26); was a
+        # 1.0 placeholder before this).
         tag="step3_p5_match",
         epsilon=0.1, delta_min_frac=0.8, lambda_mag=1.0, lambda_align=0.0,
         trigger_constraint="penalty", lambda_bd=1.0, lambda_delta=0.0, init="stripe",
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
         expert_retrain_interval=1, expert_retrain_epochs=20,
-        lambda_margin=0.0, lambda_consistency=0.0, lambda_budget=1.0, z_budget=1.0,
+        lambda_margin=0.0, lambda_consistency=0.0, lambda_budget=1.0, z_budget=1.5,
         lambda_match=1.0,
-        defense_agg="multikrum",
     ),
     4: dict(
         # P4 (poison consistency) + P3 (margin floor) -- only meaningful with num_poisoned>=2,
@@ -161,14 +195,14 @@ STEP_OVERRIDES = {
         # expected to read ~0.0 there (vacuous, see poison_consistency's own docstring) -- this
         # step's own diagnostic value comes from the DEFENDED branch's real deployment, not
         # from generation-time poison_consistency in this particular single-cell setup.
+        # z_budget=1.5: same calibration as step 3 (see its own comment).
         tag="step4_p4_p3",
         epsilon=0.1, delta_min_frac=0.8, lambda_mag=1.0, lambda_align=0.0,
         trigger_constraint="penalty", lambda_bd=1.0, lambda_delta=0.0, init="stripe",
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
         expert_retrain_interval=1, expert_retrain_epochs=20,
         lambda_margin=1.0, margin_min=2.0, lambda_consistency=1.0, lambda_budget=1.0,
-        z_budget=1.0, lambda_match=1.0,
-        defense_agg="multikrum",
+        z_budget=1.5, lambda_match=1.0,
     ),
 }
 for _cfg in STEP_OVERRIDES.values():
@@ -188,24 +222,16 @@ def step_tag(step):
     return str(STEP_OVERRIDES[step]["tag"])
 
 
-def step_defense_agg(step):
-    """The defense aggregator a given step's federated_3vs7_<agg> branch was generated against
-    by default (see STEP_OVERRIDES) -- a run generated with --defense-agg overriding this is
-    NOT reflected here; pass the actual value used at generation time instead in that case."""
-    return str(STEP_OVERRIDES[step]["defense_agg"])
-
-
 def cell_name(step, seed):
     return f"{step_tag(step)}/{MODEL_FLAG}/{DATASET}/seed{seed}"
 
 
-def generate_step(step, defense_agg=None, budgets=BUDGETS, seed=SEED, dry_run=False):
+def generate_step(step, defense_aggs=None, budgets=BUDGETS, seed=SEED, dry_run=False):
     if step not in STEP_OVERRIDES:
         raise ValueError(f"Unknown step {step} -- must be one of {sorted(STEP_OVERRIDES)}.")
     cfg = dict(STEP_OVERRIDES[step])
     tag = str(cfg.pop("tag"))
-    defense_agg = defense_agg or cfg.pop("defense_agg")
-    cfg.pop("defense_agg", None)
+    defense_aggs = list(defense_aggs) if defense_aggs else list(DEFENSE_AGGS)
 
     feasible, delta_min, max_reachable = check_delta_min_feasible(
         DATASET, cfg["epsilon"], cfg["delta_min_frac"],
@@ -292,30 +318,34 @@ def generate_step(step, defense_agg=None, budgets=BUDGETS, seed=SEED, dry_run=Fa
             ),
         )
 
-    # Defended branch (3-poisoned/7-honest, agg_method=defense_agg) -- generic, parameterized
-    # equivalent of _federated_branch.py's federated_branch_configs (that helper hardcodes
-    # agg_method="multikrum" for its own campaigns; this protocol needs trimmed-mean for
-    # Etape 1 specifically, see the module docstring above).
-    fed_dir = cell_dir / _defense_dir_tag(defense_agg)
-    fed_flips_dir = fed_dir / "select_flips"
-    configs[fed_flips_dir / "config.toml"] = SELECT_FLIPS_TEMPLATE.format(
-        budgets=budgets, module_dir=module_dir, flips_dir=fed_flips_dir,
-        num_honests=7, num_poisoned=3,
-    )
-    for budget in budgets:
-        train_user_dir = fed_dir / f"train_user_{budget}"
-        configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
-            flips_dir=fed_flips_dir, train_user_dir=train_user_dir, model_flag=MODEL_FLAG,
-            dataset=DATASET, source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
-            trigger_path=trigger_path, budget=budget, num_honests=7, num_poisoned=3,
-            agg_method=defense_agg, lr=lr, wd=wd, milestones=milestones,
-            wandb_block_train_user=wandb_block(
-                "federated_train_user",
-                f"train_user/{MODEL_FLAG}/{DATASET}/{tag}/{_defense_dir_tag(defense_agg)}/{budget}/seed{seed}",
-                enabled=WANDB_ENABLED, project=WANDB_PROJECT, mode=WANDB_MODE,
-                entity=WANDB_ENTITY, group=MODULE_NAME,
-            ),
+    # Defended branches (3-poisoned/7-honest) -- generic, parameterized equivalent of
+    # _federated_branch.py's federated_branch_configs (that helper hardcodes agg_method=
+    # "multikrum" for its own campaigns; this protocol tests EVERY entry of DEFENSE_AGGS for
+    # EVERY step, see that constant's own comment). track_poison_selection=true on all of them
+    # (see _TRAIN_USER_TEMPLATE_TRACKED's own comment -- harmless no-op for non-Krum
+    # aggregators, gives real Multi-Krum selection stats for "multikrum"/"krum").
+    for agg in defense_aggs:
+        fed_dir = cell_dir / _defense_dir_tag(agg)
+        fed_flips_dir = fed_dir / "select_flips"
+        configs[fed_flips_dir / "config.toml"] = SELECT_FLIPS_TEMPLATE.format(
+            budgets=budgets, module_dir=module_dir, flips_dir=fed_flips_dir,
+            num_honests=FED_NUM_HONESTS, num_poisoned=FED_NUM_POISONED,
         )
+        for budget in budgets:
+            train_user_dir = fed_dir / f"train_user_{budget}"
+            configs[train_user_dir / "config.toml"] = _TRAIN_USER_TEMPLATE_TRACKED.format(
+                flips_dir=fed_flips_dir, train_user_dir=train_user_dir, model_flag=MODEL_FLAG,
+                dataset=DATASET, source_label=SOURCE_LABEL, target_label=TARGET_LABEL,
+                trigger_path=trigger_path, budget=budget,
+                num_honests=FED_NUM_HONESTS, num_poisoned=FED_NUM_POISONED,
+                agg_method=agg, lr=lr, wd=wd, milestones=milestones,
+                wandb_block_train_user=wandb_block(
+                    "federated_train_user",
+                    f"train_user/{MODEL_FLAG}/{DATASET}/{tag}/{_defense_dir_tag(agg)}/{budget}/seed{seed}",
+                    enabled=WANDB_ENABLED, project=WANDB_PROJECT, mode=WANDB_MODE,
+                    entity=WANDB_ENTITY, group=MODULE_NAME,
+                ),
+            )
 
     paths = []
     for path, content in configs.items():
@@ -333,11 +363,16 @@ def generate_step(step, defense_agg=None, budgets=BUDGETS, seed=SEED, dry_run=Fa
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--step", type=int, required=True, choices=sorted(STEP_OVERRIDES))
-    parser.add_argument("--defense-agg", default=None, help="Override the step's own default.")
+    parser.add_argument(
+        "--defense-aggs", nargs="+", default=None,
+        help=f"Restrict to a subset of DEFENSE_AGGS (default: all of {DEFENSE_AGGS}).",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    paths, refused = generate_step(args.step, defense_agg=args.defense_agg, dry_run=args.dry_run)
+    paths, refused = generate_step(
+        args.step, defense_aggs=args.defense_aggs, dry_run=args.dry_run,
+    )
     if refused:
         print(f"REFUSED: {refused}")
     elif args.dry_run:
