@@ -127,13 +127,16 @@ STEP_OVERRIDES = {
     2: dict(
         # P2 (honest-client filtering -- code fix, no config knob) + P6 (live retraining under
         # the deployment's own agg_method, exposed but not yet functionally wired -- see P6's
-        # own doc): expert_retrain_interval=50, expert_retrain_epochs=20, seed=train_expert's
-        # own seed.
+        # own doc): expert_retrain_interval=1 (retrain every outer iteration -- N_ITERATIONS is
+        # only 25 here (gen_configs.py's own constant, shared by every step in this file), so
+        # the originally-specified 50 NEVER fired: `it % 50 == 0` is never true for
+        # it in [0, 24] -- caught before any run of this step, see git history),
+        # expert_retrain_epochs=20, seed=train_expert's own seed.
         tag="step2_p2_p6",
         epsilon=0.1, delta_min_frac=0.8, lambda_mag=1.0, lambda_align=0.0,
         trigger_constraint="penalty", lambda_bd=1.0, lambda_delta=0.0, init="stripe",
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
-        expert_retrain_interval=50, expert_retrain_epochs=20,
+        expert_retrain_interval=1, expert_retrain_epochs=20,
         lambda_margin=0.0, lambda_consistency=0.0, lambda_budget=0.0,
         defense_agg="multikrum",
     ),
@@ -146,7 +149,7 @@ STEP_OVERRIDES = {
         epsilon=0.1, delta_min_frac=0.8, lambda_mag=1.0, lambda_align=0.0,
         trigger_constraint="penalty", lambda_bd=1.0, lambda_delta=0.0, init="stripe",
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
-        expert_retrain_interval=50, expert_retrain_epochs=20,
+        expert_retrain_interval=1, expert_retrain_epochs=20,
         lambda_margin=0.0, lambda_consistency=0.0, lambda_budget=1.0, z_budget=1.0,
         lambda_match=1.0,
         defense_agg="multikrum",
@@ -162,7 +165,7 @@ STEP_OVERRIDES = {
         epsilon=0.1, delta_min_frac=0.8, lambda_mag=1.0, lambda_align=0.0,
         trigger_constraint="penalty", lambda_bd=1.0, lambda_delta=0.0, init="stripe",
         alpha_ckpt=0.1, n_checkpoints_per_step=4,
-        expert_retrain_interval=50, expert_retrain_epochs=20,
+        expert_retrain_interval=1, expert_retrain_epochs=20,
         lambda_margin=1.0, margin_min=2.0, lambda_consistency=1.0, lambda_budget=1.0,
         z_budget=1.0, lambda_match=1.0,
         defense_agg="multikrum",
