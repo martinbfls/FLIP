@@ -237,6 +237,62 @@ def grad_cosine_penalty(clean_grads, poison_grads, eps=1e-8):
     return 1 - cos
 
 
+def margin_floor_penalty(logits_trig, target_label, margin_min):
+    '''
+    Plancher sur la marge de classification vers la cible sur les lignes declenchees :
+    relu(margin_min - (logit_target - meilleur_autre_logit)). Remplace
+    directional_floor_penalty comme anti-collapse (P3, cf. D2 dans le diagnostic
+    threat_models_audit) : porte sur l'EFFICACITE du backdoor (une marge de decision
+    positive et large) et non sur la ressemblance de delta a une image moyenne, qui
+    poussait delta dans la direction opposee au prior gagnant (cf. D0).
+    Retourne (L_margin, margin_mean) -- meme convention que directional_floor_penalty
+    (penalty, metrique brute), pour l'instrumentation.
+    '''
+    top2 = logits_trig.topk(2, dim=1)
+    tgt = logits_trig[:, target_label]
+    runner = torch.where(top2.indices[:, 0] == target_label,
+                          top2.values[:, 1], top2.values[:, 0])
+    margin = tgt - runner
+    return F.relu(margin_min - margin).mean(), margin.mean()
+
+
+def poison_consistency(poison_grad_chunks, eps=1e-8):
+    '''
+    1 - cos moyen entre chaque chunk de gradient empoisonne (un par client poisonne
+    contribuant ce batch, meme convention que poison_grad_mean dans run_module.py) et
+    leur moyenne. Les agregateurs robustes (trimmed-mean, mediane, Krum/Multi-Krum)
+    attenuent la VARIANCE inter-contributions, pas la magnitude (D0, propriete 2) --
+    ce diagnostic/terme restaure une pression directe sur cette variance. Note : avec
+    num_poisoned<=1 (config generation "1vs0" de la campagne principale) il n'y a
+    qu'un seul chunk contribuant -> valeur triviale 0.0 (cos(g,g)=1) par construction ;
+    redevient informatif des que num_poisoned>=2 (cf. protocole experimental, etape 4
+    / grille finale).
+    '''
+    n_chunks = len(poison_grad_chunks[0])
+    G = torch.stack([
+        torch.cat([poison_grad_chunks[i][j].reshape(-1) for i in range(len(poison_grad_chunks))])
+        for j in range(n_chunks)
+    ])
+    g_bar = G.mean(0)
+    return 1.0 - F.cosine_similarity(G, g_bar.unsqueeze(0).expand_as(G), dim=1, eps=eps).mean()
+
+
+def coordinate_budget_penalty(g_poison, honest_grads_flat, z, eps=1e-8):
+    '''
+    Ce qu'une defense coordinate-wise laisse passer est un decalage borne par l'ecart-type
+    honnete, coordonnee par coordonnee. On l'impose directement plutot que de l'esperer
+    (P5). `g_poison` : gradient AGREGE (agg_expert_grads, aplati/concatene, DIFFERENTIABLE
+    w.r.t. delta) -- ce que l'agregateur reel calculerait. `honest_grads_flat` : [n_honest, d],
+    DETACHE, les contributions honnetes brutes de ce meme batch/checkpoint. Seul terme du
+    lot qui cible la robustesse ET reste differentiable partout (contrairement a Krum,
+    argmin constant par morceaux, ou a la mediane, dont le gradient est nul des que la
+    coordonnee selectionnee est honnete) -- cf. "Ce qu'il ne faut pas faire" du diagnostic :
+    ne PAS reintroduire un mecanisme conscient de l'agregateur reel dans ce chemin.
+    '''
+    mu_h, sd_h = honest_grads_flat.mean(0), honest_grads_flat.std(0) + eps
+    return F.relu((g_poison - mu_h).abs() - z * sd_h).pow(2).mean()
+
+
 def lpips_penalty(delta, x_raw_clean, lpips_model):
     '''
     Perceptual (LPIPS) distance between the clean raw image(s) and their triggered
