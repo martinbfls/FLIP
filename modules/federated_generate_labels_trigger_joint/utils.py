@@ -323,9 +323,16 @@ def project_trigger_constraints(delta, mu_target, epsilon, align_kappa, delta_mi
     angle), so only the Linf clamp and the cone projection can re-violate each other; a handful
     of alternations settles this in practice. Returns delta unchanged if it is already feasible
     for all three sets (each individual projection is itself a no-op in that case).
+
+    align_kappa <= 0 (P1, cf. D2): the directional floor is disabled entirely -- the cone
+    K_align_kappa(mu_target) would otherwise be the WHOLE space (align_kappa<=-1) or push
+    delta toward mu_target regardless (a prior the D0 diagnostic found actively works
+    against the winning "anti-aligned" pattern) -- the cone projection step is skipped, only
+    the Linf clamp and magnitude floor are enforced.
     '''
     for _ in range(n_iters):
         delta = delta.clamp(-epsilon, epsilon)
-        delta = _project_onto_cone(delta, mu_target, align_kappa, eps=eps)
+        if align_kappa > 0:
+            delta = _project_onto_cone(delta, mu_target, align_kappa, eps=eps)
         delta = _project_onto_magnitude_floor(delta, delta_min, mu_target, eps=eps)
     return delta
