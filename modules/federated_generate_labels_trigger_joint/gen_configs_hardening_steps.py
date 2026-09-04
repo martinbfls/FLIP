@@ -33,7 +33,6 @@ import argparse
 from pathlib import Path
 
 from modules.federated_generate_labels_trigger_joint.gen_configs import (
-    ALPHA_CKPT,
     CHECKPOINT_ITERS,
     CHECKPOINT_SAMPLING,
     CLUSTER_ROOT,
@@ -42,8 +41,6 @@ from modules.federated_generate_labels_trigger_joint.gen_configs import (
     GRADMATCH_EPS,
     GRADMATCH_METRIC,
     JOINT_TRIGGER_TEMPLATE,
-    LAMBDA_BD,
-    LAMBDA_DELTA,
     LAMBDA_GRADMATCH,
     LEARNING_RATE,
     LR_DELTA,
@@ -171,7 +168,7 @@ STEP_OVERRIDES = {
         defense_agg="multikrum",
     ),
 }
-for _step, _cfg in STEP_OVERRIDES.items():
+for _cfg in STEP_OVERRIDES.values():
     _cfg.setdefault("margin_min", 2.0)
     _cfg.setdefault("lambda_match", 0.0)
     _cfg.setdefault("expert_retrain_agg_method", AGG_METHOD)
@@ -186,7 +183,7 @@ def generate_step(step, defense_agg=None, budgets=BUDGETS, seed=SEED, dry_run=Fa
     if step not in STEP_OVERRIDES:
         raise ValueError(f"Unknown step {step} -- must be one of {sorted(STEP_OVERRIDES)}.")
     cfg = dict(STEP_OVERRIDES[step])
-    tag = cfg.pop("tag")
+    tag = str(cfg.pop("tag"))
     defense_agg = defense_agg or cfg.pop("defense_agg")
     cfg.pop("defense_agg", None)
 
