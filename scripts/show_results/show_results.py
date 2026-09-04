@@ -193,6 +193,24 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_federated_multi
     FED_TAG,
     cell_name as fm_cell_name,
 )
+# P0-P7 robustness-hardening protocol (Etapes 1-4, see the accompanying diagnostic writeup's
+# "Protocole experimental") -- gen_configs_hardening_steps.py's own docstring. ONE cell per
+# step (seed=0, budgets=[500,2000]), deployed via a single-user (1v0/mean, undefended) branch
+# and a defended federated_3vs7_<agg> branch (agg configurable per step, see step_defense_agg
+# -- trmean for step 1 per the diagnostic's own instruction, multikrum for steps 2-4 by
+# default). Aliased (HS_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_hardening_steps import (
+    EXP_BASE as HS_EXP_BASE,
+    MODEL_FLAG as HS_MODEL_FLAG,
+    DATASET as HS_DATASET,
+    SEED as HS_SEED,
+    BUDGETS as HS_BUDGETS,
+    STEP_OVERRIDES as HS_STEP_OVERRIDES,
+    cell_name as hs_cell_name,
+    step_tag as hs_step_tag,
+    step_defense_agg as hs_step_defense_agg,
+    _defense_dir_tag as hs_defense_dir_tag,
+)
 import json as _json
 
 
@@ -761,6 +779,50 @@ def compute_cta_pta_mean_var_federated_multikrum(
                 "mode": mode,
                 "budget": budget,
                 "model": FM_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_cta_pta_mean_var_hardening_steps(
+    step,
+    budgets,
+    seeds,
+    mode="single_user",
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var_federated_multikrum, for the P0-P7 robustness-hardening
+    protocol's Etapes 1-4 instead (see gen_configs_hardening_steps.py's own docstring). `mode` is
+    "single_user" (cell_dir/train_user_{budget}, 1-poisoned/0-honest/mean, undefended) or the
+    step's own defense_dir_tag (cell_dir/federated_3vs7_<agg>/train_user_{budget} -- pass
+    hs_defense_dir_tag(hs_step_defense_agg(step)) explicitly if the configs were generated with
+    --defense-agg overriding the step's own default, since this function has no way to recover
+    that override from disk). Only ONE seed exists per step in this protocol (SEED=0) -- seeds
+    is still a list for interface parity with every other compute_cta_pta_mean_var_* function
+    here (an empty/missing cell just yields NaN via _cta_pta_mean_var, not a crash).
+    """
+    records = []
+
+    for budget in budgets:
+        run_dir_fn = lambda seed, budget=budget: (
+            _branch_run_dir(HS_EXP_BASE / hs_cell_name(step, seed), budget, mode)
+        )
+        cta_mean, cta_var, pta_mean, pta_var = _cta_pta_mean_var(
+            run_dir_fn, seeds, cta_file, pta_file
+        )
+        records.append(
+            {
+                "dataset": HS_DATASET,
+                "step": step,
+                "mode": mode,
+                "budget": budget,
+                "model": HS_MODEL_FLAG,
                 "cta_mean": cta_mean,
                 "cta_var": cta_var,
                 "pta_mean": pta_mean,
@@ -2345,3 +2407,58 @@ if __name__ == "__main__":
         lambda seed: FM_EXP_BASE / fm_cell_name(seed),
         FM_BUDGETS, FM_SEEDS, save_dir=f"{PLOT_DIR}/federated_multikrum_compare/",
     )
+
+    # -------------------------------------------------------------------
+    # P0-P7 robustness-hardening protocol (Etapes 1-4, see gen_configs_hardening_steps.py's own
+    # docstring) -- ONE table+plot per step, single_user (1v0/mean, undefended) vs that step's
+    # own federated_3vs7_<agg> branch (agg from step_defense_agg -- trmean for step 1, multikrum
+    # for steps 2-4 by default). Gracefully produces "XXX" table cells / empty plot series for
+    # any step not yet generated/run (same convention as every other campaign above --
+    # compute_cta_pta_mean_var_hardening_steps's own _cta_pta_mean_var call yields NaN for a
+    # missing cell, never crashes) -- rerun this script as more steps land.
+    # -------------------------------------------------------------------
+    HS_SEEDS = [HS_SEED]
+
+    for step in sorted(HS_STEP_OVERRIDES):
+        tag = hs_step_tag(step)
+        defense_agg = hs_step_defense_agg(step)
+        fed_tag = hs_defense_dir_tag(defense_agg)
+
+        print(
+            f"\n=== [hardening_steps] step {step} ({tag}) -- single_user vs {fed_tag} ==="
+        )
+
+        all_data_hs = {}
+        block_hs = {}
+        hs_modes = ["single_user", fed_tag]
+
+        for mode in hs_modes:
+            print(f"   -> {mode}")
+
+            df = compute_cta_pta_mean_var_hardening_steps(
+                step=step, budgets=HS_BUDGETS, seeds=HS_SEEDS, mode=mode,
+            )
+
+            df.to_csv(
+                f"{CSV_DIR}/hardening_steps_{tag}_{mode}.csv", index=False,
+            )
+
+            all_data_hs[mode] = df
+
+            for _, row in df.iterrows():
+                block_hs[(row["budget"], mode)] = (
+                    row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+                )
+
+        latex_table_hs = build_table(
+            block_hs, HS_BUDGETS, hs_modes,
+            name=f"{HS_MODEL_FLAG}/{HS_DATASET} hardening step {step} ({tag}): single_user vs {fed_tag}",
+        )
+        with open(f"{TABLE_DIR}/hardening_steps_{tag}.tex", "w") as f:
+            f.write(latex_table_hs)
+        print(f"[INFO] Saved LaTeX table for hardening step {step} ({tag})")
+
+        plot_cta_vs_pta(
+            all_data_hs, dataset=HS_DATASET, save_dir=f"{PLOT_DIR}/hardening_steps/",
+            filename=f"{HS_DATASET}_hardening_{tag}.png",
+        )

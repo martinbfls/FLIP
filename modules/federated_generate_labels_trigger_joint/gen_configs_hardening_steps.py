@@ -179,6 +179,23 @@ def _defense_dir_tag(agg_method):
     return f"federated_3vs7_{agg_method}"
 
 
+def step_tag(step):
+    """The `tag` a given step writes under EXP_BASE (see STEP_OVERRIDES) -- exposed so callers
+    (show_results.py) don't have to duplicate STEP_OVERRIDES' own dict shape."""
+    return str(STEP_OVERRIDES[step]["tag"])
+
+
+def step_defense_agg(step):
+    """The defense aggregator a given step's federated_3vs7_<agg> branch was generated against
+    by default (see STEP_OVERRIDES) -- a run generated with --defense-agg overriding this is
+    NOT reflected here; pass the actual value used at generation time instead in that case."""
+    return str(STEP_OVERRIDES[step]["defense_agg"])
+
+
+def cell_name(step, seed):
+    return f"{step_tag(step)}/{MODEL_FLAG}/{DATASET}/seed{seed}"
+
+
 def generate_step(step, defense_agg=None, budgets=BUDGETS, seed=SEED, dry_run=False):
     if step not in STEP_OVERRIDES:
         raise ValueError(f"Unknown step {step} -- must be one of {sorted(STEP_OVERRIDES)}.")
@@ -203,7 +220,7 @@ def generate_step(step, defense_agg=None, budgets=BUDGETS, seed=SEED, dry_run=Fa
     milestones = MILESTONE.get(MODEL_FLAG, [75, 125])
     rng_seed = draw_rng_seed(MODEL_FLAG, seed)
 
-    cell_dir = EXP_BASE / tag / MODEL_FLAG / DATASET / f"seed{seed}"
+    cell_dir = EXP_BASE / cell_name(step, seed)
     train_expert_dir = EXP_BASE / f"train_expert/{MODEL_FLAG}_1xs/seed{seed}"
     module_dir = cell_dir / "gen_labels_trigger_joint"
     flips_dir = cell_dir / "select_flips"
