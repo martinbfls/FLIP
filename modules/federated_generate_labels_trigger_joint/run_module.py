@@ -1857,12 +1857,28 @@ def run(experiment_name, module_name, **kwargs):
     np.save(output_dir + "true.npy", y_true)
     np.save(output_dir + "losses.npy", losses)
 
+    # BUG FIX (found via a real hardening-protocol run, 2026-09-04): ExperimentTracker's own
+    # __init__ (modules/base_utils/experiment_tracker.py) reads THIS SAME `metrics_log_path`
+    # from `args` and reuses it as ITS OWN metrics file path (for "backward compatibility with
+    # existing readers", per its docstring) -- tracker.finalize()'s own _write_metrics_json()
+    # then WRITES TO THAT SAME FILE, with only the (narrower) set of fields ever passed to
+    # tracker.log() below. Calling tracker.finalize() AFTER this json.dump used to silently
+    # CLOBBER `history`'s much richer per-batch dump (cos_delta_to_init, delta_drift_l2,
+    # matching_term, align_active_rate, mag_active_rate, reg_term, matching_term_std,
+    # L_bd_mean_std, expert_asr_std, z_emp_median, z_emp_frac_over_1, margin_mean,
+    # poison_consistency, lambda_*_current -- NONE of which are ever passed to tracker.log())
+    # with a strictly smaller file, discarding exactly the fields this protocol's own
+    # diagnostics (D1's cos_delta_to_init/delta_sign_flip_rate, D5's poison_consistency, ...)
+    # depend on -- confirmed on a real run whose metrics.json only had tracker.log()'s keys.
+    # Fix: finalize the tracker FIRST (so its own, narrower write happens and is done), THEN
+    # overwrite metrics_log_path with `history`'s full dump, which is what every reader of this
+    # field (including this module's own run() docstring) has always assumed is there.
+    tracker.finalize()
+
     if metrics_log_path:
         Path(metrics_log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(metrics_log_path, "w") as f:
             json.dump(history, f, indent=2)
-
-    tracker.finalize()
 
     run_tag = f"{num_poisoned}vs{num_honests}"
     Path(output_dir_trigger).mkdir(parents=True, exist_ok=True)
