@@ -10,6 +10,7 @@ unmodified/side by side.
 """
 
 from pathlib import Path
+import math
 import random
 import sys
 import json
@@ -34,6 +35,7 @@ from modules.federated_generate_labels_trigger_joint.utils import (
     TriggerMTTDataset, extract_experts_biased, build_expert_pool,
     directional_floor_penalty, magnitude_floor_penalty, project_trigger_constraints,
     cosine_to, grad_mismatch_penalty, grad_cosine_penalty, lpips_penalty,
+    margin_floor_penalty, poison_consistency, coordinate_budget_penalty,
 )
 
 
@@ -441,9 +443,85 @@ def run(experiment_name, module_name, **kwargs):
     # projection after every optimizer_delta.step() ("projection").
     trigger_constraint = args.get("trigger_constraint", "penalty")
     align_kappa = args.get("align_kappa", 0.6)
-    lambda_align = args.get("lambda_align", 1.0)
+    # P1 (cf. D2): default lowered 1.0 -> 0.0. A stripe-like, ~eps-saturated global delta has
+    # cos(delta, mu_target) ~= 0, so this floor stayed permanently active and pushed delta
+    # toward mu_target -- a smooth, low-frequency, positive-everywhere direction that is the
+    # OPPOSITE of the winning anti-aligned prior identified in D0 (the old, aggregator-breaking
+    # approach's trigger_penalty pushed cos -> -1). Kept available (still computed/logged, see
+    # margin_floor_penalty below for its replacement as the anti-collapse mechanism) but inert
+    # by default.
+    lambda_align = args.get("lambda_align", 0.0)
     lambda_mag = args.get("lambda_mag", 1.0)
-    delta_min_frac = args.get("delta_min_frac", 0.5)
+    # P0 (BUG FIX, cf. D1): delta_min_frac's OWN default was 0.5, applied to delta's RAW,
+    # pre-clamp init norm (strength=6.0, stripe) -- e.g. on CIFAR (d=3072) that is
+    # delta_min ~= 0.5*231.4 ~= 115.7, ~21x the max ||delta||_2 reachable under
+    # ||delta||_inf<=epsilon=0.1 (~5.54). L_mag's gradient w.r.t. delta then has CONSTANT
+    # L2 norm 1.0 (~=0.018 per coordinate on CIFAR) whenever the floor is unmet -- which, at
+    # that infeasibility ratio, is always -- and Adam's per-coordinate normalization turns
+    # that constant push into `+lr*sign(delta_i)`: every coordinate gets pinned to its INIT
+    # sign at +-epsilon and never reconsiders it, freezing delta at (a clamped copy of) its
+    # own initialization for the whole run (see run_module.py's own historical notes on this
+    # floor's construction, and docs/threat_models_audit.md's D1 finding). The formula below
+    # computes delta_min in the ACTUAL feasible set instead (||delta||_2 <= epsilon*sqrt(d)),
+    # and the new default 0.8 targets ~80% saturation of the Linf cube -- the global,
+    # saturated, low-per-coordinate-magnitude profile D0 identifies as what survives
+    # coordinate-wise defenses -- instead of an arbitrary fraction of an infeasible reference.
+    delta_min_frac = args.get("delta_min_frac", 0.8)
+
+    # P3 (cf. D2): margin floor on the backdoor's OWN classification margin on triggered rows,
+    # replacing directional_floor_penalty as the anti-collapse mechanism -- see
+    # margin_floor_penalty (joint/utils.py). Targets backdoor EFFICACY directly instead of
+    # delta's resemblance to a class-mean image (the anti-pattern D2 identifies). 0.0 (default)
+    # is a full no-op.
+    lambda_margin = args.get("lambda_margin", 0.0)
+    margin_min = args.get("margin_min", 2.0)
+    track_margin = lambda_margin != 0
+
+    # P4 (cf. D5): penalizes inconsistency between different poisoned CLIENTS' contributions to
+    # the aggregate expert gradient -- restores D0's property (2) ("cohorent poison gradient"),
+    # which robust aggregators specifically attenuate (variance, not magnitude). Vacuous
+    # (always 0.0) at num_poisoned<=1 -- see poison_consistency's own docstring. 0.0 (default,
+    # no-op) reuses poison_grad_chunks already collected when track_gradmatch or track_match.
+    lambda_consistency = args.get("lambda_consistency", 0.0)
+    track_consistency = lambda_consistency != 0
+
+    # P5 (cf. "Ce qu'il ne faut pas faire"): differentiable substitute for coordinate-wise
+    # robustness, imposing directly the per-coordinate budget (relative to the HONEST
+    # per-coordinate std this batch) that a coordinate-wise defense would let through, on the
+    # REALISTIC aggregate agg_expert_grads -- see coordinate_budget_penalty (joint/utils.py).
+    # z_budget must be calibrated empirically per agg_method (see prelim/calibrate_z_budget.py)
+    # rather than guessed. Requires num_honests > 0 to have any honest per-coordinate std to
+    # measure -- inert (0.0) otherwise regardless of lambda_budget. 0.0 (default) is a no-op.
+    lambda_budget = args.get("lambda_budget", 0.0)
+    z_budget = args.get("z_budget", 1.0)
+    track_budget = lambda_budget != 0 and num_honests > 0
+
+    # P6 (cf. run() docstring's H1 diagnostic / expert_retrain_interval): PLACEHOLDER, currently
+    # a documented no-op. _retrain_expert_with_trigger's own retraining call
+    # (mini_train, below) is a plain CENTRALIZED training run over the whole poisoned dataset --
+    # it has no federated client split or aggregator of its own to parameterize (unlike the
+    # main label/trigger optimization loop's agg_expert_grads/agg_student_grads). Wiring a real
+    # robust-aggregator-aware retraining regime would mean rewriting mini_train's own loop to
+    # simulate per-client updates + aggregation, which is out of scope for this pass (see style
+    # constraints: no loop-architecture rewrites). Exposed here (defaulting to agg_method itself,
+    # i.e. never actually read/branched on below) so the gap is visible in configs/schema rather
+    # than silently assumed away -- see the P6 report in the accompanying diagnostic writeup.
+    expert_retrain_agg_method = args.get("expert_retrain_agg_method", agg_method)
+
+    # Gradient-norm loss balancing (see run() docstring companion diagnostic, "Equilibrage des
+    # poids"): every lambda_balance_interval outer steps (0 = disabled, default, full no-op),
+    # rescales each of a fixed set of delta-facing loss weights so its OWN gradient-w.r.t.-delta
+    # norm matches a target FRACTION of a reference ("main") term's gradient norm, damped by a
+    # sqrt (so a single recalibration doesn't overshoot) and clamped to [lambda_i_min,
+    # lambda_i_max] per term. Keeps a many-term loss (L_bd, L_consistency, L_budget,
+    # L_gradmatch, L_lpips) from requiring a combinatorial grid search over raw weights.
+    lambda_balance_interval = args.get("lambda_balance_interval", 0)
+    lambda_balance_ratios = args.get("lambda_balance_ratios", {
+        "L_bd": 0.45, "L_consistency": 0.20, "L_budget": 0.20,
+        "L_gradmatch": 0.10, "L_lpips": 0.05,
+    })
+    lambda_balance_min = args.get("lambda_balance_min", 1e-4)
+    lambda_balance_max = args.get("lambda_balance_max", 1e4)
 
     # Gradient-mismatch penalty (see run() docstring): off by default (0.0 = no-op, identical
     # to the module's behavior before this term existed). gradmatch_metric selects the distance
@@ -635,13 +713,30 @@ def run(experiment_name, module_name, **kwargs):
     delta = init_delta(
         mu.shape, horizontal=True, strength=6.0, freq=16, device=device, init=init,
     )
-    # Magnitude floor: a FRACTION of the init trigger's own norm, computed (not hardcoded) --
-    # see run() docstring's "Anti-collapse regularizers". Computed BEFORE requires_grad_ so it
-    # is a plain float, independent of delta's later optimization.
-    delta_min = delta_min_frac * delta.detach().norm().item()
+    # Magnitude floor (P0 FIX, cf. D1): delta_min must live in the FEASIBLE set
+    # {||delta||_inf <= epsilon} -- ||delta||_2 can never exceed epsilon*sqrt(d) there, so a
+    # fraction of delta's RAW, pre-clamp init norm (as this used to be computed) can and did
+    # land far above that ceiling (e.g. ~21x on the CIFAR/epsilon=0.1/strength=6.0 combination
+    # documented in D1), making L_mag's floor permanently, unsatisfiably active and freezing
+    # delta at its clamped init sign via Adam's per-coordinate normalization of an
+    # (unsatisfiable-floor-induced) constant-norm gradient. delta_min_frac now scales the
+    # feasible ceiling itself: 0.8 (new default) targets ~80% saturation of the Linf cube --
+    # the global, low-per-coordinate-amplitude, saturated profile D0 identifies as surviving
+    # coordinate-wise defenses -- while still leaving room for delta_min < max_reachable.
+    max_reachable_l2 = epsilon * math.sqrt(delta.numel())
+    delta_min = delta_min_frac * max_reachable_l2
+    if delta_min > max_reachable_l2:
+        raise ValueError(
+            f"delta_min={delta_min:.4f} (delta_min_frac={delta_min_frac} * "
+            f"max_reachable=epsilon*sqrt(d)={max_reachable_l2:.4f}) exceeds the feasible "
+            f"||delta||_2 ceiling under ||delta||_inf<=epsilon={epsilon} -- structurally "
+            "unreachable post-clamp (P0 guard, cf. D1: this used to run anyway and silently "
+            "freeze delta at its init sign). delta_min_frac must be <= 1.0."
+        )
     print(
-        f"delta_min={delta_min:.6f} ({delta_min_frac} * ||delta_init||_2="
-        f"{delta.detach().norm().item():.6f})"
+        f"delta_min={delta_min:.6f} ({delta_min_frac} * max_reachable=epsilon*sqrt(d)="
+        f"{max_reachable_l2:.6f}); ||delta_init||_2 (raw, pre-clamp)="
+        f"{delta.detach().norm().item():.6f}"
     )
     # H1 diagnostic (not a correction -- see run() docstring): delta_init is captured LATER,
     # inside the training loop, right after delta's first clamp_/projection (Step 3 fix -- see
@@ -688,6 +783,7 @@ def run(experiment_name, module_name, **kwargs):
     asr_eval_raw = torch.stack(asr_eval_raw).to(device)
 
     delta_init = None  # H1 diagnostic -- captured on the first batch, see below
+    prev_delta_sign = None  # D1 diagnostic -- delta_sign_flip_rate, see below
 
     # P3: preload `pool_size` (params, optimizer-state) checkpoint pairs into RAM once, then
     # draw one uniformly at random per outer step below -- instead of a single checkpoint
@@ -768,6 +864,23 @@ def run(experiment_name, module_name, **kwargs):
             f"{expert_retrain_epochs} epochs against the CURRENT trigger "
             f"(||delta||_inf={delta_snapshot.abs().max().item():.4f})..."
         )
+        # P6 (documented no-op, cf. run() docstring companion diagnostic): mini_train below is
+        # a PLAIN CENTRALIZED training run over the whole poisoned dataset -- it has no
+        # federated client split or aggregator to make robust-aware, so
+        # expert_retrain_agg_method (read at the top of run(), default agg_method itself) is
+        # NOT branched on anywhere in this function. Retraining therefore always happens under
+        # an (implicitly) undefended regime regardless of the VICTIM's own agg_method at
+        # deployment -- wiring a real robust-aggregator-aware retraining loop would require
+        # rewriting this call into a per-client-split-then-aggregate loop, out of scope for this
+        # pass (see the accompanying diagnostic's style constraints). Left visible here rather
+        # than silently assumed away.
+        if expert_retrain_agg_method != agg_method:
+            print(
+                f"WARNING: expert_retrain_agg_method={expert_retrain_agg_method!r} differs "
+                f"from agg_method={agg_method!r}, but expert retraining (mini_train below) is "
+                "a plain centralized run with no federated aggregator of its own -- this value "
+                "is NOT used, retraining is unaffected by it. See the comment just above."
+            )
 
         # Reseed to the ORIGINAL train_expert step's own seed (see schemas/
         # federated_generate_labels_trigger_joint.toml's `seed` doc), BEFORE building this
@@ -885,6 +998,7 @@ def run(experiment_name, module_name, **kwargs):
     align_active_window = []  # rolling fraction of steps where L_align > 0 -- see hinge_rate
     mag_active_window = []    # in federated_optimizing_trigger_policy for the same pattern
     ANTI_COLLAPSE_WINDOW = 50
+    global_step = 0  # batch-step counter, drives lambda_balance_interval below
 
     with make_pbar(total=config['iterations'] * len(mtt_dataset)) as pbar:
         expert_retrain_round = 0
@@ -908,12 +1022,33 @@ def run(experiment_name, module_name, **kwargs):
                 checkpoints_k = _load_experts_for_step(it)
                 optimizer_delta.zero_grad()
 
+                # Gradient-norm loss balancing (see "lambda_balance_interval" above): only build
+                # the extra LIVE (non-detached) sums this needs on balancing steps themselves --
+                # on every other step this is a pure no-op, identical to before this feature
+                # existed. L_bd/L_lpips are added to delta.grad manually (outside grand_loss's
+                # own autograd graph, see point 3/lpips block below) -- these separate live sums
+                # let a balancing step still measure their OWN (lambda-independent) gradient norm
+                # w.r.t. delta via a dedicated torch.autograd.grad call, without disturbing that
+                # existing manual-accumulation path.
+                do_balance = lambda_balance_interval > 0 and global_step % lambda_balance_interval == 0
+                L_bd_live_total = torch.tensor(0.0, device=device)
+                L_lpips_live_total = torch.tensor(0.0, device=device)
+
                 mtt_term_list = []
                 gradmatch_list = []
                 match_list = []
                 matching_term_list = []
                 L_bd_mean_list = []
                 L_lpips_mean_list = []
+                # P3/P4/P5 (cf. D2/D5/"Ce qu'il ne faut pas faire"): per-checkpoint collectors,
+                # same convention as mtt_term_list/gradmatch_list/match_list above (a live,
+                # differentiable tensor per checkpoint k, meaned OUTSIDE the k-loop).
+                margin_list = []
+                margin_raw_mean_list = []
+                consistency_list = []  # poison_consistency -- ALWAYS populated (mandatory, D5)
+                budget_list = []
+                z_emp_median_list = []
+                z_emp_frac_over_1_list = []
 
                 for k, (checkpoint, state_dict) in enumerate(checkpoints_k):
                     # expert_models[k]/student_models[k] are PERSISTENT, DISTINCT instances
@@ -945,6 +1080,18 @@ def run(experiment_name, module_name, **kwargs):
                     n_bd_valid = 0
                     L_lpips_sum = torch.tensor(0.0, device=device)
                     n_lpips_valid = 0
+                    # P3 (cf. D2): margin-floor accumulators, same valid-count convention as
+                    # L_bd_sum/n_bd_valid (both only ever incremented together, inside the same
+                    # `if is_poisoned.any():` block below).
+                    margin_sum = torch.tensor(0.0, device=device)
+                    margin_raw_sum = torch.tensor(0.0, device=device)
+                    # P5 (cf. coordinate_budget_penalty): counts how many honest clients ACTUALLY
+                    # contributed to expert_grad_buf this batch (P2's `continue` above can skip
+                    # an honest client whose entire local batch happened to be poisoned rows) --
+                    # since cid is processed in increasing order and appends happen in that same
+                    # order, the first n_honest_contributed entries of expert_grad_buf[i] are
+                    # always exactly the honest ones, whether or not that equals num_honests.
+                    n_honest_contributed = 0
 
                     for cid, batch in enumerate(batches):
 
@@ -954,7 +1101,18 @@ def run(experiment_name, module_name, **kwargs):
                         # federated aggregate is the same gradient on both sides, same as
                         # federated_generate_labels/federated_generate_labels_trigger.
                         if cid < num_honests:
-                            x, y = batch[0].to(device), batch[1].to(device)
+                            # P2 FIX (cf. D3): batch[5] (is_poisoned) was previously ignored
+                            # here -- per TriggerMTTDataset's own docstring, rows with
+                            # i >= len(distill) are genuinely triggered-and-relabeled, so an
+                            # "honest" client's raw batch[0]/batch[1] could (and did) include
+                            # poisoned rows. Filtering to keep==~is_poisoned is what actually
+                            # makes this branch clean -- NOT "by construction" (the comment
+                            # below, now corrected, used to claim that).
+                            x, y, _, _, _, is_p = batch
+                            keep = ~is_p
+                            if not keep.any():
+                                continue
+                            x, y = x[keep].to(device), y[keep].to(device)
 
                             expert_model.zero_grad()
                             loss = clf_loss(expert_model(x), y)
@@ -966,10 +1124,12 @@ def run(experiment_name, module_name, **kwargs):
                                     expert_grad_buf[i].append(g)
                                     student_grad_buf[i].append(g)
                                     if track_gradmatch:
-                                        # An honest client's local batch is entirely clean by
-                                        # construction -- this whole-batch gradient is exactly a
-                                        # grad(L_c) contributing chunk (see run() docstring).
+                                        # Genuinely clean by FILTERING (P2 fix, cf. D3) -- this
+                                        # whole-batch gradient is a grad(L_c) contributing chunk
+                                        # (see run() docstring) only because keep==~is_poisoned
+                                        # was applied above, not by construction of the batch.
                                         clean_grad_chunks[i].append(g)
+                            n_honest_contributed += 1
 
                         # POISONED CLIENTS
                         else:
@@ -1053,11 +1213,26 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 logits_bd = expert_model(x_trig)
                                 L_bd_cid = clf_loss(logits_bd, y_t[is_poisoned_dev])
-                                # poison_grad_chunks (bd_grads[1:] below) feeds BOTH the
-                                # gradient-mismatch penalty (track_gradmatch) AND the
-                                # aggregate-match penalty (track_match) -- either one wanting it
-                                # is enough to ask for it here.
-                                track_poison_grad = track_gradmatch or track_match
+
+                                # P3 (cf. D2): margin floor on THIS client's triggered rows --
+                                # differentiable w.r.t. delta via logits_bd (x_trig -> delta),
+                                # accumulated the same way as L_bd_sum (meaned over checkpoints
+                                # below via margin_list, mirroring mtt_term_list/match_list).
+                                if track_margin:
+                                    L_margin_cid, margin_raw_cid = margin_floor_penalty(
+                                        logits_bd, target_label, margin_min,
+                                    )
+                                    margin_sum = margin_sum + L_margin_cid
+                                    margin_raw_sum = margin_raw_sum + margin_raw_cid.detach()
+
+                                # poison_grad_chunks (bd_grads[1:] below) feeds the
+                                # gradient-mismatch penalty (track_gradmatch), the aggregate-match
+                                # penalty (track_match), AND poison_consistency (P4, cf. D5) --
+                                # the latter is MANDATORY instrumentation (see run() docstring's
+                                # instrumentation policy) regardless of lambda_consistency, so
+                                # this collection always runs, not just when one of the three
+                                # weights is nonzero.
+                                track_poison_grad = True
                                 grad_targets = [delta] + expert_params if track_poison_grad else [delta]
                                 # retain_graph=True (unlike the indirect module): x_trig's node is
                                 # shared with x_t_adv (which fed loss_e/grads_e, still needed by
@@ -1090,6 +1265,8 @@ def run(experiment_name, module_name, **kwargs):
                                             poison_grad_chunks[i].append(g)
                                 L_bd_sum = L_bd_sum + L_bd_cid.detach()
                                 n_bd_valid += 1
+                                if do_balance:
+                                    L_bd_live_total = L_bd_live_total + lambda_bd * L_bd_cid
 
                                 # Perceptual (LPIPS) penalty on the trigger (see utils.
                                 # lpips_penalty): off by default (lambda_lpips=0.0, lpips_model
@@ -1115,6 +1292,10 @@ def run(experiment_name, module_name, **kwargs):
                                         )
                                     L_lpips_sum = L_lpips_sum + L_lpips_cid.detach()
                                     n_lpips_valid += 1
+                                    if do_balance:
+                                        L_lpips_live_total = (
+                                            L_lpips_live_total + lambda_lpips * L_lpips_cid
+                                        )
 
                             # Student
                             loss_s = clf_loss(student_model(x_d), softmax(y_d))
@@ -1134,9 +1315,19 @@ def run(experiment_name, module_name, **kwargs):
                     have_poison_grad = all(len(c) > 0 for c in poison_grad_chunks)
                     poison_grad_mean = (
                         [torch.stack(c, dim=0).mean(dim=0) for c in poison_grad_chunks]
-                        if (track_gradmatch or track_match) and have_poison_grad
-                        else None
+                        if have_poison_grad else None
                     )
+
+                    # P4 (cf. D5): poison_consistency is MANDATORY instrumentation -- always
+                    # computed whenever there's at least one contributing poisoned client this
+                    # checkpoint (have_poison_grad), independent of lambda_consistency. Vacuously
+                    # 0.0 at num_poisoned<=1 (see poison_consistency's own docstring) -- not a
+                    # bug, just uninformative until num_poisoned>=2.
+                    consistency_k = (
+                        poison_consistency(poison_grad_chunks) if have_poison_grad
+                        else torch.tensor(0.0, device=device)
+                    )
+                    consistency_list.append(consistency_k)
 
                     # Gradient-mismatch penalty for THIS checkpoint (see run() docstring):
                     # means-of-contributing-chunks per expert_model parameter, then
@@ -1178,6 +1369,43 @@ def run(experiment_name, module_name, **kwargs):
                         agg_method,
                         f=num_poisoned
                     )
+
+                    # P5 (cf. "Ce qu'il ne faut pas faire"): coordinate-wise budget penalty on
+                    # the REALISTIC aggregate agg_expert_grads (DIFFERENTIABLE w.r.t. delta),
+                    # relative to this checkpoint's own HONEST per-coordinate mean/std --
+                    # honest_grads_flat is built from the first n_honest_contributed entries of
+                    # expert_grad_buf (P2: not necessarily num_honests, see that counter's own
+                    # comment), DETACHED (already are -- honest contributions are
+                    # `.detach().clone()`, see the honest branch above). z_emp_* diagnostics
+                    # (always computed when honest grads are available) are the empirical
+                    # per-coordinate deviation the CURRENT delta induces, in units of honest
+                    # std -- what z_budget should be calibrated against (see
+                    # prelim/calibrate_z_budget.py).
+                    if n_honest_contributed > 0:
+                        honest_grads_flat = torch.stack([
+                            torch.cat([
+                                expert_grad_buf[i][j].reshape(-1)
+                                for i in range(len(expert_params))
+                            ])
+                            for j in range(n_honest_contributed)
+                        ])
+                        g_poison_flat = torch.cat(
+                            [agg_expert_grads[i].reshape(-1) for i in range(len(expert_params))]
+                        )
+                        mu_h_diag = honest_grads_flat.mean(0)
+                        sd_h_diag = honest_grads_flat.std(0) + 1e-8
+                        z_emp = (g_poison_flat.detach() - mu_h_diag).abs() / sd_h_diag
+                        z_emp_median_list.append(z_emp.median().item())
+                        z_emp_frac_over_1_list.append((z_emp > 1.0).float().mean().item())
+                        if track_budget:
+                            budget_k = coordinate_budget_penalty(
+                                g_poison_flat, honest_grads_flat, z_budget,
+                            )
+                        else:
+                            budget_k = torch.tensor(0.0, device=device)
+                    else:
+                        budget_k = torch.tensor(0.0, device=device)
+                    budget_list.append(budget_k)
 
                     # Aggregate-match penalty for THIS checkpoint (see run() docstring,
                     # "Aggregate-gradient alignment"): 1 - cos(agg_expert_grads,
@@ -1249,6 +1477,13 @@ def run(experiment_name, module_name, **kwargs):
                     L_lpips_mean_list.append(
                         (L_lpips_sum / n_lpips_valid).item() if n_lpips_valid > 0 else 0.0
                     )
+                    margin_list.append(
+                        margin_sum / n_bd_valid if n_bd_valid > 0
+                        else torch.tensor(0.0, device=device)
+                    )
+                    margin_raw_mean_list.append(
+                        (margin_raw_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
+                    )
 
                 # Step 5 instrumentation: snapshot of delta.grad from JUST the L_bd path
                 # (accumulated across ALL n_checkpoints_per_step checkpoints' cid loops above,
@@ -1275,6 +1510,10 @@ def run(experiment_name, module_name, **kwargs):
                 mtt_term_avg = torch.stack(mtt_term_list).mean()
                 L_gradmatch_avg = torch.stack(gradmatch_list).mean()
                 L_match_avg = torch.stack(match_list).mean()
+                # P3/P4/P5 checkpoint-averages, same convention as mtt_term_avg above.
+                margin_avg = torch.stack(margin_list).mean()
+                consistency_avg = torch.stack(consistency_list).mean()
+                budget_avg = torch.stack(budget_list).mean()
 
                 grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
@@ -1304,6 +1543,78 @@ def run(experiment_name, module_name, **kwargs):
 
                 grand_loss = grand_loss + lambda_gradmatch * L_gradmatch_avg
                 grand_loss = grand_loss + lambda_match * L_match_avg
+                # P3 (cf. D2): margin floor, replaces directional_floor_penalty as the
+                # anti-collapse mechanism -- added regardless of trigger_constraint (unlike
+                # L_align/L_mag, this has no "projection" hard-constraint counterpart).
+                grand_loss = grand_loss + lambda_margin * margin_avg
+                # P4/P5 (cf. D5 / "Ce qu'il ne faut pas faire"): consistency_avg is added with
+                # its own weight (0.0 default, no-op) even though it is ALWAYS computed/logged
+                # above (mandatory instrumentation) -- only the grand_loss contribution is gated.
+                grand_loss = grand_loss + lambda_consistency * consistency_avg
+                grand_loss = grand_loss + lambda_budget * budget_avg
+
+                # Gradient-norm loss balancing (see "lambda_balance_interval" above, cf.
+                # "Equilibrage des poids"): measured BEFORE grand_loss.backward() consumes the
+                # graph, using retain_graph=True autograd.grad probes on the (already lambda_i-
+                # WEIGHTED, see accumulation sites above) per-term tensors as they actually enter
+                # the total -- the subsequent sqrt-damped update is a fixed-point iteration (each
+                # recalibration moves lambda_i only PART of the way to the ratio_i target,
+                # converging over repeated intervals rather than jumping there in one step).
+                # g_main is defined as the MTT matching term's own (always-on, never itself
+                # rescaled) gradient norm -- gamma_stealth*mtt_term_avg, the term every other
+                # weight's ratio_i is meant as a FRACTION of. L_bd/L_lpips bypass grand_loss's
+                # own graph (manually accumulated into delta.grad instead, see point 3/lpips
+                # block above) -- their own probes use the dedicated L_bd_live_total/
+                # L_lpips_live_total sums built ONLY on balancing steps for exactly this purpose.
+                if do_balance:
+                    def _grad_norm(term):
+                        g = torch.autograd.grad(
+                            term, delta, retain_graph=True, allow_unused=True,
+                        )[0]
+                        return g.norm().item() if g is not None else 0.0
+
+                    g_main = _grad_norm(gamma_stealth * mtt_term_avg)
+                    balance_targets = {
+                        "L_bd": (L_bd_live_total, "lambda_bd"),
+                        "L_gradmatch": (lambda_gradmatch * L_gradmatch_avg, "lambda_gradmatch"),
+                        "L_lpips": (L_lpips_live_total, "lambda_lpips"),
+                    }
+                    # L_consistency/L_budget only meaningfully rescalable once their own
+                    # weight is already nonzero (a zero-weight term's tensor still has a
+                    # well-defined raw gradient, but starting a fixed-point iteration from
+                    # lambda_i=0 can never move -- new_lambda = 0*sqrt(...) = 0 -- so these
+                    # are skipped entirely while their weight is still exactly 0.0, same as
+                    # the other terms would be were their own lambda_i ever driven to 0).
+                    if lambda_consistency != 0:
+                        balance_targets["L_consistency"] = (
+                            lambda_consistency * consistency_avg, "lambda_consistency"
+                        )
+                    if lambda_budget != 0:
+                        balance_targets["L_budget"] = (
+                            lambda_budget * budget_avg, "lambda_budget"
+                        )
+                    for name, (term, lambda_attr) in balance_targets.items():
+                        ratio_i = lambda_balance_ratios.get(name)
+                        if ratio_i is None:
+                            continue
+                        g_i = _grad_norm(term)
+                        if g_i <= 0:
+                            continue
+                        current = locals()[lambda_attr]
+                        if current == 0:
+                            continue
+                        scale = math.sqrt(max(ratio_i * g_main / g_i, 0.0))
+                        new_val = min(max(current * scale, lambda_balance_min), lambda_balance_max)
+                        if lambda_attr == "lambda_bd":
+                            lambda_bd = new_val
+                        elif lambda_attr == "lambda_gradmatch":
+                            lambda_gradmatch = new_val
+                        elif lambda_attr == "lambda_lpips":
+                            lambda_lpips = new_val
+                        elif lambda_attr == "lambda_consistency":
+                            lambda_consistency = new_val
+                        elif lambda_attr == "lambda_budget":
+                            lambda_budget = new_val
 
                 # Optimize labels and trigger. delta.grad already holds the per-client L_bd
                 # contributions accumulated above (point 3) -- grand_loss.backward() ADDS the
@@ -1312,6 +1623,7 @@ def run(experiment_name, module_name, **kwargs):
                 # delta.grad again in between).
                 optimizer_labels.zero_grad()
                 grand_loss.backward()
+                global_step += 1
 
                 # Step 5 instrumentation: norm of grand_loss.backward()'s contribution to
                 # delta.grad beyond the L_bd-only snapshot taken before it -- i.e. the
@@ -1369,6 +1681,20 @@ def run(experiment_name, module_name, **kwargs):
                     cos_source_post = cosine_to(delta, mu_source).item()
                     L_mag_post, _ = magnitude_floor_penalty(delta, delta_min)
                     L_mag_post = L_mag_post.item()
+
+                    # D1 diagnostic: fraction of coordinates whose sign changed since the
+                    # PREVIOUS batch's post-step delta -- direct evidence of (or against) the
+                    # sign-pinning freeze P0 fixes (see delta_min_frac's own comment above).
+                    # Should be non-zero once P0 is applied; a value stuck at ~0.0 for many
+                    # consecutive batches past the first few is the freeze signature.
+                    delta_sign = delta.sign()
+                    if prev_delta_sign is None:
+                        delta_sign_flip_rate = 0.0
+                    else:
+                        delta_sign_flip_rate = (
+                            (delta_sign != prev_delta_sign).float().mean().item()
+                        )
+                    prev_delta_sign = delta_sign.clone()
 
                     # H1 diagnostic, Step 3 fix (see run() docstring / delta_init comment
                     # above): delta_init is captured HERE, the first time this code runs --
@@ -1459,6 +1785,30 @@ def run(experiment_name, module_name, **kwargs):
                         "matching_term_std": float(np.std(matching_term_list)),
                         "L_bd_mean_std": float(np.std(L_bd_mean_list)),
                         "expert_asr_std": float(np.std(asr_mean_list)),
+                        # P0/P3/P4/P5 instrumentation (see run() docstring companions D1/D2/D5):
+                        # L_margin/L_budget/L_consistency logged SEPARATELY, never their sum
+                        # (per the diagnostic protocol) -- poison_consistency/z_emp_* are
+                        # MANDATORY (always computed above when data is available, independent
+                        # of their own lambda_i), delta_sign_flip_rate is the direct D1 freeze
+                        # diagnostic.
+                        "L_margin": margin_avg.item(),
+                        "margin_mean": float(np.mean(margin_raw_mean_list)),
+                        "L_consistency": consistency_avg.item(),
+                        "poison_consistency": consistency_avg.item(),
+                        "L_budget": budget_avg.item(),
+                        "z_emp_median": (
+                            float(np.mean(z_emp_median_list)) if z_emp_median_list else None
+                        ),
+                        "z_emp_frac_over_1": (
+                            float(np.mean(z_emp_frac_over_1_list))
+                            if z_emp_frac_over_1_list else None
+                        ),
+                        "delta_sign_flip_rate": delta_sign_flip_rate,
+                        "lambda_bd_current": lambda_bd,
+                        "lambda_gradmatch_current": lambda_gradmatch,
+                        "lambda_lpips_current": lambda_lpips,
+                        "lambda_consistency_current": lambda_consistency,
+                        "lambda_budget_current": lambda_budget,
                     })
                 tracker.log(
                     it,
@@ -1474,6 +1824,10 @@ def run(experiment_name, module_name, **kwargs):
                     mtt_delta_grad_norm=mtt_delta_grad_norm,
                     L_gradmatch=L_gradmatch_avg.item(),
                     L_match=L_match_avg.item(),
+                    L_margin=margin_avg.item(),
+                    L_consistency=consistency_avg.item(),
+                    L_budget=budget_avg.item(),
+                    delta_sign_flip_rate=delta_sign_flip_rate,
                 )
 
                 pbar.update(batch_size)
