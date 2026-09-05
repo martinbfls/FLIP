@@ -29,7 +29,7 @@ from modules.federated_generate_labels.utils import coalesce_attack_config, \
 from modules.train_expert.utils import checkpoint_callback
 from modules.federated_optimizing_trigger.utils import (
     get_mu, init_delta, raw_to_trigger_preprocess, get_raw_clean_dataset,
-    trigger_penalty_hinge, tv_loss,
+    trigger_penalty, trigger_penalty_hinge, tv_loss,
 )
 from modules.federated_generate_labels_trigger_joint.utils import (
     TriggerMTTDataset, extract_experts_biased, build_expert_pool,
@@ -1518,11 +1518,14 @@ def run(experiment_name, module_name, **kwargs):
                 grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
                 # Trigger regularizers (optional, default 0) -- same terms/names as
-                # federated_optimizing_trigger_policy, reused unchanged. L_pen/kappa is the
-                # STEALTH ceiling on cos(delta, mu_target-mu_source) (trigger_penalty_hinge,
-                # shared/unmodified file) -- unrelated to the anti-collapse floor below.
+                # federated_optimizing_trigger_policy, reused unchanged, EXCEPT for this line:
+                # ancien port de federated_optimizing_trigger (avant trigger_penalty_hinge) --
+                # cos(delta, mu_target) + 1, minimise, pousse delta ANTI-aligne avec la moyenne
+                # de la classe cible. C'est ce terme-la qui tournait dans la config
+                # num_honests=0/num_poisoned=1/agg=mean qui cassait les agregateurs robustes,
+                # pas le plafond de furtivite trigger_penalty_hinge.
                 # Checkpoint-independent -- computed/added exactly ONCE.
-                L_pen = trigger_penalty_hinge(delta, mu, mu_source, kappa)
+                L_pen = trigger_penalty(delta, mu)
                 L_tv = tv_loss(delta)
                 grand_loss = grand_loss + (
                     lambda_penalty * L_pen + lambda_delta * delta.norm() + lambda_tv * L_tv

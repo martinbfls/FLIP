@@ -86,6 +86,13 @@ def compute_batch_gradients(model, loss_fn, batch, create_graph, retain_graph=Fa
     return grads, logits
 
 
+def trigger_penalty(delta, mu, eps=1e-8):
+    delta_f = delta.view(1, -1)
+    mu_f = mu.view(1, -1).detach()
+    cos = F.cosine_similarity(delta_f, mu_f).mean()
+    return cos + 1.0
+
+
 def trigger_penalty_hinge(delta, mu_target, mu_source, kappa, eps=1e-8):
     delta_f = delta.view(1, -1)
     diff_f = (mu_target - mu_source).view(1, -1).detach()
