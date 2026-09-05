@@ -212,6 +212,24 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_hardening_steps
     step_tag as hs_step_tag,
     _defense_dir_tag as hs_defense_dir_tag,
 )
+# Old-objective port (trigger_penalty, cos(delta,mu_target)+1, ported back into the joint module
+# from the pre-B1/B2 federated version of federated_optimizing_trigger -- see
+# gen_configs_old_objective_port.py's own docstring) under the REAL config that broke every
+# robust aggregator: num_honests=7/num_poisoned=3/agg_method="mean"/lambda_match=1.0 at
+# generation time (not the earlier, degenerate 0-honest cell, where L_match is structurally 0).
+# ONE generation cell (no seed axis), deployed via a DEPLOY_AGG_METHODS x DEPLOY_BUDGETS sweep
+# (mean/trmean/multikrum x 500/1500/5000), all reading the SAME generated trigger. Aliased
+# (OOP_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_old_objective_port import (
+    EXP_BASE as OOP_EXP_BASE,
+    MODEL_FLAG as OOP_MODEL_FLAG,
+    DATASET as OOP_DATASET,
+    GEN_NUM_POISONED as OOP_GEN_NUM_POISONED,
+    GEN_NUM_HONESTS as OOP_GEN_NUM_HONESTS,
+    GEN_INIT as OOP_INIT,
+    DEPLOY_AGG_METHODS as OOP_AGG_METHODS,
+    DEPLOY_BUDGETS as OOP_BUDGETS,
+)
 import json as _json
 
 
@@ -834,6 +852,52 @@ def compute_cta_pta_mean_var_hardening_steps(
     return pd.DataFrame.from_records(records)
 
 
+def compute_cta_pta_mean_var_old_objective_port(
+    agg_method,
+    budgets,
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var, for the old-objective-port campaign instead (see
+    gen_configs_old_objective_port.py's own docstring) -- a SINGLE generation cell, no seed
+    axis (num_honests=7/num_poisoned=3/agg_method="mean"/lambda_match=1.0 at generation time,
+    the REAL config that broke every robust aggregator, not the earlier degenerate 0-honest
+    port where L_match is structurally 0). `agg_method` here is the DEPLOYMENT aggregator
+    (independent of the fixed generation-time one) -- directory layout matches
+    gen_configs_old_objective_port.generate() exactly: OOP_EXP_BASE / MODEL_FLAG / DATASET /
+    {agg_method} / train_user_{budget}/{caccs,paccs}.npy. cta_var/pta_var are 0.0 whenever the
+    single run's files exist (no seeds to vary over), NaN otherwise -- same missing-cell
+    convention as every other campaign here (never crashes on a not-yet-run cell).
+    """
+    records = []
+
+    for budget in budgets:
+        run_dir = OOP_EXP_BASE / OOP_MODEL_FLAG / OOP_DATASET / agg_method / f"train_user_{budget}"
+        cta_path = run_dir / cta_file
+        pta_path = run_dir / pta_file
+
+        if cta_path.exists() and pta_path.exists():
+            cta_mean, pta_mean = get_final_value(cta_path), get_final_value(pta_path)
+            cta_var = pta_var = 0.0
+        else:
+            cta_mean = cta_var = pta_mean = pta_var = np.nan
+
+        records.append(
+            {
+                "dataset": OOP_DATASET,
+                "agg_method": agg_method,
+                "budget": budget,
+                "model": OOP_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
 # =========================
 # MULTI-KRUM POISON-SELECTION STATS
 # =========================
@@ -1411,6 +1475,25 @@ def save_all_trigger_visuals_federated_multikrum(seeds):
                 f"  {trigger_path_in(module_dir, FM_MODEL_FLAG, FM_DATASET, FM_NUM_POISONED, FM_NUM_HONESTS)}"
             )
     return saved
+
+
+def save_trigger_visual_old_objective_port():
+    """old-objective-port campaign wrapper: the attack is generated ONCE (no per-agg_method/
+    per-budget/per-seed axis at generation time -- see gen_configs_old_objective_port.py's own
+    docstring), so there's just one module_dir/trigger to render. init is fixed at "stripe"
+    (OOP_INIT)."""
+    module_dir = OOP_EXP_BASE / OOP_MODEL_FLAG / OOP_DATASET / "gen_labels_trigger_joint"
+    out_path = save_trigger_visual_in(
+        module_dir, OOP_MODEL_FLAG, OOP_DATASET, OOP_GEN_NUM_POISONED, OOP_GEN_NUM_HONESTS,
+        label=f"old_objective_port ({OOP_GEN_NUM_POISONED}vs{OOP_GEN_NUM_HONESTS}, mean)",
+        init=OOP_INIT,
+    )
+    if out_path is None:
+        print(
+            "[INFO] old_objective_port trigger not found yet (skipped): "
+            f"{trigger_path_in(module_dir, OOP_MODEL_FLAG, OOP_DATASET, OOP_GEN_NUM_POISONED, OOP_GEN_NUM_HONESTS, init=OOP_INIT)}"
+        )
+    return out_path
 
 
 def compute_best_second(block, budgets, series_labels):
@@ -2476,3 +2559,58 @@ if __name__ == "__main__":
             filename=f"{HS_DATASET}_hardening_poison_selection.png",
             title="Multi-Krum poisoned-selection rate by hardening step",
         )
+
+    # -------------------------------------------------------------------
+    # Old-objective port (trigger_penalty, cos(delta,mu_target)+1, ported back into the joint
+    # module from the pre-B1/B2 federated version of federated_optimizing_trigger -- see
+    # gen_configs_old_objective_port.py's own docstring) under the REAL config that broke every
+    # robust aggregator: num_honests=7/num_poisoned=3/agg_method="mean"/lambda_match=1.0 at
+    # generation time (not the earlier, degenerate 0-honest cell, where L_match is structurally
+    # 0). ONE generation cell (no seed axis), deployed across DEPLOY_AGG_METHODS x
+    # DEPLOY_BUDGETS (mean/trmean/multikrum x 500/1500/5000), all reading the SAME generated
+    # trigger -- directly comparable to each other at fixed budget. Same graceful-empty
+    # behavior as every campaign above if this hasn't been run yet.
+    # -------------------------------------------------------------------
+    print(f"\n=== [old_objective_port] Trigger visual ===")
+    save_trigger_visual_old_objective_port()
+
+    print(
+        f"\n=== [old_objective_port] {OOP_MODEL_FLAG}/{OOP_DATASET} -- deployment aggregators "
+        f"{OOP_AGG_METHODS} (generation: {OOP_GEN_NUM_POISONED}vs{OOP_GEN_NUM_HONESTS}, mean, "
+        "lambda_match=1.0) ==="
+    )
+
+    all_data_oop = {}
+    block_oop = {}
+
+    for agg_method in OOP_AGG_METHODS:
+        print(f"   -> {agg_method}")
+
+        df = compute_cta_pta_mean_var_old_objective_port(
+            agg_method=agg_method, budgets=OOP_BUDGETS,
+        )
+
+        df.to_csv(
+            f"{CSV_DIR}/old_objective_port_{OOP_MODEL_FLAG}_{OOP_DATASET}_{agg_method}.csv",
+            index=False,
+        )
+
+        all_data_oop[agg_method] = df
+
+        for _, row in df.iterrows():
+            block_oop[(row["budget"], agg_method)] = (
+                row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+            )
+
+    latex_table_oop = build_table(
+        block_oop, OOP_BUDGETS, OOP_AGG_METHODS,
+        name=f"{OOP_MODEL_FLAG}/{OOP_DATASET} old_objective_port: deployment aggregator sweep",
+    )
+    with open(f"{TABLE_DIR}/old_objective_port_{OOP_MODEL_FLAG}_{OOP_DATASET}.tex", "w") as f:
+        f.write(latex_table_oop)
+    print(f"[INFO] Saved LaTeX table for old_objective_port")
+
+    plot_cta_vs_pta(
+        all_data_oop, dataset=OOP_DATASET, save_dir=f"{PLOT_DIR}/old_objective_port/",
+        colors=AGG_COLORS, filename=f"{OOP_DATASET}_old_objective_port.png",
+    )
