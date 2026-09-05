@@ -24,16 +24,21 @@ depends only on the worker split and budget list, not on the aggregator), so thi
 1 train_expert + 1 gen_labels_trigger_joint + 1 select_flips + 9 train_user configs, not 9
 independent generation runs.
 
-Missing piece (flagged, not silently ignored): the OLD module's winning config also had
-lambda_b1=1.0/lambda_b2=1.0 (a gradient-geometry term comparing the poisoned-vs-clean gradient
-shift against the feasible label-flip polytope -- B1_k/B2_k in
-federated_optimizing_trigger/run_module.py's _compute_step docstring). There is no equivalent of
-this term anywhere in federated_generate_labels_trigger_joint (its own gradient-alignment knobs,
-lambda_match/lambda_gradmatch, are a DIFFERENT comparison -- realistic aggregate vs. poison-only
-direction, not delta's induced gradient shift vs. a label-flip feasibility polytope). Porting
-B1/B2 would require real code (compute_expected_flip_gradients/compute_v_polytope_distance and
-the QP solve behind them, ported into the joint module), not a TOML change -- deliberately left
-OUT of this generator; see PR/commit description for the decision on whether/how to add it.
+NOTE on B1/B2 (ruled out, not a gap): the CURRENT on-disk federated_optimizing_trigger/
+run_module.py (B1_k/B2_k, a gradient-shift-vs-label-flip-polytope feasibility term) is a LATER
+rewrite ("Finalize federated_optimizing_trigger as a non-federated B1/B2 objective") of the
+module -- it is NOT the code that actually produced the winning num_honests=0/num_poisoned=1/
+agg="mean" config this campaign ports. That run used an earlier, genuinely FEDERATED version of
+the module (build_worker_loaders + federated_aggregate/agg() mixing honest+poisoned client
+gradients into agg_mix, cosine_grad_loss(agg_mix, mu_poison) as L_match), whose objective was:
+    L_tot = lambda_match*L_match + lambda_adv*L_adv + lambda_penalty*L_pen + lambda_delta*||delta||
+with L_pen = trigger_penalty(delta, mu) (ported above) and L_adv == this module's own L_bd. At
+num_honests=0/num_poisoned=1, agg_mix reduces to the single poisoned worker's own gradient
+(mu_poison), making L_match = 1 - cos(g, g) = 0 structurally -- so GEN_LAMBDA_BD/GEN_LAMBDA_PENALTY/
+GEN_LAMBDA_DELTA below already cover the objective's only non-vanishing terms; there is nothing
+further to port for THIS specific config. lambda_match would need porting only for a FUTURE cell
+with num_honests>0 at generation time (this campaign's generation-time split stays 0/1, so it
+doesn't apply here).
 """
 
 import argparse
