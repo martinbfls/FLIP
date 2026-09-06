@@ -276,6 +276,28 @@ def run(experiment_name, module_name, **kwargs):
     batch's mini-batches. See docs/threat_models_audit.md for the re-run verdict under this
     corrected instrumentation.
 
+    Joint clean+poison task term (2026-09-06, `lambda_joint`, optional, off by default): an
+    additional term, L_joint (manually accumulated into delta.grad, same pattern as the
+    isolated L_bd term above -- NOT added through grand_loss.backward()), reusing `loss_e`
+    (`clf_loss(expert_model(x_t_adv), y_t)`, already computed for every poisoned client to
+    build grads_e) as-is: a classification loss over that client's WHOLE local batch -- its
+    clean rows (unchanged inputs/labels) AND its poisoned rows (T_delta(x)/target label via
+    x_trig) together, real inputs and real/target labels, not the synthetic labels_syn/distilled
+    set loss_s uses. `loss_e` already has a live dependency on delta through its poisoned rows
+    (E2's real coupling, point 1) and already shapes delta indirectly via grads_e ->
+    agg_expert_grads -> expert_next_param -> param_loss -- but that path also carries the
+    trajectory-matching dynamics (student_update tracking expert_next_param), so its pressure on
+    delta to keep the CLEAN-row loss low is entangled with matching, not a direct lever.
+    `L_joint = lambda_joint * torch.autograd.grad(loss_e, [delta], retain_graph=True,
+    allow_unused=True)`, accumulated into delta.grad exactly like L_bd (point 3) -- an
+    ADDITIONAL, separately-tunable contribution, not a duplicate of param_loss's indirect
+    pressure or of L_bd (which only ever sees the poisoned rows, never the clean ones). Costs no
+    extra forward pass (reuses loss_e's already-built graph) -- only one extra
+    `torch.autograd.grad` call per poisoned client, skipped entirely when lambda_joint=0.0
+    (default, full no-op, identical to the module's behavior before this term existed). Logged
+    separately (never merged into L_bd_mean/matching_term) as `L_joint_mean`/`L_joint_mean_std`
+    in metrics_log_path/tracker.log/the progress bar, same convention as L_bd_mean.
+
     Gradient-mismatch penalty (2026-08-31, optional, off by default): an additional term,
     L_gradmatch (`lambda_gradmatch * L_gradmatch` added to grand_loss, weight default 0.0 =
     no-op), measuring how distinguishable grad(L_p)(theta_k)(delta) is from grad(L_c)(theta_k)
@@ -421,6 +443,21 @@ def run(experiment_name, module_name, **kwargs):
     epsilon = args.get("epsilon", 0.1)
     lr_delta = args.get("lr_delta", 1e-2)
     lambda_bd = args.get("lambda_bd", 1.0)
+    # lambda_joint (regularizer, off by default): weight for L_joint, the isolated,
+    # manually-accumulated (same pattern as L_bd, point 3) gradient of loss_e -- the CE this
+    # module ALREADY computes each poisoned client's local batch (`clf_loss(expert_model(
+    # x_t_adv), y_t)`, x_t_adv mixing this client's clean rows unchanged with its poisoned
+    # rows via x_trig) -- w.r.t. delta ALONE. loss_e already influences delta indirectly
+    # through grads_e -> agg_expert_grads -> expert_next_param -> param_loss (E2's real
+    # coupling), but that path also depends on the trajectory-matching dynamics (student_update
+    # tracking expert_next_param); L_joint gives a DIRECT, separately-tunable pressure so delta
+    # keeps the expert's CLEAN-task loss (from the always-present clean rows) low alongside
+    # backdoor efficacy (L_bd, poisoned rows only), independent of that matching term. Reuses
+    # loss_e's already-built graph (retain_graph=True, no extra forward pass) -- see the cid
+    # loop below. 0.0 (default) is a full no-op, identical to the module's behavior before this
+    # term existed: the torch.autograd.grad call is skipped entirely (track_joint below).
+    lambda_joint = args.get("lambda_joint", 0.0)
+    track_joint = lambda_joint != 0
     lambda_penalty = args.get("lambda_penalty", 0.0)
     # lambda_delta defaults to 0 HERE specifically (same default as the other two modules, but
     # load-bearing in THIS one): it penalizes ||delta||, i.e. actively pushes delta's magnitude
@@ -1039,6 +1076,7 @@ def run(experiment_name, module_name, **kwargs):
                 match_list = []
                 matching_term_list = []
                 L_bd_mean_list = []
+                L_joint_mean_list = []
                 L_lpips_mean_list = []
                 # P3/P4/P5 (cf. D2/D5/"Ce qu'il ne faut pas faire"): per-checkpoint collectors,
                 # same convention as mtt_term_list/gradmatch_list/match_list above (a live,
@@ -1078,6 +1116,13 @@ def run(experiment_name, module_name, **kwargs):
 
                     L_bd_sum = torch.tensor(0.0, device=device)
                     n_bd_valid = 0
+                    # L_joint accumulators (see lambda_joint above) -- valid_count increments for
+                    # EVERY poisoned client processed (not just those with is_poisoned.any(),
+                    # unlike n_bd_valid): loss_e is computed unconditionally for every poisoned
+                    # client below, so its mean is meaningful even on a checkpoint where no
+                    # poisoned client's mini-batch happened to draw a triggered row.
+                    L_joint_sum = torch.tensor(0.0, device=device)
+                    n_joint_valid = 0
                     L_lpips_sum = torch.tensor(0.0, device=device)
                     n_lpips_valid = 0
                     # P3 (cf. D2): margin-floor accumulators, same valid-count convention as
@@ -1182,6 +1227,33 @@ def run(experiment_name, module_name, **kwargs):
                             # "last-poisoned-client-wins" grads_e_last.
                             for i, g in enumerate(grads_e):
                                 expert_grad_buf[i].append(g)
+
+                            # Joint clean+poison task term (lambda_joint, regularizer): reuses
+                            # loss_e -- already the CE over this poisoned client's WHOLE local
+                            # batch (clean rows unchanged + poisoned rows via x_trig), true labels
+                            # y_t -- as an ADDITIONAL, isolated contribution to delta.grad,
+                            # manually accumulated exactly like L_bd (point 3) so it does not
+                            # disturb grand_loss's own graph. retain_graph=True is required (and
+                            # safe -- grads_e's own call above already set it, and this graph is
+                            # still needed for grand_loss.backward() later via
+                            # agg_expert_grads/expert_next_param/param_loss). No extra forward
+                            # pass: loss_e's graph is reused as-is. allow_unused=True handles the
+                            # (common) case where this mini-batch's is_poisoned mask is all-False
+                            # (x_t_adv == x_t, no dependency on delta) -- skipped, contributes 0.
+                            if track_joint:
+                                joint_grad_raw = torch.autograd.grad(
+                                    loss_e, [delta], retain_graph=True, allow_unused=True,
+                                )[0]
+                                if joint_grad_raw is not None:
+                                    joint_grad = (
+                                        lambda_joint / n_checkpoints_per_step
+                                    ) * joint_grad_raw.detach()
+                                    delta.grad = (
+                                        joint_grad if delta.grad is None
+                                        else delta.grad + joint_grad
+                                    )
+                                L_joint_sum = L_joint_sum + loss_e.detach()
+                                n_joint_valid += 1
 
                             # Gradient-mismatch penalty (see run() docstring): the CLEAN subset of
                             # this poisoned client's own local batch (is_poisoned == False rows,
@@ -1474,6 +1546,9 @@ def run(experiment_name, module_name, **kwargs):
                     L_bd_mean_list.append(
                         (L_bd_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
                     )
+                    L_joint_mean_list.append(
+                        (L_joint_sum / n_joint_valid).item() if n_joint_valid > 0 else 0.0
+                    )
                     L_lpips_mean_list.append(
                         (L_lpips_sum / n_lpips_valid).item() if n_lpips_valid > 0 else 0.0
                     )
@@ -1485,12 +1560,12 @@ def run(experiment_name, module_name, **kwargs):
                         (margin_raw_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0
                     )
 
-                # Step 5 instrumentation: snapshot of delta.grad from JUST the L_bd path
-                # (accumulated across ALL n_checkpoints_per_step checkpoints' cid loops above,
-                # point 3, each already scaled by 1/n_checkpoints_per_step -- see that scaling's
-                # own comment), taken BEFORE grand_loss.backward() adds the MTT/param_loss-path
-                # contribution on top -- lets mtt_delta_grad_norm below isolate each path's
-                # magnitude without a separate lambda_bd=0 run.
+                # Step 5 instrumentation: snapshot of delta.grad from the manually-accumulated
+                # paths -- L_bd (point 3), L_joint (lambda_joint above), and L_lpips (lpips
+                # block above), each already scaled by 1/n_checkpoints_per_step where applicable
+                # -- taken BEFORE grand_loss.backward() adds the MTT/param_loss-path contribution
+                # on top -- lets mtt_delta_grad_norm below isolate the backward()-driven paths'
+                # magnitude without a separate lambda_bd=lambda_joint=0 run.
                 L_bd_only_delta_grad = (
                     delta.grad.detach().clone() if delta.grad is not None
                     else torch.zeros_like(delta)
@@ -1668,6 +1743,7 @@ def run(experiment_name, module_name, **kwargs):
                 # n_checkpoints_per_step per-checkpoint values collected during the k-loop above
                 # -- n_checkpoints_per_step==1 makes this exactly the single value it always was.
                 L_bd_mean = float(np.mean(L_bd_mean_list))
+                L_joint_mean = float(np.mean(L_joint_mean_list))
                 L_lpips_mean = float(np.mean(L_lpips_mean_list))
                 matching_term = float(np.mean(matching_term_list))
 
@@ -1762,6 +1838,7 @@ def run(experiment_name, module_name, **kwargs):
                         "grand_loss": grand_loss.item(),
                         "matching_term": matching_term,
                         "L_bd_mean": L_bd_mean,
+                        "L_joint_mean": L_joint_mean,
                         "L_lpips_mean": L_lpips_mean,
                         "expert_asr": asr_mean,
                         "expert_asr_frozen": asr_frozen_mean,
@@ -1787,6 +1864,7 @@ def run(experiment_name, module_name, **kwargs):
                         # term / ASR, worth knowing alongside the mean.
                         "matching_term_std": float(np.std(matching_term_list)),
                         "L_bd_mean_std": float(np.std(L_bd_mean_list)),
+                        "L_joint_mean_std": float(np.std(L_joint_mean_list)),
                         "expert_asr_std": float(np.std(asr_mean_list)),
                         # P0/P3/P4/P5 instrumentation (see run() docstring companions D1/D2/D5):
                         # L_margin/L_budget/L_consistency logged SEPARATELY, never their sum
@@ -1817,6 +1895,7 @@ def run(experiment_name, module_name, **kwargs):
                     it,
                     grand_loss=grand_loss.item(),
                     L_bd_mean=L_bd_mean,
+                    L_joint_mean=L_joint_mean,
                     L_lpips_mean=L_lpips_mean,
                     expert_asr=asr_mean,
                     expert_asr_frozen=asr_frozen_mean,
@@ -1838,6 +1917,7 @@ def run(experiment_name, module_name, **kwargs):
                     g_loss=f"{np.mean(losses[-20:]):.4g}",
                     match=f"{matching_term:.4g}" if attack in ["backdoor"] else "N/A",
                     L_bd=f"{L_bd_mean:.4g}",
+                    L_joint=f"{L_joint_mean:.4g}",
                     expert_asr=f"{asr_mean:.4g}",
                     asr_frozen=f"{asr_frozen_mean:.4g}",
                     cos_init=f"{cos_to_init:.4g}",
