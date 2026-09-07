@@ -31,6 +31,10 @@
 #   2. Submit the campaign:
 #        SLURM_ACCOUNT=<account> ./orchestrate_runs_trigger_joint_old_objective_port_slurm.sh
 #        SLURM_ACCOUNT=<account> DRY_RUN=1 ./orchestrate_runs_trigger_joint_old_objective_port_slurm.sh
+#
+#   Re-run just the USER phase against already-materialized flips (e.g. after fixing a
+#   train_user-only config bug such as `soft`), skipping BOOTSTRAP/GEN/FLIPS entirely:
+#        SLURM_ACCOUNT=<account> USER_ONLY=1 ./orchestrate_runs_trigger_joint_old_objective_port_slurm.sh
 ###
 
 set -euo pipefail
@@ -44,6 +48,7 @@ cd "$BASE_DIR"
 source "$SCRIPT_DIR/slurm_lib.sh"
 
 DRY_RUN="${DRY_RUN:-0}"
+USER_ONLY="${USER_ONLY:-0}"
 
 BOOTSTRAP_TIME="${BOOTSTRAP_TIME:-0-00:10:00}"
 GEN_TIME="${GEN_TIME:-1-00:00:00}"
@@ -78,9 +83,11 @@ BOOTSTRAP_CFG="$EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_bootstrap"
 GEN_CFG="$CELL_BASE_REL/gen_labels_trigger_joint"
 FLIPS_CFG="$CELL_BASE_REL/select_flips"
 
-require_config "$BOOTSTRAP_CFG"
-require_config "$GEN_CFG"
-require_config "$FLIPS_CFG"
+if [ "$USER_ONLY" != "1" ]; then
+    require_config "$BOOTSTRAP_CFG"
+    require_config "$GEN_CFG"
+    require_config "$FLIPS_CFG"
+fi
 
 USER_JOBS=()
 for agg_method in "${DEPLOY_AGG_METHODS[@]}"; do
@@ -102,13 +109,19 @@ echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET (generation-time: num_honests=0/
 echo "[PLAN] deployment sweep: agg_methods=${DEPLOY_AGG_METHODS[*]} budgets=${DEPLOY_BUDGETS[*]} (num_honests=7/num_poisoned=3)"
 echo "[PLAN] user cells=${#USER_JOBS[@]} (=agg_methods x budgets)"
 echo "[PLAN] partitions=${SLURM_PARTITIONS}"
-echo "[PLAN] phases: BOOTSTRAP -> GEN -> FLIPS -> USER"
+if [ "$USER_ONLY" = "1" ]; then
+    echo "[PLAN] phases: USER only (USER_ONLY=1 -- reusing existing BOOTSTRAP/GEN/FLIPS outputs on disk)"
+else
+    echo "[PLAN] phases: BOOTSTRAP -> GEN -> FLIPS -> USER"
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
     echo "[DRY-RUN] nothing submitted."
-    echo "[DRY-RUN] python run_experiment.py $BOOTSTRAP_CFG"
-    echo "[DRY-RUN] python run_experiment.py $GEN_CFG"
-    echo "[DRY-RUN] python run_experiment.py $FLIPS_CFG"
+    if [ "$USER_ONLY" != "1" ]; then
+        echo "[DRY-RUN] python run_experiment.py $BOOTSTRAP_CFG"
+        echo "[DRY-RUN] python run_experiment.py $GEN_CFG"
+        echo "[DRY-RUN] python run_experiment.py $FLIPS_CFG"
+    fi
     printf '[DRY-RUN] %s\n' "${USER_JOBS[@]}"
     exit 0
 fi
@@ -118,27 +131,33 @@ preflight_slurm || exit 1
 # ---------------------------------------------------------------------------
 # Submit -- same job-pool/barrier pattern as the sibling campaign scripts.
 # ---------------------------------------------------------------------------
-TIME_PER_TASK="$BOOTSTRAP_TIME"
-BOOTSTRAP_JOBS=("python run_experiment.py $BOOTSTRAP_CFG|old_port_bootstrap")
-submit_job_pool_slurm BOOTSTRAP_JOBS "old_port_bootstrap" || exit 1
-bootstrap_barrier=$(submit_barrier_slurm "old_port_barrier_bootstrap" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-echo "[PHASE] BOOTSTRAP submitted -> barrier $bootstrap_barrier"
+if [ "$USER_ONLY" = "1" ]; then
+    TIME_PER_TASK="$USER_TIME"
+    submit_job_pool_slurm USER_JOBS "old_port_user" || exit 1
+    echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs), no dependency (USER_ONLY=1)."
+else
+    TIME_PER_TASK="$BOOTSTRAP_TIME"
+    BOOTSTRAP_JOBS=("python run_experiment.py $BOOTSTRAP_CFG|old_port_bootstrap")
+    submit_job_pool_slurm BOOTSTRAP_JOBS "old_port_bootstrap" || exit 1
+    bootstrap_barrier=$(submit_barrier_slurm "old_port_barrier_bootstrap" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    echo "[PHASE] BOOTSTRAP submitted -> barrier $bootstrap_barrier"
 
-TIME_PER_TASK="$GEN_TIME"
-GEN_JOBS=("python run_experiment.py $GEN_CFG|old_port_gen")
-submit_job_pool_slurm GEN_JOBS "old_port_gen" "afterok:$bootstrap_barrier" || exit 1
-gen_barrier=$(submit_barrier_slurm "old_port_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-echo "[PHASE] GEN submitted -> barrier $gen_barrier"
+    TIME_PER_TASK="$GEN_TIME"
+    GEN_JOBS=("python run_experiment.py $GEN_CFG|old_port_gen")
+    submit_job_pool_slurm GEN_JOBS "old_port_gen" "afterok:$bootstrap_barrier" || exit 1
+    gen_barrier=$(submit_barrier_slurm "old_port_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    echo "[PHASE] GEN submitted -> barrier $gen_barrier"
 
-TIME_PER_TASK="$FLIPS_TIME"
-FLIPS_JOBS=("python run_experiment.py $FLIPS_CFG|old_port_flips")
-submit_job_pool_slurm FLIPS_JOBS "old_port_flips" "afterok:$gen_barrier" || exit 1
-flips_barrier=$(submit_barrier_slurm "old_port_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-echo "[PHASE] FLIPS submitted -> barrier $flips_barrier"
+    TIME_PER_TASK="$FLIPS_TIME"
+    FLIPS_JOBS=("python run_experiment.py $FLIPS_CFG|old_port_flips")
+    submit_job_pool_slurm FLIPS_JOBS "old_port_flips" "afterok:$gen_barrier" || exit 1
+    flips_barrier=$(submit_barrier_slurm "old_port_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    echo "[PHASE] FLIPS submitted -> barrier $flips_barrier"
 
-TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm USER_JOBS "old_port_user" "afterok:$flips_barrier" || exit 1
-echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
+    TIME_PER_TASK="$USER_TIME"
+    submit_job_pool_slurm USER_JOBS "old_port_user" "afterok:$flips_barrier" || exit 1
+    echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
+fi
 
 echo "[DONE] campaign submitted; job ids in $LOG_DIR/jobids_*.txt"
 echo "[NOTE] this module builds a second-order graph (create_graph=True) on the"

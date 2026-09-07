@@ -41,7 +41,7 @@ def run(experiment_name, module_name, **kwargs):
     clean_label = args["source_label"]
     target_label = args["target_label"]
 
-    soft = args.get("soft", True)
+    soft = args.get("soft", False)
     alpha = args.get("alpha", 0.0)
 
     batch_size = args.get("batch_size", None)
