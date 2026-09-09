@@ -64,6 +64,53 @@ if [ "$SLURM_PARTITIONS" = "all" ] || [ "$SLURM_PARTITIONS" = "auto" ]; then
 fi
 read -ra _SLURM_PARTITIONS_ARR <<< "$SLURM_PARTITIONS"
 
+# ---------------------------------------------------------------------------
+# Some partitions (e.g. "maple") are only reachable for JOB SUBMISSION from a
+# specific login node -- sbatch run from anywhere else is rejected/hangs even
+# though sinfo/squad queries work fine from the regular login node. Map such
+# partitions to the host that must run their sbatch, "partition:host" pairs
+# space-separated; sbatch (never sinfo/squeue) for that partition is then run
+# via `ssh <host> sbatch ...` instead of locally. Override/extend with:
+#   PARTITION_HOSTS="maple:maple-1 otherpart:other-login-1" ./orchestrate_...sh
+# Requires passwordless (key-based) SSH to that host already set up -- this
+# library never prompts for a password (BatchMode=yes), see partition_host()
+# below and preflight_slurm's own connectivity check.
+# ---------------------------------------------------------------------------
+PARTITION_HOSTS="${PARTITION_HOSTS:-maple:maple-1}"
+declare -A _PARTITION_HOST=()
+for _ph_pair in $PARTITION_HOSTS; do
+    _ph_part="${_ph_pair%%:*}"
+    _ph_host="${_ph_pair#*:}"
+    [ -n "$_ph_part" ] && [ -n "$_ph_host" ] && [ "$_ph_part" != "$_ph_host" ] && \
+        _PARTITION_HOST["$_ph_part"]="$_ph_host"
+done
+unset _ph_pair _ph_part _ph_host
+
+# partition_host PARTITION -- prints the ssh host required to submit to this
+# partition (empty if it can be submitted directly from here).
+partition_host() {
+    echo "${_PARTITION_HOST[$1]:-}"
+}
+
+# _run_sbatch HOST ARG... -- runs `sbatch ARG...`, either locally (HOST
+# empty) or via `ssh HOST sbatch ARG...` (HOST non-empty). Any stdin heredoc
+# the caller attached (submit_job_slurm's job script) is forwarded to the
+# remote sbatch unchanged -- ssh connects local stdin to the remote command's
+# stdin by default (no -n), and args are individually shell-quoted
+# (printf %q) before being joined into the single command string ssh expects.
+_run_sbatch() {
+    local host="$1"; shift
+    if [ -z "$host" ]; then
+        sbatch "$@"
+        return $?
+    fi
+    local cmd="" arg
+    for arg in "$@"; do
+        cmd+=" $(printf '%q' "$arg")"
+    done
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$host" "sbatch${cmd}"
+}
+
 # R&D Line / account required by this cluster. Run `slurmaccounts` to list
 # the accounts you may charge jobs to. Nothing can be submitted without it.
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-power}"
@@ -136,7 +183,7 @@ preflight_slurm() {
         return 1
     fi
 
-    local partition
+    local partition host
     local -a _ok_partitions=()
     for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
         if ! sinfo -h -p "$partition" -o "%P" 2>/dev/null | grep -q .; then
@@ -145,6 +192,18 @@ preflight_slurm() {
                 continue
             fi
             echo "[PREFLIGHT] partition '$partition' unknown or unreachable" >&2
+            rc=1
+            continue
+        fi
+
+        host="$(partition_host "$partition")"
+        if [ -n "$host" ] && ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" true 2>/dev/null; then
+            if [ "$_SLURM_PARTITIONS_AUTO" = "1" ]; then
+                echo "[PREFLIGHT] partition '$partition' requires ssh to '$host', which is not reachable passwordlessly -- dropping it" >&2
+                continue
+            fi
+            echo "[PREFLIGHT] partition '$partition' requires ssh to '$host', which is not reachable passwordlessly" >&2
+            echo "[PREFLIGHT]   run 'ssh $host' once by hand to accept its host key / confirm your keys are set up, then retry" >&2
             rc=1
             continue
         fi
@@ -169,7 +228,8 @@ preflight_slurm() {
     local probe probe_rc
     _ok_partitions=()
     for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
-        probe=$(sbatch --kill-on-invalid-dep=yes --test-only \
+        host="$(partition_host "$partition")"
+        probe=$(_run_sbatch "$host" --kill-on-invalid-dep=yes --test-only \
                        --account="$SLURM_ACCOUNT" \
                        --partition="$partition" \
                        --gres="gpu:$GPUS_PER_TASK" \
@@ -269,7 +329,7 @@ submit_job_slurm() {
     fi
 
     local jobid
-    jobid=$(sbatch --parsable \
+    jobid=$(_run_sbatch "$(partition_host "$partition")" --parsable \
            --job-name="$safe_name" \
            --account="$SLURM_ACCOUNT" \
            --partition="$partition" \
@@ -356,7 +416,7 @@ submit_barrier_slurm() {
     [ "$KILL_ON_INVALID_DEP" = "1" ] && dep_args+=(--kill-on-invalid-dep=yes)
 
     local jobid
-    jobid=$(sbatch --parsable \
+    jobid=$(_run_sbatch "$(partition_host "$BARRIER_PARTITION")" --parsable \
            --job-name="$name" \
            --account="$SLURM_ACCOUNT" \
            --partition="$BARRIER_PARTITION" \

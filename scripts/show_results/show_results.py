@@ -2725,9 +2725,10 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------
     print(f"\n=== [stealth_sweep] {SS_MODEL_FLAG}/{SS_DATASET} -- tags {[t for t, _ in SS_STEALTH_GRID]} ===")
 
-    SS_SUMMARY_BUDGET = SS_BUDGETS[len(SS_BUDGETS) // 2]  # the middle budget, as a single
-    # representative point for the cross-tag summary table (full per-budget detail is still in
-    # each tag's own CSV/LaTeX table below).
+    # Cross-tag summary now carries one row per (tag, agg_method, budget) -- ALL of SS_BUDGETS,
+    # not just a single representative one -- since the budget/aggregator tradeoff is not
+    # monotonic and picking the final paper config requires comparing across the full budget
+    # grid (500/1500/5000), not one middle point.
     ss_summary_rows = []
 
     for tag, overrides in SS_STEALTH_GRID:
@@ -2760,23 +2761,22 @@ if __name__ == "__main__":
                 block_ss[(row["budget"], agg_method)] = (
                     row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
                 )
-                if row["budget"] == SS_SUMMARY_BUDGET:
-                    ss_summary_rows.append(
-                        {
-                            "tag": tag,
-                            "epsilon": cfg["epsilon"],
-                            "lambda_tv": cfg["lambda_tv"],
-                            "lambda_lpips": cfg["lambda_lpips"],
-                            "lambda_penalty": cfg["lambda_penalty"],
-                            "agg_method": agg_method,
-                            "budget": SS_SUMMARY_BUDGET,
-                            "cta_mean": row["cta_mean"],
-                            "pta_mean": row["pta_mean"],
-                            "measured_linf": footprint["linf"] if footprint else np.nan,
-                            "measured_l2": footprint["l2"] if footprint else np.nan,
-                            "measured_tv": footprint["tv"] if footprint else np.nan,
-                        }
-                    )
+                ss_summary_rows.append(
+                    {
+                        "tag": tag,
+                        "epsilon": cfg["epsilon"],
+                        "lambda_tv": cfg["lambda_tv"],
+                        "lambda_lpips": cfg["lambda_lpips"],
+                        "lambda_penalty": cfg["lambda_penalty"],
+                        "agg_method": agg_method,
+                        "budget": row["budget"],
+                        "cta_mean": row["cta_mean"],
+                        "pta_mean": row["pta_mean"],
+                        "measured_linf": footprint["linf"] if footprint else np.nan,
+                        "measured_l2": footprint["l2"] if footprint else np.nan,
+                        "measured_tv": footprint["tv"] if footprint else np.nan,
+                    }
+                )
 
         latex_table_ss = build_table(
             block_ss, SS_BUDGETS, SS_AGG_METHODS,
@@ -2795,13 +2795,15 @@ if __name__ == "__main__":
         ss_summary_path = f"{CSV_DIR}/stealth_sweep_{SS_MODEL_FLAG}_{SS_DATASET}_summary.csv"
         ss_summary_df.to_csv(ss_summary_path, index=False)
         print(
-            f"\n[INFO] Saved stealth_sweep cross-tag summary (budget={SS_SUMMARY_BUDGET}): "
+            f"\n[INFO] Saved stealth_sweep cross-tag summary (budgets={SS_BUDGETS}): "
             f"{ss_summary_path}"
         )
         print(
             "[INFO] Columns: tag, epsilon/lambda_tv/lambda_lpips/lambda_penalty (the swept "
-            "knob), agg_method, cta_mean/pta_mean (ASR), measured_linf/l2/tv (trigger "
-            "footprint) -- use this to rank the stealth-vs-attack-success tradeoff across tags."
+            "knob), agg_method, budget, cta_mean/pta_mean (ASR), measured_linf/l2/tv (trigger "
+            "footprint, budget-independent) -- one row per (tag, agg_method, budget); use this "
+            "to rank the stealth-vs-attack-success tradeoff across tags AND budgets (not "
+            "monotonic in budget, so check all of 500/1500/5000, not just one)."
         )
     else:
         print("\n[INFO] stealth_sweep: no runs found yet, summary CSV skipped.")
