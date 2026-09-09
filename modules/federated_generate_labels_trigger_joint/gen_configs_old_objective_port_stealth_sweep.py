@@ -146,6 +146,13 @@ STEALTH_GRID = [
     ("lpips_1p0", {"lambda_lpips": 1.0}),
     ("penalty_0p5", {"lambda_penalty": 0.5}),
     ("penalty_2p0", {"lambda_penalty": 2.0}),
+    # Hybrid candidate: slightly reduced epsilon combined with a mild LPIPS penalty, to check
+    # whether the two axes compound (mixed reduction in visible footprint) or whether reducing
+    # epsilon alone dilutes the robust-aggregator-breaking effect that lpips_0p1 (epsilon=1.0)
+    # showed -- eps_0p50/eps_0p25 alone collapsed multikrum ASR (worst-case pta down to
+    # 0.013-0.04) despite lpips_0p1 alone being the most robust cell in the grid (worst-case
+    # pta=0.279), so this cell is NOT assumed to inherit lpips_0p1's robustness.
+    ("eps_0p50_lpips_0p1", {"epsilon": 0.5, "lambda_lpips": 0.1}),
 ]
 
 DELTA_MIN_FRAC = 0.0  # lambda_mag=0.0 (hardcoded in JOINT_TRIGGER_TEMPLATE) makes this inert
