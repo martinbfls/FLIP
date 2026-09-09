@@ -42,7 +42,26 @@ SLURM_PARTITION="${SLURM_PARTITION:-rtx6k}"
 # partition. Defaults to just SLURM_PARTITION, so single-partition behavior
 # is unchanged unless SLURM_PARTITIONS is set explicitly, e.g.:
 #   SLURM_PARTITIONS="cypress_dgx other_dgx_partition" ./orchestrate_...sh
+#
+# SLURM_PARTITIONS=all (or "auto") instead discovers every partition `sinfo`
+# knows about and lets preflight_slurm below PROBE each one, silently
+# dropping whichever ones this account/QOS/gres shape can't actually use
+# (unlike an explicit list, where preflight_slurm still hard-fails the whole
+# campaign on the first bad partition -- see its own comment) -- so
+# "launch on every partition I can actually use" is just:
+#   SLURM_PARTITIONS=all SLURM_ACCOUNT=<account> ./orchestrate_...sh
 SLURM_PARTITIONS="${SLURM_PARTITIONS:-$SLURM_PARTITION}"
+_SLURM_PARTITIONS_AUTO=0
+if [ "$SLURM_PARTITIONS" = "all" ] || [ "$SLURM_PARTITIONS" = "auto" ]; then
+    _SLURM_PARTITIONS_AUTO=1
+    _discovered="$(sinfo -h -o '%P' 2>/dev/null | sed 's/\*$//' | sort -u | tr '\n' ' ')"
+    if [ -z "${_discovered// /}" ]; then
+        echo "[SLURM_PARTITIONS=all] sinfo returned no partitions (unreachable cluster / not on a login node?)" >&2
+    else
+        SLURM_PARTITIONS="$_discovered"
+    fi
+    unset _discovered
+fi
 read -ra _SLURM_PARTITIONS_ARR <<< "$SLURM_PARTITIONS"
 
 # R&D Line / account required by this cluster. Run `slurmaccounts` to list
@@ -57,7 +76,14 @@ TIME_PER_TASK="${TIME_PER_TASK:-1-00:00:00}" # walltime per experiment
 
 # Partition used for the tiny CPU-only barrier job. Defaults to the first
 # entry of SLURM_PARTITIONS; override if a general-purpose CPU partition
-# exists.
+# exists. _BARRIER_PARTITION_EXPLICIT records whether that came from the
+# caller's own environment (kept as-is even if pruned below) or from this
+# default (re-pinned by preflight_slurm if auto-discovery prunes it away).
+if [ -n "${BARRIER_PARTITION:-}" ]; then
+    _BARRIER_PARTITION_EXPLICIT=1
+else
+    _BARRIER_PARTITION_EXPLICIT=0
+fi
 BARRIER_PARTITION="${BARRIER_PARTITION:-${_SLURM_PARTITIONS_ARR[0]}}"
 
 # Set to 0 if this Slurm build does not support --kill-on-invalid-dep.
@@ -111,12 +137,22 @@ preflight_slurm() {
     fi
 
     local partition
+    local -a _ok_partitions=()
     for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
         if ! sinfo -h -p "$partition" -o "%P" 2>/dev/null | grep -q .; then
+            if [ "$_SLURM_PARTITIONS_AUTO" = "1" ]; then
+                echo "[PREFLIGHT] auto-discovered partition '$partition' unknown/unreachable -- dropping it" >&2
+                continue
+            fi
             echo "[PREFLIGHT] partition '$partition' unknown or unreachable" >&2
             rc=1
+            continue
         fi
+        _ok_partitions+=("$partition")
     done
+    if [ "$_SLURM_PARTITIONS_AUTO" = "1" ]; then
+        _SLURM_PARTITIONS_ARR=("${_ok_partitions[@]}")
+    fi
 
     # Trial submission per partition (--test-only validates and submits
     # nothing). Catches a bad account, an unknown QOS, an association limit,
@@ -131,6 +167,7 @@ preflight_slurm() {
     # false negative here (or worse, a false pass that only fails once 50
     # real jobs are already queued).
     local probe probe_rc
+    _ok_partitions=()
     for partition in "${_SLURM_PARTITIONS_ARR[@]}"; do
         probe=$(sbatch --kill-on-invalid-dep=yes --test-only \
                        --account="$SLURM_ACCOUNT" \
@@ -143,14 +180,44 @@ preflight_slurm() {
         probe_rc=$?
 
         if [ $probe_rc -ne 0 ]; then
+            if [ "$_SLURM_PARTITIONS_AUTO" = "1" ]; then
+                echo "[PREFLIGHT] auto-discovered partition '$partition' rejected the trial submission -- dropping it:" >&2
+                echo "$probe" | sed 's/^/[PREFLIGHT]   /' >&2
+                continue
+            fi
             # Any other rejection (bad account, unknown QOS, limits...) would
             # hit all real submissions to this partition. Surface sbatch's
             # own message and stop here.
             echo "[PREFLIGHT] a trial submission to partition '$partition' was rejected by Slurm:" >&2
             echo "$probe" | sed 's/^/[PREFLIGHT]   /' >&2
             rc=1
+            continue
         fi
+        _ok_partitions+=("$partition")
     done
+
+    if [ "$_SLURM_PARTITIONS_AUTO" = "1" ]; then
+        _SLURM_PARTITIONS_ARR=("${_ok_partitions[@]}")
+        if [ ${#_SLURM_PARTITIONS_ARR[@]} -eq 0 ]; then
+            echo "[PREFLIGHT] SLURM_PARTITIONS=all: no partition survived auto-discovery pruning" >&2
+            return 1
+        fi
+        SLURM_PARTITIONS="${_SLURM_PARTITIONS_ARR[*]}"
+        export SLURM_PARTITIONS
+
+        if [ "$_BARRIER_PARTITION_EXPLICIT" != "1" ]; then
+            local bp_ok=0 p
+            for p in "${_SLURM_PARTITIONS_ARR[@]}"; do
+                [ "$p" = "$BARRIER_PARTITION" ] && bp_ok=1
+            done
+            if [ "$bp_ok" -ne 1 ]; then
+                BARRIER_PARTITION="${_SLURM_PARTITIONS_ARR[0]}"
+                export BARRIER_PARTITION
+            fi
+        fi
+        echo "[PREFLIGHT] SLURM_PARTITIONS=all: usable partitions after auto-discovery: $SLURM_PARTITIONS" >&2
+        echo "[PREFLIGHT] SLURM_PARTITIONS=all: barrier partition: $BARRIER_PARTITION" >&2
+    fi
 
     if [ ! -x "$CONDA_ENV/bin/python" ]; then
         echo "[PREFLIGHT] warning: $CONDA_ENV/bin/python not visible from this host" >&2
