@@ -230,6 +230,23 @@ from modules.federated_generate_labels_trigger_joint.gen_configs_old_objective_p
     DEPLOY_AGG_METHODS as OOP_AGG_METHODS,
     DEPLOY_BUDGETS as OOP_BUDGETS,
 )
+# Stealth-regularization sweep on top of the old-objective-port winning config (epsilon /
+# lambda_tv / lambda_lpips / lambda_penalty, one-at-a-time -- see
+# gen_configs_old_objective_port_stealth_sweep.py's own docstring). Same ONE-generation-cell-
+# per-tag / DEPLOY_AGG_METHODS x DEPLOY_BUDGETS deployment structure as old_objective_port
+# above, just with an extra `tag` axis nested one level deeper. Aliased (SS_ prefix).
+from modules.federated_generate_labels_trigger_joint.gen_configs_old_objective_port_stealth_sweep import (
+    EXP_BASE as SS_EXP_BASE,
+    MODEL_FLAG as SS_MODEL_FLAG,
+    DATASET as SS_DATASET,
+    GEN_NUM_POISONED as SS_GEN_NUM_POISONED,
+    GEN_NUM_HONESTS as SS_GEN_NUM_HONESTS,
+    GEN_INIT as SS_INIT,
+    DEPLOY_AGG_METHODS as SS_AGG_METHODS,
+    DEPLOY_BUDGETS as SS_BUDGETS,
+    STEALTH_BASE as SS_STEALTH_BASE,
+    STEALTH_GRID as SS_STEALTH_GRID,
+)
 import json as _json
 
 
@@ -898,6 +915,67 @@ def compute_cta_pta_mean_var_old_objective_port(
     return pd.DataFrame.from_records(records)
 
 
+def compute_cta_pta_mean_var_stealth_sweep(
+    tag,
+    agg_method,
+    budgets,
+    cta_file="caccs.npy",
+    pta_file="paccs.npy",
+):
+    """Same as compute_cta_pta_mean_var_old_objective_port, one level deeper under `tag` (see
+    gen_configs_old_objective_port_stealth_sweep.py's own docstring) -- directory layout:
+    SS_EXP_BASE / MODEL_FLAG / DATASET / tag / agg_method / train_user_{budget}/
+    {caccs,paccs}.npy. No seed axis (cta_var/pta_var are 0.0 whenever the single run's files
+    exist, NaN otherwise), same as the old_objective_port campaign this sweep is built on."""
+    records = []
+
+    for budget in budgets:
+        run_dir = SS_EXP_BASE / SS_MODEL_FLAG / SS_DATASET / tag / agg_method / f"train_user_{budget}"
+        cta_path = run_dir / cta_file
+        pta_path = run_dir / pta_file
+
+        if cta_path.exists() and pta_path.exists():
+            cta_mean, pta_mean = get_final_value(cta_path), get_final_value(pta_path)
+            cta_var = pta_var = 0.0
+        else:
+            cta_mean = cta_var = pta_mean = pta_var = np.nan
+
+        records.append(
+            {
+                "dataset": SS_DATASET,
+                "tag": tag,
+                "agg_method": agg_method,
+                "budget": budget,
+                "model": SS_MODEL_FLAG,
+                "cta_mean": cta_mean,
+                "cta_var": cta_var,
+                "pta_mean": pta_mean,
+                "pta_var": pta_var,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def measure_trigger_footprint(trig_path):
+    """Numeric visual-footprint measurements for a saved trigger .pt, independent of whatever
+    epsilon it was optimized under: max|delta| (Linf), ||delta||_2, and the anisotropic total
+    variation tv_loss(delta) (same formula run_module.py's own L_tv uses, see
+    modules.federated_optimizing_trigger.utils.tv_loss) -- smaller is less conspicuous on all
+    three. Returns a dict, or None if trig_path doesn't exist yet (same graceful-skip
+    convention as save_trigger_visual_in / check_epsilon_compliance)."""
+    if not trig_path.exists():
+        return None
+    from modules.federated_optimizing_trigger.utils import tv_loss
+
+    delta = torch.load(trig_path, map_location="cpu")
+    return {
+        "linf": delta.abs().max().item(),
+        "l2": delta.norm().item(),
+        "tv": tv_loss(delta).item(),
+    }
+
+
 # =========================
 # MULTI-KRUM POISON-SELECTION STATS
 # =========================
@@ -1494,6 +1572,23 @@ def save_trigger_visual_old_objective_port():
             f"{trigger_path_in(module_dir, OOP_MODEL_FLAG, OOP_DATASET, OOP_GEN_NUM_POISONED, OOP_GEN_NUM_HONESTS, init=OOP_INIT)}"
         )
     return out_path
+
+
+def save_trigger_visual_stealth_sweep(tag):
+    """stealth_sweep campaign wrapper, one tag: same one-cell-per-tag structure as
+    save_trigger_visual_old_objective_port, nested under SS_EXP_BASE/.../tag/."""
+    module_dir = SS_EXP_BASE / SS_MODEL_FLAG / SS_DATASET / tag / "gen_labels_trigger_joint"
+    out_path = save_trigger_visual_in(
+        module_dir, SS_MODEL_FLAG, SS_DATASET, SS_GEN_NUM_POISONED, SS_GEN_NUM_HONESTS,
+        label=f"stealth_sweep/{tag} ({SS_GEN_NUM_POISONED}vs{SS_GEN_NUM_HONESTS}, mean)",
+        init=SS_INIT,
+    )
+    if out_path is None:
+        print(
+            f"[INFO] stealth_sweep/{tag} trigger not found yet (skipped): "
+            f"{trigger_path_in(module_dir, SS_MODEL_FLAG, SS_DATASET, SS_GEN_NUM_POISONED, SS_GEN_NUM_HONESTS, init=SS_INIT)}"
+        )
+    return module_dir, out_path
 
 
 def compute_best_second(block, budgets, series_labels):
@@ -2614,3 +2709,99 @@ if __name__ == "__main__":
         all_data_oop, dataset=OOP_DATASET, save_dir=f"{PLOT_DIR}/old_objective_port/",
         colors=AGG_COLORS, filename=f"{OOP_DATASET}_old_objective_port.png",
     )
+
+    # -------------------------------------------------------------------
+    # Old-objective-port STEALTH SWEEP (epsilon / lambda_tv / lambda_lpips / lambda_penalty,
+    # one-at-a-time around the old_objective_port winning config -- see
+    # gen_configs_old_objective_port_stealth_sweep.py's own docstring). One generation cell per
+    # STEALTH_GRID tag, each deployed across the SAME DEPLOY_AGG_METHODS x DEPLOY_BUDGETS grid
+    # as old_objective_port above. Per tag: a trigger visual + a CTA-vs-PTA table/plot exactly
+    # like the old_objective_port block above (reusing the same AGG_COLORS/build_table/
+    # plot_cta_vs_pta machinery), PLUS one row of a cross-tag summary CSV (measured trigger
+    # footprint -- Linf/L2/TV -- next to CTA/ASR at a representative budget/agg_method) meant
+    # to make the stealth-vs-attack-success tradeoff across tags scannable in one table, to pick
+    # the final config for the paper. Same graceful-empty behavior as every campaign above if a
+    # given tag hasn't finished running yet.
+    # -------------------------------------------------------------------
+    print(f"\n=== [stealth_sweep] {SS_MODEL_FLAG}/{SS_DATASET} -- tags {[t for t, _ in SS_STEALTH_GRID]} ===")
+
+    SS_SUMMARY_BUDGET = SS_BUDGETS[len(SS_BUDGETS) // 2]  # the middle budget, as a single
+    # representative point for the cross-tag summary table (full per-budget detail is still in
+    # each tag's own CSV/LaTeX table below).
+    ss_summary_rows = []
+
+    for tag, overrides in SS_STEALTH_GRID:
+        print(f"\n--- [stealth_sweep/{tag}] ---")
+        cfg = {**SS_STEALTH_BASE, **overrides}
+
+        module_dir, _ = save_trigger_visual_stealth_sweep(tag)
+        footprint = measure_trigger_footprint(
+            trigger_path_in(
+                module_dir, SS_MODEL_FLAG, SS_DATASET, SS_GEN_NUM_POISONED, SS_GEN_NUM_HONESTS,
+                init=SS_INIT,
+            )
+        )
+
+        all_data_ss = {}
+        block_ss = {}
+
+        for agg_method in SS_AGG_METHODS:
+            print(f"   -> {agg_method}")
+            df = compute_cta_pta_mean_var_stealth_sweep(
+                tag=tag, agg_method=agg_method, budgets=SS_BUDGETS,
+            )
+            df.to_csv(
+                f"{CSV_DIR}/stealth_sweep_{SS_MODEL_FLAG}_{SS_DATASET}_{tag}_{agg_method}.csv",
+                index=False,
+            )
+            all_data_ss[agg_method] = df
+
+            for _, row in df.iterrows():
+                block_ss[(row["budget"], agg_method)] = (
+                    row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+                )
+                if row["budget"] == SS_SUMMARY_BUDGET:
+                    ss_summary_rows.append(
+                        {
+                            "tag": tag,
+                            "epsilon": cfg["epsilon"],
+                            "lambda_tv": cfg["lambda_tv"],
+                            "lambda_lpips": cfg["lambda_lpips"],
+                            "lambda_penalty": cfg["lambda_penalty"],
+                            "agg_method": agg_method,
+                            "budget": SS_SUMMARY_BUDGET,
+                            "cta_mean": row["cta_mean"],
+                            "pta_mean": row["pta_mean"],
+                            "measured_linf": footprint["linf"] if footprint else np.nan,
+                            "measured_l2": footprint["l2"] if footprint else np.nan,
+                            "measured_tv": footprint["tv"] if footprint else np.nan,
+                        }
+                    )
+
+        latex_table_ss = build_table(
+            block_ss, SS_BUDGETS, SS_AGG_METHODS,
+            name=f"{SS_MODEL_FLAG}/{SS_DATASET} stealth_sweep/{tag}: deployment aggregator sweep",
+        )
+        with open(f"{TABLE_DIR}/stealth_sweep_{SS_MODEL_FLAG}_{SS_DATASET}_{tag}.tex", "w") as f:
+            f.write(latex_table_ss)
+
+        plot_cta_vs_pta(
+            all_data_ss, dataset=SS_DATASET, save_dir=f"{PLOT_DIR}/stealth_sweep/{tag}/",
+            colors=AGG_COLORS, filename=f"{SS_DATASET}_stealth_sweep_{tag}.png",
+        )
+
+    if ss_summary_rows:
+        ss_summary_df = pd.DataFrame.from_records(ss_summary_rows)
+        ss_summary_path = f"{CSV_DIR}/stealth_sweep_{SS_MODEL_FLAG}_{SS_DATASET}_summary.csv"
+        ss_summary_df.to_csv(ss_summary_path, index=False)
+        print(
+            f"\n[INFO] Saved stealth_sweep cross-tag summary (budget={SS_SUMMARY_BUDGET}): "
+            f"{ss_summary_path}"
+        )
+        print(
+            "[INFO] Columns: tag, epsilon/lambda_tv/lambda_lpips/lambda_penalty (the swept "
+            "knob), agg_method, cta_mean/pta_mean (ASR), measured_linf/l2/tv (trigger "
+            "footprint) -- use this to rank the stealth-vs-attack-success tradeoff across tags."
+        )
+    else:
+        print("\n[INFO] stealth_sweep: no runs found yet, summary CSV skipped.")
