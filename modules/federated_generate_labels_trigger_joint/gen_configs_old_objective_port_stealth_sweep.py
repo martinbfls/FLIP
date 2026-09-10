@@ -176,6 +176,10 @@ STEALTH_GRID = [
     # lambda_lpips=1.0 was doing useful work at this epsilon or just adding regularization
     # pressure without payoff.
     ("eps_16_255_lpips_0p5", {"epsilon": 16 / 255, "lambda_lpips": 0.5}),
+    # Same epsilon floor, no LPIPS term at all -- the single-axis control for
+    # eps_16_255_lpips_1p0/eps_16_255_lpips_0p5, extending the eps_0p50/eps_0p25/eps_0p125
+    # single-axis ladder one step further down.
+    ("eps_16_255", {"epsilon": 16 / 255}),
 ]
 
 DELTA_MIN_FRAC = 0.0  # lambda_mag=0.0 (hardcoded in JOINT_TRIGGER_TEMPLATE) makes this inert
