@@ -164,6 +164,14 @@ STEALTH_GRID = [
     # 0.1->0.2) drives its result: same lambda_lpips bump, epsilon held at eps_0p50_lpips_0p1's
     # 0.5.
     ("eps_0p50_lpips_0p2", {"epsilon": 0.5, "lambda_lpips": 0.2}),
+    # Extreme end of the hybrid direction: epsilon down to the 16/255 bound used by
+    # gen_configs_epsilon_sweep.py's own EPSILON_VALUES (its most conspicuous-reduction cell),
+    # paired with the strongest LPIPS weight tried anywhere in this campaign (lambda_lpips=1.0,
+    # same value as the lpips_1p0 single-axis cell above) -- tests whether the compounding effect
+    # seen at eps_0p50_lpips_0p1/eps_0p375_lpips_0p2/eps_0p50_lpips_0p2 still holds at a much
+    # smaller L_infinity budget, or whether epsilon this low starves the optimizer regardless of
+    # lambda_lpips (as eps_0p125 alone did: worst-case multikrum pta=0.002).
+    ("eps_16_255_lpips_1p0", {"epsilon": 16 / 255, "lambda_lpips": 1.0}),
 ]
 
 DELTA_MIN_FRAC = 0.0  # lambda_mag=0.0 (hardcoded in JOINT_TRIGGER_TEMPLATE) makes this inert
