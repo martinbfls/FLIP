@@ -153,6 +153,13 @@ STEALTH_GRID = [
     # 0.013-0.04) despite lpips_0p1 alone being the most robust cell in the grid (worst-case
     # pta=0.279), so this cell is NOT assumed to inherit lpips_0p1's robustness.
     ("eps_0p50_lpips_0p1", {"epsilon": 0.5, "lambda_lpips": 0.1}),
+    # Pushed one step further in the same direction, now that eps_0p50_lpips_0p1 confirmed the
+    # hybrid compounds rather than dilutes (worst-case multikrum pta=0.32, better than either
+    # axis alone, at half the visible footprint of lpips_0p1): epsilon down another notch,
+    # lambda_lpips up another notch. Still a modest step, not eps_0p25/lpips_1p0's extremes --
+    # if this regresses multikrum robustness vs eps_0p50_lpips_0p1, that pins down where the
+    # compounding effect breaks down.
+    ("eps_0p375_lpips_0p2", {"epsilon": 0.375, "lambda_lpips": 0.2}),
 ]
 
 DELTA_MIN_FRAC = 0.0  # lambda_mag=0.0 (hardcoded in JOINT_TRIGGER_TEMPLATE) makes this inert
