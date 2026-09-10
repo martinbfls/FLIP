@@ -172,6 +172,10 @@ STEALTH_GRID = [
     # smaller L_infinity budget, or whether epsilon this low starves the optimizer regardless of
     # lambda_lpips (as eps_0p125 alone did: worst-case multikrum pta=0.002).
     ("eps_16_255_lpips_1p0", {"epsilon": 16 / 255, "lambda_lpips": 1.0}),
+    # Same epsilon floor as eps_16_255_lpips_1p0, weaker LPIPS weight -- isolates whether
+    # lambda_lpips=1.0 was doing useful work at this epsilon or just adding regularization
+    # pressure without payoff.
+    ("eps_16_255_lpips_0p5", {"epsilon": 16 / 255, "lambda_lpips": 0.5}),
 ]
 
 DELTA_MIN_FRAC = 0.0  # lambda_mag=0.0 (hardcoded in JOINT_TRIGGER_TEMPLATE) makes this inert

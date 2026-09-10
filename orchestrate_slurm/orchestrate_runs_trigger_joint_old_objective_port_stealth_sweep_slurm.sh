@@ -72,7 +72,7 @@ read -ra DEPLOY_AGG_METHODS <<< "${DEPLOY_AGG_METHODS:-mean trmean multikrum}"
 read -ra DEPLOY_BUDGETS <<< "${DEPLOY_BUDGETS:-500 1500 5000}"
 # STEALTH_GRID's own tags (module docstring) -- keep in sync by hand, same convention as
 # DEPLOY_AGG_METHODS/DEPLOY_BUDGETS above; verify with --print-tags if in doubt.
-read -ra STEALTH_TAGS <<< "${STEALTH_TAGS:-baseline eps_0p50 eps_0p25 eps_0p125 tv_0p01 tv_0p05 tv_0p10 lpips_0p1 lpips_0p5 lpips_1p0 penalty_0p5 penalty_2p0 eps_0p50_lpips_0p1 eps_0p375_lpips_0p2 eps_0p50_lpips_0p2 eps_16_255_lpips_1p0}"
+read -ra STEALTH_TAGS <<< "${STEALTH_TAGS:-baseline eps_0p50 eps_0p25 eps_0p125 tv_0p01 tv_0p05 tv_0p10 lpips_0p1 lpips_0p5 lpips_1p0 penalty_0p5 penalty_2p0 eps_0p50_lpips_0p1 eps_0p375_lpips_0p2 eps_0p50_lpips_0p2 eps_16_255_lpips_1p0 eps_16_255_lpips_0p5}"
 
 EXP_BASE_REL="${EXP_BASE_REL:-federated_experiments/threat_model_direct_trigger_joint_old_objective_port_stealth_sweep}"
 CELL_BASE_REL="$EXP_BASE_REL/$MODEL_FLAG/$DATASET"
