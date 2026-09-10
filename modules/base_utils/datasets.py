@@ -667,13 +667,6 @@ def get_matching_datasets(
     train_dataset = Subset(train_data, np.arange(n_train))
     train_labels = np.array([y for _, y in train_data])[:n_train]
 
-    # By default, preserve the original poisoning budget.
-    if budget is None:
-        n_poisons_train = int((len(train_data) // n_classes) * train_pct)
-    else:
-        # budget = number of labels the attacker is allowed to invert.
-        n_poisons_train = int(budget)
-
     n_poisons_test = len(test_data) // n_classes
     if dataset_flag == "svhn":
         n_poisons_test = 1500
@@ -683,6 +676,20 @@ def get_matching_datasets(
         candidate_inds = np.where(train_labels != poisoner.target_label)[0]
     else:
         candidate_inds = np.where(train_labels == label)[0]
+
+    # By default, preserve the original poisoning budget -- but capped at the number of
+    # actually-eligible examples: len(train_data)//n_classes assumes perfectly balanced
+    # classes, which holds for CIFAR (a no-op cap there) but not for e.g. SVHN, whose digit
+    # classes are heavily imbalanced (digit '9' has far fewer than len//n_classes examples) --
+    # an uncapped default budget crashed every such caller (see the ValueError below) even
+    # though a smaller, fully-populated budget was always available.
+    if budget is None:
+        n_poisons_train = min(
+            int((len(train_data) // n_classes) * train_pct), len(candidate_inds),
+        )
+    else:
+        # budget = number of labels the attacker is allowed to invert.
+        n_poisons_train = int(budget)
 
     if n_poisons_train > len(candidate_inds):
         raise ValueError(

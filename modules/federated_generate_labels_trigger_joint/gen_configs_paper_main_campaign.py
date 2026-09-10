@@ -142,10 +142,24 @@ EXP_BASE = Path(
 _TRAIN_EXPERT_TEMPLATE_DATASET = TRAIN_EXPERT_TEMPLATE.replace(
     'output_dir = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/0/"\n',
     'output_dir = "{cluster_root}/out/checkpoints/{model_flag}_{dataset}_1xs/seed{seed}/0/"\n',
+).replace(
+    'poisoner = "1xs"\n',
+    'poisoner = "1xs"\n'
+    "budget = {budget}\n",
 )
 assert _TRAIN_EXPERT_TEMPLATE_DATASET != TRAIN_EXPERT_TEMPLATE, (
-    "TRAIN_EXPERT_TEMPLATE's output_dir line changed shape -- update the splice."
+    "TRAIN_EXPERT_TEMPLATE's output_dir/poisoner lines changed shape -- update the splice."
 )
+
+# get_matching_datasets' own no-budget default is len(train_data)//n_classes (modules/base_utils/
+# datasets.py) -- exactly right for CIFAR (5000 per class, perfectly balanced) but WRONG for
+# SVHN, whose classes are heavily imbalanced (digit '9' -- SOURCE_LABEL here -- has only ~4659
+# eligible train examples, far under the 7325 that formula assumes): the un-set default budget
+# crashed every SVHN bootstrap cell with "Budget requires 7325 poisoned samples, but only 4659
+# eligible samples are available." Pin an explicit, per-dataset-safe budget instead of relying on
+# that default -- 5000 for cifar (bit-identical to the previous unset-default behavior), a value
+# safely under SVHN's smallest class count for svhn.
+BOOTSTRAP_BUDGET = {"cifar": 5000, "svhn": 4500}
 
 _JOINT_TRIGGER_TEMPLATE_MAIN = _JOINT_TRIGGER_TEMPLATE_STEALTH.replace(
     "expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}\n",
@@ -229,6 +243,7 @@ def generate_bootstrap_cell(model_flag, dataset, seed, dry_run=False):
         rng_seed=rng_seed,
         source_label=SOURCE_LABEL,
         target_label=TARGET_LABEL,
+        budget=BOOTSTRAP_BUDGET[dataset],
         checkpoint_iters=GEN_EXPERT_RETRAIN_CHECKPOINT_ITERS,
         epochs=GEN_EXPERT_RETRAIN_EPOCHS,
         lr=lr,
