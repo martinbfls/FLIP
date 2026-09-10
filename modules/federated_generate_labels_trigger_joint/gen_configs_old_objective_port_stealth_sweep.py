@@ -160,6 +160,10 @@ STEALTH_GRID = [
     # if this regresses multikrum robustness vs eps_0p50_lpips_0p1, that pins down where the
     # compounding effect breaks down.
     ("eps_0p375_lpips_0p2", {"epsilon": 0.375, "lambda_lpips": 0.2}),
+    # Isolates which of eps_0p375_lpips_0p2's two changes (epsilon 0.5->0.375, lambda_lpips
+    # 0.1->0.2) drives its result: same lambda_lpips bump, epsilon held at eps_0p50_lpips_0p1's
+    # 0.5.
+    ("eps_0p50_lpips_0p2", {"epsilon": 0.5, "lambda_lpips": 0.2}),
 ]
 
 DELTA_MIN_FRAC = 0.0  # lambda_mag=0.0 (hardcoded in JOINT_TRIGGER_TEMPLATE) makes this inert
