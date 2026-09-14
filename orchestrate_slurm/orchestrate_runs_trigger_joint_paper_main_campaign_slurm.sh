@@ -50,6 +50,10 @@
 #
 #   Re-run just GEN+FLIPS+USER, skipping BOOTSTRAP (reusing existing expert checkpoints):
 #        SLURM_ACCOUNT=<account> BOOTSTRAP_SKIP=1 ./orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
+#
+#   Submit only BOOTSTRAP -> GEN -> FLIPS, never USER -- when train_user is trained elsewhere
+#   (e.g. orchestrate_student_machines/, off this cluster's job-count limit):
+#        SLURM_ACCOUNT=<account> SKIP_USER=1 STEALTH_TAGS="eps_16_255" ./orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
 ###
 
 set -euo pipefail
@@ -65,6 +69,10 @@ source "$SCRIPT_DIR/slurm_lib.sh"
 DRY_RUN="${DRY_RUN:-0}"
 USER_ONLY="${USER_ONLY:-0}"
 BOOTSTRAP_SKIP="${BOOTSTRAP_SKIP:-0}"
+# Submit only BOOTSTRAP->GEN->FLIPS, never USER -- for when USER training is being done
+# elsewhere (e.g. orchestrate_student_machines/, off a cluster job-count limit). Mutually
+# exclusive with USER_ONLY in practice (nothing would be submitted if both are set).
+SKIP_USER="${SKIP_USER:-0}"
 
 BOOTSTRAP_TIME="${BOOTSTRAP_TIME:-0-06:00:00}"
 GEN_TIME="${GEN_TIME:-1-00:00:00}"
@@ -88,6 +96,17 @@ read -ra DEPLOY_AGG_METHODS_FEDERATED <<< "${DEPLOY_AGG_METHODS_FEDERATED:-mean 
 FEDERATED_TAG="${FEDERATED_TAG:-federated_3vs7}"
 
 EXP_BASE_REL="${EXP_BASE_REL:-federated_experiments/threat_model_direct_trigger_joint_paper_main_campaign}"
+
+# Distinguishes this invocation's phase names/log files from any other (e.g. when the campaign
+# is staged across several sequential calls with different MODEL_FLAGS/DATASETS slices, see the
+# header's Usage section) -- otherwise every slice would submit under the SAME phase name
+# ("paper_gen", "paper_user", ...), truncating (see slurm_lib.sh's submit_job_pool_slurm:
+# `: > "$id_file"`) the PREVIOUS slice's $LOG_DIR/jobids_<phase>.txt on every new invocation.
+# Purely a logging/job-naming concern -- submit_job_pool_slurm/submit_barrier_slurm build every
+# afterok dependency from the in-memory SUBMITTED_JOB_IDS array, never by re-reading these
+# files, so a collision here does NOT corrupt any invocation's own barrier chain. Override
+# explicitly (RUN_TAG=foo) if the default (models + datasets, slash-joined) collides anyway.
+RUN_TAG="${RUN_TAG:-$(IFS=-; echo "${MODEL_FLAGS[*]}")_$(IFS=-; echo "${DATASETS[*]}")}"
 
 # ---------------------------------------------------------------------------
 # Config / prerequisite presence check.
@@ -163,13 +182,19 @@ if [ "$MISSING" -gt 0 ]; then
     exit 1
 fi
 
-echo "[PLAN] campaign=paper_main_campaign exp_base=$EXP_BASE_REL"
+echo "[PLAN] campaign=paper_main_campaign exp_base=$EXP_BASE_REL run_tag=$RUN_TAG"
 echo "[PLAN] models=${MODEL_FLAGS[*]} datasets=${DATASETS[*]} seeds=${#SEEDS[@]} (${SEEDS[*]}) tags=${STEALTH_TAGS[*]}"
 echo "[PLAN] deployment: single_user agg=$DEPLOY_SINGLE_USER_AGG, federated($FEDERATED_TAG) agg_methods=${DEPLOY_AGG_METHODS_FEDERATED[*]}, budgets=${DEPLOY_BUDGETS[*]}"
 echo "[PLAN] bootstrap cells=${#BOOTSTRAP_JOBS[@]} gen cells=${#GEN_JOBS[@]} flips cells=${#FLIPS_JOBS[@]} user cells=${#USER_JOBS[@]}"
 echo "[PLAN] partitions=${SLURM_PARTITIONS}"
 if [ "$USER_ONLY" = "1" ]; then
     echo "[PLAN] phases: USER only (USER_ONLY=1 -- reusing existing BOOTSTRAP/GEN/FLIPS outputs on disk)"
+elif [ "$SKIP_USER" = "1" ]; then
+    if [ "$BOOTSTRAP_SKIP" = "1" ]; then
+        echo "[PLAN] phases: GEN -> FLIPS only (SKIP_USER=1, BOOTSTRAP_SKIP=1 -- USER trained elsewhere)"
+    else
+        echo "[PLAN] phases: BOOTSTRAP -> GEN -> FLIPS only (SKIP_USER=1 -- USER trained elsewhere, e.g. orchestrate_student_machines/)"
+    fi
 elif [ "$BOOTSTRAP_SKIP" = "1" ]; then
     echo "[PLAN] phases: GEN -> FLIPS -> USER (BOOTSTRAP_SKIP=1 -- reusing existing bootstrap checkpoints)"
 else
@@ -185,7 +210,9 @@ if [ "$DRY_RUN" = "1" ]; then
         printf '[DRY-RUN] %s\n' "${GEN_JOBS[@]}"
         printf '[DRY-RUN] %s\n' "${FLIPS_JOBS[@]}"
     fi
-    printf '[DRY-RUN] %s\n' "${USER_JOBS[@]}"
+    if [ "$SKIP_USER" != "1" ]; then
+        printf '[DRY-RUN] %s\n' "${USER_JOBS[@]}"
+    fi
     exit 0
 fi
 
@@ -196,14 +223,14 @@ preflight_slurm || exit 1
 # ---------------------------------------------------------------------------
 if [ "$USER_ONLY" = "1" ]; then
     TIME_PER_TASK="$USER_TIME"
-    submit_job_pool_slurm USER_JOBS "paper_user" || exit 1
+    submit_job_pool_slurm USER_JOBS "paper_user_${RUN_TAG}" || exit 1
     echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs), no dependency (USER_ONLY=1)."
 else
     gen_dep=""
     if [ "$BOOTSTRAP_SKIP" != "1" ]; then
         TIME_PER_TASK="$BOOTSTRAP_TIME"
-        submit_job_pool_slurm BOOTSTRAP_JOBS "paper_bootstrap" || exit 1
-        bootstrap_barrier=$(submit_barrier_slurm "paper_barrier_bootstrap" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+        submit_job_pool_slurm BOOTSTRAP_JOBS "paper_bootstrap_${RUN_TAG}" || exit 1
+        bootstrap_barrier=$(submit_barrier_slurm "paper_barrier_bootstrap_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
         echo "[PHASE] BOOTSTRAP submitted (${#BOOTSTRAP_JOBS[@]} jobs) -> barrier $bootstrap_barrier"
         gen_dep="afterok:$bootstrap_barrier"
     else
@@ -211,21 +238,25 @@ else
     fi
 
     TIME_PER_TASK="$GEN_TIME"
-    submit_job_pool_slurm GEN_JOBS "paper_gen" "$gen_dep" || exit 1
-    gen_barrier=$(submit_barrier_slurm "paper_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    submit_job_pool_slurm GEN_JOBS "paper_gen_${RUN_TAG}" "$gen_dep" || exit 1
+    gen_barrier=$(submit_barrier_slurm "paper_barrier_gen_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
     echo "[PHASE] GEN submitted (${#GEN_JOBS[@]} jobs) -> barrier $gen_barrier"
 
     TIME_PER_TASK="$FLIPS_TIME"
-    submit_job_pool_slurm FLIPS_JOBS "paper_flips" "afterok:$gen_barrier" || exit 1
-    flips_barrier=$(submit_barrier_slurm "paper_barrier_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    submit_job_pool_slurm FLIPS_JOBS "paper_flips_${RUN_TAG}" "afterok:$gen_barrier" || exit 1
+    flips_barrier=$(submit_barrier_slurm "paper_barrier_flips_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
     echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs) -> barrier $flips_barrier"
 
-    TIME_PER_TASK="$USER_TIME"
-    submit_job_pool_slurm USER_JOBS "paper_user" "afterok:$flips_barrier" || exit 1
-    echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
+    if [ "$SKIP_USER" != "1" ]; then
+        TIME_PER_TASK="$USER_TIME"
+        submit_job_pool_slurm USER_JOBS "paper_user_${RUN_TAG}" "afterok:$flips_barrier" || exit 1
+        echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
+    else
+        echo "[PHASE] USER skipped (SKIP_USER=1 -- train it elsewhere, e.g. orchestrate_student_machines/)."
+    fi
 fi
 
-echo "[DONE] campaign submitted; job ids in $LOG_DIR/jobids_*.txt"
+echo "[DONE] campaign submitted (RUN_TAG=$RUN_TAG); job ids in $LOG_DIR/jobids_*_${RUN_TAG}.txt"
 echo "[NOTE] this module builds a second-order graph (create_graph=True) on the"
 echo "[NOTE] expert step, with n_checkpoints_per_step=5 DISTINCT checkpoints held"
 echo "[NOTE] simultaneously -- watch the first GEN job for OOM before the rest start."
