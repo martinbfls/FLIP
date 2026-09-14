@@ -321,6 +321,15 @@ FAILED=()
 
 echo "À lancer : $TOTAL   déjà faits (caccs/paccs présents) : $SKIPPED"
 
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[DRY-RUN] rien ne sera lancé."
+    for job in "${USER_JOBS[@]}"; do
+        IFS='|' read -r config name <<< "$job"
+        echo "[DRY-RUN] $name -> $config"
+    done
+    exit 0
+fi
+
 while [ $INDEX -lt $TOTAL ]; do
 
     DONE_FILES=()
