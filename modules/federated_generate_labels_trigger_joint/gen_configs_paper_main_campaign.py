@@ -130,9 +130,21 @@ _TRACKED_AGG_METHODS = {"multikrum", "krum"}
 
 MODULE_NAME = "federated_generate_labels_trigger_joint"
 
+# Deliberately NOT .resolve()'d, unlike every sibling gen_configs*.py in this module -- GEN/
+# FLIPS run on the Slurm cluster but USER (federated_train_user) is trained on separate,
+# non-Slurm shared machines with a DIFFERENT repo root (see orchestrate_student_machines/
+# orchestrate_runs_paper_main_campaign_user.sh) that only receive a copy of this campaign's
+# experiments/ subtree, never the cluster's own absolute filesystem layout. A resolved
+# (absolute, cluster-specific) EXP_BASE gets baked verbatim into every config's output_dir/
+# input_labels/delta fields, which the student machines then can't create/read (`No such file
+# or directory: '/shared/data1/...'`). Both orchestrators already `cd` into their own BASE_DIR
+# before running `python run_experiment.py <relative path>` (slurm_lib.sh's submit_job_slurm,
+# orchestrate_runs_paper_main_campaign_user.sh's run_remote), so a RELATIVE EXP_BASE resolves
+# correctly on whichever machine actually executes a given cell -- CLUSTER_ROOT-based paths
+# (bootstrap_dir, read only by GEN, which always runs on the cluster) are unaffected either way.
 EXP_BASE = Path(
     "experiments/federated_experiments/threat_model_direct_trigger_joint_paper_main_campaign"
-).resolve()
+)
 
 # --------------------------------------------------------------------------- #
 # Locally-extended copies: dataset-aware bootstrap checkpoint path (see module docstring), and
