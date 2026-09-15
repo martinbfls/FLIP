@@ -713,12 +713,14 @@ def main():
         save_dir = str(out_root / dataset)
 
         # Per-branch trade-off plots -- one file per config (cifar_mean.png, cifar_krum.png,
-        # ..., cifar_centralized.png), saved under a {model}_{dataset}_{federated_tag_suffix}
-        # directory so the on-disk layout matches the img_neurips/ subfigure-grid convention
-        # (e.g. img_neurips/r32p_cifar_3vs7/cifar_mean.png) -- group them into a LaTeX
-        # subfigure grid by hand from there.
+        # ..., cifar_centralized.png), saved under out_root (which already keys on
+        # {model}_{tag} -- see above) / {dataset}_{federated_tag_suffix}, so results from a
+        # DIFFERENT tag never collide/overwrite these files (each tag gets its own
+        # {model}_{tag}/ subtree). Matches the img_neurips/ subfigure-grid convention (e.g.
+        # img_neurips/r32p_cifar_3vs7/cifar_mean.png) one level deeper -- group them into a
+        # LaTeX subfigure grid by hand from there.
         tag_suffix = FEDERATED_TAG.split("_", 1)[-1]  # "federated_3vs7" -> "3vs7"
-        per_branch_dir = str(Path(args.out_dir) / f"{args.model}_{dataset}_{tag_suffix}")
+        per_branch_dir = str(out_root / f"{dataset}_{tag_suffix}")
         saved_per_branch = plot_cta_vs_pta_per_branch(
             all_data, dataset, args.model, args.tag, save_dir=per_branch_dir,
         )
