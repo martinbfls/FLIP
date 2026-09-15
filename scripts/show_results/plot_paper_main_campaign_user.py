@@ -95,6 +95,19 @@ BRANCH_LABELS = {
     "federated_multikrum": f"{FEDERATED_TAG} (multikrum)",
 }
 
+# Filename suffix per branch for the per-config trade-off plots (plot_cta_vs_pta_per_branch) --
+# matches the naming the user's own LaTeX subfigure grid expects ({dataset}_{suffix}.png, e.g.
+# cifar_mean.png / cifar_krum.png / ... / cifar_centralized.png), one file per branch so each
+# can be grouped as its own \subfigure with a caption set externally in LaTeX.
+BRANCH_FILE_SUFFIX = {
+    "single_user": "centralized",
+    "federated_mean": "mean",
+    "federated_median": "median",
+    "federated_krum": "krum",
+    "federated_trmean": "trmean",
+    "federated_multikrum": "multikrum",
+}
+
 # Column order/labels for the LaTeX table -- matches the paper's own header (MEAN, CW-MEDIAN,
 # KRUM, TRMEAN, MULTIKRUM), independent of DEPLOY_AGG_METHODS_FEDERATED's own order. "centralized"
 # is a synthetic series (not a real deployment aggregator) read from the single_user branch
@@ -317,6 +330,73 @@ def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=
 
     plt.close()
     return True
+
+
+def plot_cta_vs_pta_per_branch(all_data, dataset, model_flag, tag, save_dir=None):
+    """One standalone figure PER branch (single_user + each federated aggregator), instead of
+    plot_cta_vs_pta's single overlaid figure -- meant to be grouped externally into a LaTeX
+    subfigure grid (one \\subfigure per aggregator, caption set by the caller), so no legend/
+    title is drawn here (redundant with that external caption). Same per-point styling as
+    plot_cta_vs_pta otherwise (error bars, best-budget point highlighted and annotated,
+    equal-aspect axes, dashed grid). Saved as f"{dataset}_{BRANCH_FILE_SUFFIX[branch]}.png".
+    Returns the list of paths actually written."""
+    saved = []
+
+    for branch_key, df in all_data.items():
+        df = df.dropna()
+        if df.empty:
+            continue
+
+        df = df.sort_values("budget")
+
+        x = df["pta_mean"].values * 100
+        y = df["cta_mean"].values * 100
+        xerr = np.sqrt(df["pta_var"].values) * 100
+        yerr = np.sqrt(df["cta_var"].values) * 100
+
+        color = BRANCH_COLORS.get(branch_key)
+        linestyle = "--" if branch_key == "single_user" else "-"
+
+        plt.figure(figsize=(7.5, 6))
+
+        plt.plot(x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85, zorder=3)
+        plt.errorbar(
+            x, y, xerr=xerr, yerr=yerr, fmt="none", ecolor=color,
+            elinewidth=1.2, capsize=3, alpha=0.35, zorder=1,
+        )
+        plt.scatter(x, y, s=45, color=color, edgecolors="none", zorder=4)
+
+        score = x  # ASR
+        max_score = np.nanmax(score)
+        candidates = np.where(np.isclose(score, max_score, atol=1e-12))[0]
+        budgets = df["budget"].values
+        idx_best = candidates[np.argmin(budgets[candidates])]
+
+        plt.scatter(
+            x[idx_best], y[idx_best], s=95, color=color,
+            edgecolor="black", linewidth=1.2, zorder=6,
+        )
+        annotate_key_points(df, x, y, score, color)
+
+        plt.xlabel("ASR (%)")
+        plt.ylabel("CTA (%)")
+        plt.xlim(0, 100)
+        plt.ylim(0, 100)
+        plt.gca().set_aspect("equal", adjustable="box")
+        plt.grid(True, linestyle="--", alpha=0.25)
+        plt.tight_layout()
+
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            suffix = BRANCH_FILE_SUFFIX.get(branch_key, branch_key)
+            path = os.path.join(save_dir, f"{dataset}_{suffix}.png")
+            plt.savefig(path, dpi=300)
+            print(f"[INFO] Saved plot: {path}")
+            saved.append(path)
+
+        plt.close()
+
+    return saved
 
 
 def plot_metric_vs_budget(all_data, dataset, model_flag, tag, metric, ylabel, save_dir=None, filename=None):
@@ -631,7 +711,19 @@ def main():
             df.to_csv(csv_dir / f"{branch_key}.csv", index=False)
 
         save_dir = str(out_root / dataset)
-        ok_tradeoff = plot_cta_vs_pta(all_data, dataset, args.model, args.tag, save_dir=save_dir)
+
+        # Per-branch trade-off plots -- one file per config (cifar_mean.png, cifar_krum.png,
+        # ..., cifar_centralized.png), saved under a {model}_{dataset}_{federated_tag_suffix}
+        # directory so the on-disk layout matches the img_neurips/ subfigure-grid convention
+        # (e.g. img_neurips/r32p_cifar_3vs7/cifar_mean.png) -- group them into a LaTeX
+        # subfigure grid by hand from there.
+        tag_suffix = FEDERATED_TAG.split("_", 1)[-1]  # "federated_3vs7" -> "3vs7"
+        per_branch_dir = str(Path(args.out_dir) / f"{args.model}_{dataset}_{tag_suffix}")
+        saved_per_branch = plot_cta_vs_pta_per_branch(
+            all_data, dataset, args.model, args.tag, save_dir=per_branch_dir,
+        )
+        ok_tradeoff = bool(saved_per_branch)
+
         ok_cta = plot_metric_vs_budget(
             all_data, dataset, args.model, args.tag,
             metric="cta", ylabel="CTA (%)", save_dir=save_dir,
