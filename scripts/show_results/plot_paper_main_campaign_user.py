@@ -87,7 +87,7 @@ BRANCH_COLORS = {
 }
 
 BRANCH_LABELS = {
-    "single_user": f"single_user ({GEN_NUM_POISONED}v{GEN_NUM_HONESTS}/{DEPLOY_SINGLE_USER_AGG_METHOD})",
+    "single_user": f"Centralized ({GEN_NUM_POISONED}v{GEN_NUM_HONESTS}/{DEPLOY_SINGLE_USER_AGG_METHOD})",
     "federated_mean": f"{FEDERATED_TAG} (mean)",
     "federated_median": f"{FEDERATED_TAG} (median)",
     "federated_krum": f"{FEDERATED_TAG} (krum)",
@@ -268,9 +268,10 @@ def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=
         yerr = np.sqrt(df["cta_var"].values) * 100
 
         color = BRANCH_COLORS.get(branch_key)
+        linestyle = "--" if branch_key == "single_user" else "-"
 
         plt.plot(
-            x, y, linestyle="-", linewidth=2.2, color=color, alpha=0.85,
+            x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85,
             label=BRANCH_LABELS.get(branch_key, branch_key), zorder=3,
         )
 
@@ -337,9 +338,10 @@ def plot_metric_vs_budget(all_data, dataset, model_flag, tag, metric, ylabel, sa
         means = df[f"{metric}_mean"].values * 100
         stds = np.sqrt(df[f"{metric}_var"].values) * 100
         color = BRANCH_COLORS.get(branch_key)
+        linestyle = "--" if branch_key == "single_user" else "-"
 
         plt.plot(
-            budgets, means, "-o", color=color, alpha=0.85, markersize=5,
+            budgets, means, marker="o", linestyle=linestyle, color=color, alpha=0.85, markersize=5,
             label=BRANCH_LABELS.get(branch_key, branch_key), zorder=3,
         )
         plt.fill_between(budgets, means - stds, means + stds, color=color, alpha=0.15, zorder=1)
