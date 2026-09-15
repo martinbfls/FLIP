@@ -267,7 +267,11 @@ def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=
     any_data = False
 
     for branch_key, df in all_data.items():
-        df = df.dropna()
+        # subset= is required: single_user's DataFrame has "agg"=None for every row (that
+        # branch has no aggregator), and a bare df.dropna() treats None as missing on ANY
+        # column -- silently dropping every row of that branch's df regardless of whether
+        # cta/pta actually have data.
+        df = df.dropna(subset=["cta_mean", "cta_var", "pta_mean", "pta_var"])
         if df.empty:
             continue
         any_data = True
@@ -343,8 +347,14 @@ def plot_cta_vs_pta_per_branch(all_data, dataset, model_flag, tag, save_dir=None
     saved = []
 
     for branch_key, df in all_data.items():
-        df = df.dropna()
+        # subset= is required: single_user's DataFrame has "agg"=None for every row (that
+        # branch has no aggregator), and a bare df.dropna() treats None as missing on ANY
+        # column -- silently dropping every row of that branch's df regardless of whether
+        # cta/pta actually have data.
+        df = df.dropna(subset=["cta_mean", "cta_var", "pta_mean", "pta_var"])
         if df.empty:
+            print(f"[WARNING] branch={branch_key!r} has no complete (cta,pta) cell yet for "
+                  f"{model_flag}/{dataset}/tag={tag} -- skipping its plot.")
             continue
 
         df = df.sort_values("budget")
