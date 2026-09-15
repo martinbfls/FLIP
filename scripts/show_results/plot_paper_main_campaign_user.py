@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Clean plots for the paper_main_campaign TRAIN_USER results (see
+Clean plots + LaTeX tables + trigger visuals for the paper_main_campaign TRAIN_USER results (see
 modules/federated_generate_labels_trigger_joint/gen_configs_paper_main_campaign.py and
 orchestrate_student_machines/orchestrate_runs_paper_main_campaign_user.sh).
 
 Same house style as scripts/show_results/show_results.py (compute_cta_pta_mean_var /
-plot_cta_vs_pta / annotate_key_points) -- this script just points that same machinery at the
-paper_main_campaign's own directory layout, which none of show_results.py's existing
-compute_cta_pta_mean_var_* variants match:
+plot_cta_vs_pta / annotate_key_points / format_cell / build_table / save_trigger_visual_in) --
+this script just points that same machinery at the paper_main_campaign's own directory layout,
+which none of show_results.py's existing compute_cta_pta_mean_var_*/save_all_trigger_visuals_*
+variants match:
 
   experiments/federated_experiments/threat_model_direct_trigger_joint_paper_main_campaign/
     {model_flag}/{dataset}/{tag}/seed{seed}/
-      mean/train_user_{budget}/                       <- single_user branch (1v0/mean)
-      federated_3vs7/{agg}/train_user_{budget}/        <- federated branch (3v7/agg)
+      gen_labels_trigger_joint/trigger/                <- the generated trigger (.pt + .png)
+      mean/train_user_{budget}/                         <- single_user branch (1v0/mean)
+      federated_3vs7/{agg}/train_user_{budget}/         <- federated branch (3v7/agg)
 
 caccs.npy/paccs.npy (final-epoch value = CTA / ASR) are read and averaged over seeds exactly as
-show_results.py's get_final_value / compute_cta_pta_mean_var do.
+show_results.py's get_final_value / compute_cta_pta_mean_var do. Sweep axes (EXP_BASE,
+SEEDS, DEPLOY_BUDGETS, DEPLOY_AGG_METHODS_FEDERATED, GEN_NUM_POISONED/HONESTS, GEN_INIT,
+SOURCE_LABEL/TARGET_LABEL, cell_name) are imported straight from gen_configs_paper_main_campaign.py
+itself (same convention show_results.py uses for its own main campaign) so this can't drift from
+wherever that generator actually wrote its configs.
 
 Usage:
   python scripts/show_results/plot_paper_main_campaign_user.py
@@ -25,11 +31,36 @@ Usage:
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
+from torchvision import transforms
+
+# This file lives at FLIP/scripts/show_results/ -- same sys.path fix as show_results.py, needed
+# for `modules.*` to import when run directly (`python scripts/show_results/....py`).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from modules.base_utils.datasets import load_dataset, pick_poisoner
+from modules.federated_generate_labels_trigger_joint.gen_configs_paper_main_campaign import (
+    EXP_BASE,
+    MODEL_FLAGS,
+    DATASETS,
+    SEEDS,
+    DEPLOY_BUDGETS,
+    DEPLOY_SINGLE_USER_AGG_METHOD,
+    FEDERATED_TAG,
+    DEPLOY_AGG_METHODS_FEDERATED,
+    GEN_NUM_POISONED,
+    GEN_NUM_HONESTS,
+    SOURCE_LABEL,
+    TARGET_LABEL,
+    GEN_INIT,
+    cell_name,
+)
 
 # =========================
 # Style (Paper-ready) -- identical to show_results.py's own plt.rcParams block.
@@ -41,16 +72,6 @@ plt.rcParams.update({
     "legend.fontsize": 11,
     "lines.linewidth": 2.5,
 })
-
-EXP_BASE = Path(
-    "experiments/federated_experiments/threat_model_direct_trigger_joint_paper_main_campaign"
-)
-
-BUDGETS = [0, 150, 300, 500, 1000, 2000, 2500, 5000]
-SEEDS = list(range(10))
-FEDERATED_TAG = "federated_3vs7"
-DEPLOY_AGG_METHODS_FEDERATED = ["mean", "krum", "multikrum", "median", "trmean"]
-SINGLE_USER_AGG = "mean"
 
 # Same palette as show_results.py's AGG_COLORS, plus single_user (that script's
 # FEDERATED_MULTIKRUM_COLORS reserves tab:blue for single_user/tab:purple for the federated
@@ -66,13 +87,39 @@ BRANCH_COLORS = {
 }
 
 BRANCH_LABELS = {
-    "single_user": "single_user (1v0/mean)",
-    "federated_mean": "federated_3vs7 (mean)",
-    "federated_median": "federated_3vs7 (median)",
-    "federated_krum": "federated_3vs7 (krum)",
-    "federated_trmean": "federated_3vs7 (trmean)",
-    "federated_multikrum": "federated_3vs7 (multikrum)",
+    "single_user": f"single_user ({GEN_NUM_POISONED}v{GEN_NUM_HONESTS}/{DEPLOY_SINGLE_USER_AGG_METHOD})",
+    "federated_mean": f"{FEDERATED_TAG} (mean)",
+    "federated_median": f"{FEDERATED_TAG} (median)",
+    "federated_krum": f"{FEDERATED_TAG} (krum)",
+    "federated_trmean": f"{FEDERATED_TAG} (trmean)",
+    "federated_multikrum": f"{FEDERATED_TAG} (multikrum)",
 }
+
+# Column order/labels for the LaTeX table -- matches the paper's own header (MEAN, CW-MEDIAN,
+# KRUM, TRMEAN, MULTIKRUM), independent of DEPLOY_AGG_METHODS_FEDERATED's own order. "centralized"
+# is a synthetic series (not a real deployment aggregator) read from the single_user branch
+# instead of federated_3vs7 -- see build_dataset_table's own handling of it below.
+CENTRALIZED_SERIES = "centralized"
+TABLE_AGG_ORDER = ["mean", "median", "krum", "trmean", "multikrum"]
+TABLE_COLUMNS_WITH_CENTRALIZED = [CENTRALIZED_SERIES] + TABLE_AGG_ORDER
+TABLE_AGG_DISPLAY = {
+    CENTRALIZED_SERIES: "CENTRALIZED",
+    "mean": "MEAN", "median": "CW-MEDIAN", "krum": "KRUM",
+    "trmean": "TRMEAN", "multikrum": "MULTIKRUM",
+}
+
+# Tag -> table block name. Extend as more paper_main_campaign tags (eps_0p50_lpips_0p1,
+# eps_16_255) finish training -- see gen_configs_paper_main_campaign.py's own CONFIG_TAGS /
+# STEALTH_GRID docstring for what each tag means ("baseline" = the plain optimized joint
+# trigger, reference config with no extra stealth regularization).
+TAG_DISPLAY_NAMES = {
+    "baseline": "Optimized Trigger -- \\broad{}",
+    "eps_0p50_lpips_0p1": "Optimized Trigger (eps=0.5, LPIPS=0.1) -- \\broad{}",
+    "eps_16_255": "Optimized Trigger (eps=16/255) -- \\broad{}",
+}
+
+DATASET_DISPLAY = {"cifar": "CIFAR-10", "svhn": "SVHN"}
+MODEL_DISPLAY = {"r32p": "ResNet-32", "convnext_micro": "ConvNeXt-Micro"}
 
 
 # =========================
@@ -103,9 +150,9 @@ def get_final_value(npy_path):
 # COMPUTE
 # =========================
 def _branch_run_dir(model_flag, dataset, tag, seed, branch, agg=None):
-    cell_dir = EXP_BASE / model_flag / dataset / tag / f"seed{seed}"
+    cell_dir = EXP_BASE / cell_name(model_flag, dataset, tag, seed)
     if branch == "single_user":
-        return cell_dir / SINGLE_USER_AGG
+        return cell_dir / DEPLOY_SINGLE_USER_AGG_METHOD
     return cell_dir / FEDERATED_TAG / agg
 
 
@@ -151,16 +198,16 @@ def compute_cta_pta_mean_var(
     return pd.DataFrame.from_records(records)
 
 
-def collect_dataset(model_flag, dataset, tag):
+def collect_dataset(model_flag, dataset, tag, budgets=DEPLOY_BUDGETS, seeds=SEEDS):
     """{branch_key: DataFrame} for single_user + every federated aggregator, one dataset."""
     all_data = {
         "single_user": compute_cta_pta_mean_var(
-            model_flag, dataset, tag, "single_user", BUDGETS, SEEDS,
+            model_flag, dataset, tag, "single_user", budgets, seeds,
         ),
     }
     for agg in DEPLOY_AGG_METHODS_FEDERATED:
         all_data[f"federated_{agg}"] = compute_cta_pta_mean_var(
-            model_flag, dataset, tag, "federated", BUDGETS, SEEDS, agg=agg,
+            model_flag, dataset, tag, "federated", budgets, seeds, agg=agg,
         )
     return all_data
 
@@ -320,26 +367,266 @@ def plot_metric_vs_budget(all_data, dataset, model_flag, tag, metric, ylabel, sa
 
 
 # =========================
+# TABLE -- format_cell/compute_best_second/build_table ported verbatim from show_results.py
+# (modules/base_utils/show_results.py's own render_block/build_final_table predate this and use
+# a slightly different signature; scripts/show_results/show_results.py's build_table below is
+# the one actually producing the paper's tables, so that's the one this mirrors).
+# =========================
+def format_cell(cta, cta_var, asr, asr_var):
+    if np.isnan(cta):
+        return "XXX"
+    cta_std = np.sqrt(cta_var) * 100
+    asr_std = np.sqrt(asr_var) * 100
+    return f"{cta * 100:.1f}$\\pm${cta_std:.1f}/{asr * 100:.1f}$\\pm${asr_std:.1f}"
+
+
+def compute_best_second(block, budgets, series_labels):
+    """best/second-best budget per column, ranked by ASR (mean, index 2 of the stored 4-tuple)
+    -- \\textbf{}/\\underline{} targets for build_table below."""
+    best, second = {}, {}
+
+    for series in series_labels:
+        values = np.array([block.get((b, series), (np.nan,) * 4)[2] for b in budgets])
+        valid_idx = np.where(~np.isnan(values))[0]
+
+        if len(valid_idx) == 0:
+            best[series] = second[series] = None
+            continue
+
+        sorted_idx = valid_idx[np.argsort(values[valid_idx])]
+        best[series] = budgets[sorted_idx[-1]]
+        second[series] = budgets[sorted_idx[-2] if len(sorted_idx) > 1 else sorted_idx[-1]]
+
+    return best, second
+
+
+def render_block(name, block, budgets, series_labels):
+    best, second = compute_best_second(block, budgets, series_labels)
+    lines = [f"\\multicolumn{{{1 + len(series_labels)}}}{{c}}{{\\textbf{{{name}}}}} \\\\", "\\midrule"]
+
+    for b in budgets:
+        row = [str(b)]
+        for series in series_labels:
+            cell = format_cell(*block.get((b, series), (np.nan,) * 4))
+            if best[series] == b:
+                cell = f"\\textbf{{{cell}}}"
+            elif second[series] == b:
+                cell = f"\\underline{{{cell}}}"
+            row.append(cell)
+        lines.append(" & ".join(row) + " \\\\")
+
+    return "\n".join(lines)
+
+
+def build_table(blocks, budgets, series_labels, caption, label):
+    """`blocks` is an ordered dict: block name -> block dict (as filled by the MAIN loop below,
+    {(budget, series): (cta_mean, cta_var, pta_mean, pta_var)}) -- one \\multicolumn block per
+    tag/attack-variant, same layout as the paper's own table (Optimized Trigger / Sinusoidal
+    Trigger / FLIP). Values are reported CTA/ASR (%) with std; bold/underline mark the
+    highest/second-highest ASR per column within its own block."""
+    lines = [
+        "\\begin{table}[ht]",
+        "\\centering",
+        "\\scriptsize",
+        "\\setlength{\\tabcolsep}{3pt}",
+        "",
+        f"\\caption{{{caption}}}",
+        "\\vspace{2mm}",
+        "\\begin{tabular}{c " + " ".join(["c"] * len(series_labels)) + "}",
+        "\\toprule",
+        "Budget & " + " & ".join(TABLE_AGG_DISPLAY.get(s, str(s).upper()) for s in series_labels) + " \\\\",
+    ]
+
+    first = True
+    for name, block in blocks.items():
+        lines.append("\\midrule")
+        lines.append(render_block(name, block, budgets, series_labels))
+        first = False
+
+    lines += [
+        "\\bottomrule",
+        "\\end{tabular}",
+        f"\\label{{{label}}}",
+        "\\end{table}",
+    ]
+    return "\n".join(lines)
+
+
+def build_dataset_table(
+    model_flag, dataset, tags, budgets=DEPLOY_BUDGETS, seeds=SEEDS, include_centralized=True,
+):
+    """One table for (model_flag, dataset): one \\multicolumn block per `tags` entry that has
+    ANY data on disk (missing tags -- not yet trained -- are silently skipped, never crash).
+    Columns are the federated_3vs7 robust-aggregation rules (TABLE_AGG_ORDER), plus -- when
+    include_centralized -- a leading CENTRALIZED column read off the single_user branch instead
+    (the undefended 1-victim/no-aggregation deployment of the SAME attack, directly comparable
+    at fixed budget/seed since it's the same generated trigger)."""
+    columns = TABLE_COLUMNS_WITH_CENTRALIZED if include_centralized else TABLE_AGG_ORDER
+
+    blocks = {}
+    for tag in tags:
+        block = {}
+        any_cell = False
+        for series in columns:
+            if series == CENTRALIZED_SERIES:
+                df = compute_cta_pta_mean_var(model_flag, dataset, tag, "single_user", budgets, seeds)
+            else:
+                df = compute_cta_pta_mean_var(model_flag, dataset, tag, "federated", budgets, seeds, agg=series)
+            for _, row in df.iterrows():
+                if not np.isnan(row["cta_mean"]):
+                    any_cell = True
+                block[(row["budget"], series)] = (
+                    row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+                )
+        if any_cell:
+            blocks[TAG_DISPLAY_NAMES.get(tag, tag)] = block
+        else:
+            print(f"[INFO] tag={tag!r} has no data yet for {model_flag}/{dataset} -- skipped in table.")
+
+    if not blocks:
+        return None
+
+    dataset_name = DATASET_DISPLAY.get(dataset, dataset)
+    model_name = MODEL_DISPLAY.get(model_flag, model_flag)
+    centralized_clause = " and the centralized (undefended, single-victim) deployment" if include_centralized else ""
+    caption = (
+        f"Impact of poisoning budget on ASR and CTA across robust aggregation rules{centralized_clause} on "
+        f"{dataset_name} with a {model_name} model. Results are reported as CTA/ASR (in \\%) "
+        f"with standard deviation. Bold and underlined values indicate the highest and "
+        f"second-highest ASR."
+    )
+    label = f"tab:{dataset}_{model_flag}_budget_vs_asr"
+    return build_table(blocks, budgets, columns, caption, label)
+
+
+# =========================
+# TRIGGER VISUALS -- trigger_path_in/save_trigger_visual_in/save_all_trigger_visuals ported from
+# show_results.py, pointed at paper_main_campaign's own module_dir layout.
+# =========================
+def trigger_path_in(module_dir, model_flag, dataset):
+    """Path to the .pt trigger written by federated_generate_labels_trigger_joint's run_module.py
+    -- matches gen_configs_paper_main_campaign.generate_cell()'s own trigger_path build exactly
+    (GEN_INIT/GEN_NUM_POISONED/GEN_NUM_HONESTS imported straight from that module, see top of
+    this file)."""
+    return (
+        module_dir / "trigger"
+        / f"opt_trig_direct_joint_{GEN_INIT}_{model_flag}_{dataset}_{GEN_NUM_POISONED}vs{GEN_NUM_HONESTS}.pt"
+    )
+
+
+def save_trigger_visual_in(module_dir, model_flag, dataset, label, sample_seed=0):
+    """Renders clean-vs-poisoned side by side for one generated trigger and saves the PNG next
+    to the .pt file itself (same `trigger/` directory) -- identical rendering to
+    show_results.py's own save_trigger_visual_in."""
+    trig_path = trigger_path_in(module_dir, model_flag, dataset)
+    if not trig_path.exists():
+        return None
+
+    dataset_obj = load_dataset(dataset, train=True)
+    indices = [i for i, (_, y) in enumerate(dataset_obj) if y == SOURCE_LABEL]
+    idx = np.random.RandomState(sample_seed).choice(indices)
+    img, _ = dataset_obj[idx]
+
+    clean_img = img
+    if isinstance(clean_img, torch.Tensor):
+        clean_img = transforms.ToPILImage()(clean_img)
+
+    poisoner = pick_poisoner("optimized", dataset, TARGET_LABEL, delta=str(trig_path))
+    poisoned_img, _ = poisoner.poison((img, SOURCE_LABEL))
+    if isinstance(poisoned_img, torch.Tensor):
+        poisoned_img = transforms.ToPILImage()(poisoned_img)
+
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3.2))
+    axes[0].imshow(clean_img)
+    axes[0].set_title("Clean image", fontsize=11)
+    axes[0].axis("off")
+    axes[1].imshow(poisoned_img)
+    axes[1].set_title(f"Poisoned ({label})", fontsize=11)
+    axes[1].axis("off")
+    plt.tight_layout()
+
+    out_path = trig_path.with_suffix(".png")
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] Saved trigger visual: {out_path}")
+    return out_path
+
+
+def save_all_trigger_visuals(model_flags, datasets, tags, seeds):
+    """paper_main_campaign wrapper: builds each cell's module_dir via that generator's own
+    cell_name/EXP_BASE, one trigger per (model_flag, dataset, tag, seed)."""
+    saved, missing = [], []
+    for model_flag in model_flags:
+        for dataset in datasets:
+            for tag in tags:
+                for seed in seeds:
+                    module_dir = (
+                        EXP_BASE / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint"
+                    )
+                    out_path = save_trigger_visual_in(
+                        module_dir, model_flag, dataset, label=f"{tag}, seed{seed}",
+                    )
+                    if out_path is None:
+                        missing.append((model_flag, dataset, tag, seed))
+                    else:
+                        saved.append(out_path)
+
+    if missing:
+        print(f"[INFO] {len(missing)} trigger(s) not found yet (skipped):")
+        for model_flag, dataset, tag, seed in missing:
+            module_dir = EXP_BASE / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint"
+            print(f"  {trigger_path_in(module_dir, model_flag, dataset)}")
+
+    return saved
+
+
+# =========================
 # MAIN
 # =========================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="r32p")
-    parser.add_argument("--tag", default="baseline")
-    parser.add_argument("--datasets", nargs="+", default=["cifar", "svhn"])
+    parser.add_argument("--tag", default="baseline", help="single tag to plot per-dataset curves for")
+    parser.add_argument(
+        "--table-tags", nargs="+", default=None,
+        help="tags to include as table blocks, in order (default: just --tag; add more once "
+             "trained, e.g. --table-tags baseline eps_16_255 eps_0p50_lpips_0p1)",
+    )
+    parser.add_argument("--datasets", nargs="+", default=DATASETS)
     parser.add_argument("--out-dir", default="./plots_paper_main_campaign_user")
+    parser.add_argument("--csv-dir", default="./results_csv_paper_main_campaign_user")
+    parser.add_argument("--table-dir", default="./tables_paper_main_campaign_user")
+    parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    parser.add_argument("--skip-trigger-visuals", action="store_true")
+    parser.add_argument(
+        "--no-centralized-column", action="store_true",
+        help="drop the CENTRALIZED (single_user) column from the table, matching the "
+             "federated-aggregators-only style of the original show_results.py table",
+    )
     args = parser.parse_args()
 
+    table_tags = args.table_tags or [args.tag]
+
     out_root = Path(args.out_dir) / f"{args.model}_{args.tag}"
+    csv_root = Path(args.csv_dir) / f"{args.model}_{args.tag}"
+    table_root = Path(args.table_dir)
+    table_root.mkdir(parents=True, exist_ok=True)
+
+    if not args.skip_trigger_visuals:
+        print(f"\n=== [paper_main_campaign] Trigger visuals ({args.model}, tags={table_tags}) ===")
+        save_all_trigger_visuals([args.model], args.datasets, table_tags, args.seeds)
 
     for dataset in args.datasets:
         print(f"\n=== [paper_main_campaign/user] {args.model} / {dataset} / tag={args.tag} ===")
-        all_data = collect_dataset(args.model, dataset, args.tag)
+        all_data = collect_dataset(args.model, dataset, args.tag, seeds=args.seeds)
 
+        csv_dir = csv_root / dataset
+        csv_dir.mkdir(parents=True, exist_ok=True)
         for branch_key, df in all_data.items():
             n_cta = df["cta_mean"].notna().sum()
             n_asr = df["pta_mean"].notna().sum()
-            print(f"   -> {branch_key:24s} budgets with data: cta={n_cta}/{len(BUDGETS)} asr={n_asr}/{len(BUDGETS)}")
+            print(f"   -> {branch_key:24s} budgets with data: cta={n_cta}/{len(DEPLOY_BUDGETS)} asr={n_asr}/{len(DEPLOY_BUDGETS)}")
+            df.to_csv(csv_dir / f"{branch_key}.csv", index=False)
 
         save_dir = str(out_root / dataset)
         ok_tradeoff = plot_cta_vs_pta(all_data, dataset, args.model, args.tag, save_dir=save_dir)
@@ -353,8 +640,19 @@ def main():
         )
 
         if not (ok_tradeoff or ok_cta or ok_asr):
-            print(f"[WARNING] no data found under {EXP_BASE / args.model / dataset / args.tag} -- "
+            print(f"[WARNING] no data found under {EXP_BASE / cell_name(args.model, dataset, args.tag, '*')} -- "
                   f"nothing plotted for {dataset}.")
+
+        table = build_dataset_table(
+            args.model, dataset, table_tags, seeds=args.seeds,
+            include_centralized=not args.no_centralized_column,
+        )
+        if table is None:
+            print(f"[WARNING] no data found for table blocks {table_tags} -- nothing written for {dataset}.")
+        else:
+            table_path = table_root / f"{args.model}_{dataset}.tex"
+            table_path.write_text(table)
+            print(f"[INFO] Saved table: {table_path}")
 
     print("\nDone.")
 
