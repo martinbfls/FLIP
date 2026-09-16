@@ -58,10 +58,12 @@
 #   Resume a partially-completed campaign: GEN cells whose trigger .pt already exists on disk
 #   (experiments/$EXP_BASE_REL/<model>/<dataset>/<tag>/seed<seed>/gen_labels_trigger_joint/
 #   trigger/opt_trig_direct_joint_stripe_<model>_<dataset>_1vs0.pt) are skipped automatically --
-#   only the missing GEN cells are (re)submitted. FLIPS is unconditionally (re)submitted for
-#   EVERY cell (select_flips is fast/idempotent and, per this campaign, hasn't run for any cell
-#   yet) and defaults to CPU-only (GPUS_PER_TASK=0, no --gres) since it never touches a GPU --
-#   set FLIPS_PARTITIONS to a CPU partition if the default SLURM_PARTITIONS is GPU-only:
+#   only the missing GEN cells are (re)submitted. FLIPS branches whose select_flips output is
+#   already fully materialized on disk (last budget's last worker's *_indices.npy present) are
+#   skipped the same way -- only the missing single_user/federated FLIPS branches are
+#   (re)submitted. FLIPS defaults to CPU-only (GPUS_PER_TASK=0, no --gres) since it never
+#   touches a GPU -- set FLIPS_PARTITIONS to a CPU partition if the default SLURM_PARTITIONS is
+#   GPU-only:
 #        SLURM_ACCOUNT=<account> BOOTSTRAP_SKIP=1 FLIPS_PARTITIONS="<cpu_partition>" \
 #            ./orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
 #   Force a GEN cell to redo even if its trigger already exists (e.g. after a code fix):
@@ -170,9 +172,26 @@ gen_labels_done() {
     [ -f "$trig" ]
 }
 
+# federated_select_flips's own last write (run_module.py's run(): for each budget IN ORDER,
+# np.save idx_flipped/idx_clean THEN, per worker (0..num_workers-1) IN ORDER, worker{w}/
+# {budget}_labels.npy THEN worker{w}/{budget}_indices.npy) -- the LAST budget in DEPLOY_BUDGETS'
+# LAST worker's indices.npy is therefore the last file select_flips ever writes; its presence
+# means that flips_dir's select_flips run already completed. num_workers = deploy_num_honests +
+# deploy_num_poisoned MUST match gen_configs_paper_main_campaign.py's own DEPLOY_SINGLE_USER_*
+# (0+1=1) / DEPLOY_FEDERATED_* (7+3=10) constants; verify with --print-grid if this drifts.
+FLIPS_LAST_BUDGET="${DEPLOY_BUDGETS[-1]}"
+FLIPS_SINGLE_USER_WORKERS=1
+FLIPS_FEDERATED_WORKERS=10
+flips_done() {
+    local flips_dir="$1" num_workers="$2"
+    local last_worker=$((num_workers - 1))
+    [ -f "experiments/$flips_dir/worker${last_worker}/${FLIPS_LAST_BUDGET}_indices.npy" ]
+}
+
 GEN_JOBS=()
 GEN_SKIPPED=0
 FLIPS_JOBS=()
+FLIPS_SKIPPED=0
 for model in "${MODEL_FLAGS[@]}"; do
   for dataset in "${DATASETS[@]}"; do
     for tag in "${STEALTH_TAGS[@]}"; do
@@ -182,12 +201,20 @@ for model in "${MODEL_FLAGS[@]}"; do
         flips_cfg="$cell/select_flips"
         fed_flips_cfg="$cell/$FEDERATED_TAG/select_flips"
 
-        # FLIPS is (re)submitted for every cell -- select_flips hasn't run at all yet for
-        # this campaign, unlike GEN below.
-        require_config "$flips_cfg"
-        require_config "$fed_flips_cfg"
-        FLIPS_JOBS+=("python run_experiment.py $flips_cfg|paper_flips_${model}_${dataset}_${tag}_seed${seed}")
-        FLIPS_JOBS+=("python run_experiment.py $fed_flips_cfg|paper_flips_fed_${model}_${dataset}_${tag}_seed${seed}")
+        # FLIPS: skip a branch whose select_flips output is already fully materialized on
+        # disk (see flips_done above), same idea as GEN's skip-if-done check below.
+        if flips_done "$flips_cfg" "$FLIPS_SINGLE_USER_WORKERS"; then
+            FLIPS_SKIPPED=$((FLIPS_SKIPPED + 1))
+        else
+            require_config "$flips_cfg"
+            FLIPS_JOBS+=("python run_experiment.py $flips_cfg|paper_flips_${model}_${dataset}_${tag}_seed${seed}")
+        fi
+        if flips_done "$fed_flips_cfg" "$FLIPS_FEDERATED_WORKERS"; then
+            FLIPS_SKIPPED=$((FLIPS_SKIPPED + 1))
+        else
+            require_config "$fed_flips_cfg"
+            FLIPS_JOBS+=("python run_experiment.py $fed_flips_cfg|paper_flips_fed_${model}_${dataset}_${tag}_seed${seed}")
+        fi
 
         if [ "$GEN_FORCE_ALL" != "1" ] && gen_labels_done "$model" "$dataset" "$tag" "$seed"; then
             GEN_SKIPPED=$((GEN_SKIPPED + 1))
@@ -232,7 +259,7 @@ fi
 echo "[PLAN] campaign=paper_main_campaign exp_base=$EXP_BASE_REL run_tag=$RUN_TAG"
 echo "[PLAN] models=${MODEL_FLAGS[*]} datasets=${DATASETS[*]} seeds=${#SEEDS[@]} (${SEEDS[*]}) tags=${STEALTH_TAGS[*]}"
 echo "[PLAN] deployment: single_user agg=$DEPLOY_SINGLE_USER_AGG, federated($FEDERATED_TAG) agg_methods=${DEPLOY_AGG_METHODS_FEDERATED[*]}, budgets=${DEPLOY_BUDGETS[*]}"
-echo "[PLAN] bootstrap cells=${#BOOTSTRAP_JOBS[@]} gen cells=${#GEN_JOBS[@]} (skipped, already done=$GEN_SKIPPED) flips cells=${#FLIPS_JOBS[@]} user cells=${#USER_JOBS[@]}"
+echo "[PLAN] bootstrap cells=${#BOOTSTRAP_JOBS[@]} gen cells=${#GEN_JOBS[@]} (skipped, already done=$GEN_SKIPPED) flips cells=${#FLIPS_JOBS[@]} (skipped, already done=$FLIPS_SKIPPED) user cells=${#USER_JOBS[@]}"
 echo "[PLAN] partitions=${SLURM_PARTITIONS}; flips partitions=${FLIPS_PARTITIONS} gpus_per_task=${FLIPS_GPUS_PER_TASK} (0 = CPU-only, no --gres)"
 if [ "$USER_ONLY" = "1" ]; then
     echo "[PLAN] phases: USER only (USER_ONLY=1 -- reusing existing BOOTSTRAP/GEN/FLIPS outputs on disk)"
@@ -321,25 +348,31 @@ else
 
     # FLIPS never touches a GPU -- submitted CPU-only (FLIPS_GPUS_PER_TASK=0 by default, see
     # header Usage section) on FLIPS_PARTITIONS, independently of the GPU resources/partitions
-    # the rest of the campaign uses. Every cell is (re)submitted regardless of GEN_SKIPPED,
-    # since select_flips hasn't run for any cell yet.
-    TIME_PER_TASK="$FLIPS_TIME"
-    _saved_gpus_per_task="$GPUS_PER_TASK"
-    _saved_mem_per_task="$MEM_PER_TASK"
-    _saved_slurm_partitions="$SLURM_PARTITIONS"
-    GPUS_PER_TASK="$FLIPS_GPUS_PER_TASK"
-    MEM_PER_TASK="$FLIPS_MEM"
-    SLURM_PARTITIONS="$FLIPS_PARTITIONS"
-    submit_job_pool_slurm FLIPS_JOBS "paper_flips_${RUN_TAG}" "$flips_dep" || exit 1
-    GPUS_PER_TASK="$_saved_gpus_per_task"
-    MEM_PER_TASK="$_saved_mem_per_task"
-    SLURM_PARTITIONS="$_saved_slurm_partitions"
-    flips_barrier=$(submit_barrier_slurm "paper_barrier_flips_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-    echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs, gpus_per_task=$FLIPS_GPUS_PER_TASK, partitions=$FLIPS_PARTITIONS) -> barrier $flips_barrier"
+    # the rest of the campaign uses. Branches already resubmitted regardless of GEN_SKIPPED are
+    # the ones NOT already done on disk -- see flips_done/FLIPS_SKIPPED above.
+    user_dep="$flips_dep"
+    if [ ${#FLIPS_JOBS[@]} -gt 0 ]; then
+        TIME_PER_TASK="$FLIPS_TIME"
+        _saved_gpus_per_task="$GPUS_PER_TASK"
+        _saved_mem_per_task="$MEM_PER_TASK"
+        _saved_slurm_partitions="$SLURM_PARTITIONS"
+        GPUS_PER_TASK="$FLIPS_GPUS_PER_TASK"
+        MEM_PER_TASK="$FLIPS_MEM"
+        SLURM_PARTITIONS="$FLIPS_PARTITIONS"
+        submit_job_pool_slurm FLIPS_JOBS "paper_flips_${RUN_TAG}" "$flips_dep" || exit 1
+        GPUS_PER_TASK="$_saved_gpus_per_task"
+        MEM_PER_TASK="$_saved_mem_per_task"
+        SLURM_PARTITIONS="$_saved_slurm_partitions"
+        flips_barrier=$(submit_barrier_slurm "paper_barrier_flips_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+        echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs, $FLIPS_SKIPPED already done -- skipped, gpus_per_task=$FLIPS_GPUS_PER_TASK, partitions=$FLIPS_PARTITIONS) -> barrier $flips_barrier"
+        user_dep="afterok:$flips_barrier"
+    else
+        echo "[PHASE] FLIPS skipped entirely -- all $FLIPS_SKIPPED branches already have flips on disk."
+    fi
 
     if [ "$SKIP_USER" != "1" ]; then
         TIME_PER_TASK="$USER_TIME"
-        submit_job_pool_slurm USER_JOBS "paper_user_${RUN_TAG}" "afterok:$flips_barrier" || exit 1
+        submit_job_pool_slurm USER_JOBS "paper_user_${RUN_TAG}" "$user_dep" || exit 1
         echo "[PHASE] USER submitted (${#USER_JOBS[@]} jobs)."
     else
         echo "[PHASE] USER skipped (SKIP_USER=1 -- train it elsewhere, e.g. orchestrate_student_machines/)."
