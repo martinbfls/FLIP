@@ -54,6 +54,18 @@
 #   Submit only BOOTSTRAP -> GEN -> FLIPS, never USER -- when train_user is trained elsewhere
 #   (e.g. orchestrate_student_machines/, off this cluster's job-count limit):
 #        SLURM_ACCOUNT=<account> SKIP_USER=1 STEALTH_TAGS="eps_16_255" ./orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
+#
+#   Resume a partially-completed campaign: GEN cells whose trigger .pt already exists on disk
+#   (experiments/$EXP_BASE_REL/<model>/<dataset>/<tag>/seed<seed>/gen_labels_trigger_joint/
+#   trigger/opt_trig_direct_joint_stripe_<model>_<dataset>_1vs0.pt) are skipped automatically --
+#   only the missing GEN cells are (re)submitted. FLIPS is unconditionally (re)submitted for
+#   EVERY cell (select_flips is fast/idempotent and, per this campaign, hasn't run for any cell
+#   yet) and defaults to CPU-only (GPUS_PER_TASK=0, no --gres) since it never touches a GPU --
+#   set FLIPS_PARTITIONS to a CPU partition if the default SLURM_PARTITIONS is GPU-only:
+#        SLURM_ACCOUNT=<account> BOOTSTRAP_SKIP=1 FLIPS_PARTITIONS="<cpu_partition>" \
+#            ./orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
+#   Force a GEN cell to redo even if its trigger already exists (e.g. after a code fix):
+#        SLURM_ACCOUNT=<account> GEN_FORCE_ALL=1 ./orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
 ###
 
 set -euo pipefail
@@ -78,6 +90,20 @@ BOOTSTRAP_TIME="${BOOTSTRAP_TIME:-0-06:00:00}"
 GEN_TIME="${GEN_TIME:-1-00:00:00}"
 FLIPS_TIME="${FLIPS_TIME:-00:10:00}"
 USER_TIME="${USER_TIME:-0-01:00:00}"
+
+# GEN cells whose trigger .pt is already on disk are skipped by default (see "Resume a
+# partially-completed campaign" in the header Usage section). Set GEN_FORCE_ALL=1 to
+# resubmit every GEN cell regardless of what's already on disk.
+GEN_FORCE_ALL="${GEN_FORCE_ALL:-0}"
+
+# FLIPS (federated_select_flips) never touches a GPU -- it only reads labels.npy/true.npy off
+# disk and writes flip-index .npy files. Defaults to a CPU-only submission (no --gres at all,
+# see slurm_lib.sh's submit_job_slurm) on the SAME partitions as the rest of the campaign;
+# override FLIPS_PARTITIONS to point it at an actual CPU partition if SLURM_PARTITIONS is
+# GPU-only on this cluster. Set FLIPS_GPUS_PER_TASK=1 to go back to the old GPU-slot behavior.
+FLIPS_GPUS_PER_TASK="${FLIPS_GPUS_PER_TASK:-0}"
+FLIPS_PARTITIONS="${FLIPS_PARTITIONS:-$SLURM_PARTITIONS}"
+FLIPS_MEM="${FLIPS_MEM:-4G}"
 
 # ---------------------------------------------------------------------------
 # Fixed axes -- MUST match gen_configs_paper_main_campaign.py's own constants. Every one of
@@ -132,7 +158,20 @@ for model in "${MODEL_FLAGS[@]}"; do
   done
 done
 
+# GEN's own last write (run_module.py's run(): torch.save(delta, ...) AFTER labels.npy/true.npy/
+# losses.npy) -- its presence means the cell's GEN already completed successfully. Path/name
+# MUST match gen_configs_old_objective_port.GEN_INIT ("stripe") and
+# gen_configs_paper_main_campaign.py's GEN_NUM_POISONED=1/GEN_NUM_HONESTS=0 ("1vs0"); verify
+# with --print-grid if this drifts.
+GEN_INIT_TAG="stripe"
+gen_labels_done() {
+    local model="$1" dataset="$2" tag="$3" seed="$4"
+    local trig="experiments/$EXP_BASE_REL/$model/$dataset/$tag/seed${seed}/gen_labels_trigger_joint/trigger/opt_trig_direct_joint_${GEN_INIT_TAG}_${model}_${dataset}_1vs0.pt"
+    [ -f "$trig" ]
+}
+
 GEN_JOBS=()
+GEN_SKIPPED=0
 FLIPS_JOBS=()
 for model in "${MODEL_FLAGS[@]}"; do
   for dataset in "${DATASETS[@]}"; do
@@ -142,12 +181,20 @@ for model in "${MODEL_FLAGS[@]}"; do
         gen_cfg="$cell/gen_labels_trigger_joint"
         flips_cfg="$cell/select_flips"
         fed_flips_cfg="$cell/$FEDERATED_TAG/select_flips"
-        require_config "$gen_cfg"
+
+        # FLIPS is (re)submitted for every cell -- select_flips hasn't run at all yet for
+        # this campaign, unlike GEN below.
         require_config "$flips_cfg"
         require_config "$fed_flips_cfg"
-        GEN_JOBS+=("python run_experiment.py $gen_cfg|paper_gen_${model}_${dataset}_${tag}_seed${seed}")
         FLIPS_JOBS+=("python run_experiment.py $flips_cfg|paper_flips_${model}_${dataset}_${tag}_seed${seed}")
         FLIPS_JOBS+=("python run_experiment.py $fed_flips_cfg|paper_flips_fed_${model}_${dataset}_${tag}_seed${seed}")
+
+        if [ "$GEN_FORCE_ALL" != "1" ] && gen_labels_done "$model" "$dataset" "$tag" "$seed"; then
+            GEN_SKIPPED=$((GEN_SKIPPED + 1))
+            continue
+        fi
+        require_config "$gen_cfg"
+        GEN_JOBS+=("python run_experiment.py $gen_cfg|paper_gen_${model}_${dataset}_${tag}_seed${seed}")
       done
     done
   done
@@ -185,8 +232,8 @@ fi
 echo "[PLAN] campaign=paper_main_campaign exp_base=$EXP_BASE_REL run_tag=$RUN_TAG"
 echo "[PLAN] models=${MODEL_FLAGS[*]} datasets=${DATASETS[*]} seeds=${#SEEDS[@]} (${SEEDS[*]}) tags=${STEALTH_TAGS[*]}"
 echo "[PLAN] deployment: single_user agg=$DEPLOY_SINGLE_USER_AGG, federated($FEDERATED_TAG) agg_methods=${DEPLOY_AGG_METHODS_FEDERATED[*]}, budgets=${DEPLOY_BUDGETS[*]}"
-echo "[PLAN] bootstrap cells=${#BOOTSTRAP_JOBS[@]} gen cells=${#GEN_JOBS[@]} flips cells=${#FLIPS_JOBS[@]} user cells=${#USER_JOBS[@]}"
-echo "[PLAN] partitions=${SLURM_PARTITIONS}"
+echo "[PLAN] bootstrap cells=${#BOOTSTRAP_JOBS[@]} gen cells=${#GEN_JOBS[@]} (skipped, already done=$GEN_SKIPPED) flips cells=${#FLIPS_JOBS[@]} user cells=${#USER_JOBS[@]}"
+echo "[PLAN] partitions=${SLURM_PARTITIONS}; flips partitions=${FLIPS_PARTITIONS} gpus_per_task=${FLIPS_GPUS_PER_TASK} (0 = CPU-only, no --gres)"
 if [ "$USER_ONLY" = "1" ]; then
     echo "[PLAN] phases: USER only (USER_ONLY=1 -- reusing existing BOOTSTRAP/GEN/FLIPS outputs on disk)"
 elif [ "$SKIP_USER" = "1" ]; then
@@ -218,6 +265,30 @@ fi
 
 preflight_slurm || exit 1
 
+# preflight_slurm above only trial-probes SLURM_PARTITIONS with the GPU resource shape
+# (--gres=gpu:$GPUS_PER_TASK); when FLIPS_PARTITIONS points at a different (e.g. CPU-only)
+# partition, probe THAT partition with the CPU-only shape FLIPS jobs will actually request, so
+# a bad partition name / unusable account-partition pair is caught now instead of after 240
+# FLIPS submissions.
+if [ "$FLIPS_PARTITIONS" != "$SLURM_PARTITIONS" ]; then
+    for _flips_partition in $FLIPS_PARTITIONS; do
+        if ! sinfo -h -p "$_flips_partition" -o "%P" 2>/dev/null | grep -q .; then
+            echo "[PREFLIGHT] FLIPS_PARTITIONS partition '$_flips_partition' unknown or unreachable" >&2
+            exit 1
+        fi
+        _flips_probe_gres=()
+        [ "$FLIPS_GPUS_PER_TASK" != "0" ] && _flips_probe_gres=(--gres="gpu:$FLIPS_GPUS_PER_TASK")
+        if ! sbatch --kill-on-invalid-dep=yes --test-only \
+                --account="$SLURM_ACCOUNT" --partition="$_flips_partition" \
+                "${_flips_probe_gres[@]}" --cpus-per-task="$CPUS_PER_TASK" \
+                --mem="$FLIPS_MEM" --time=00:01:00 --wrap=true >/dev/null 2>&1; then
+            echo "[PREFLIGHT] a trial submission to FLIPS_PARTITIONS partition '$_flips_partition' was rejected by Slurm" >&2
+            exit 1
+        fi
+    done
+    unset _flips_partition _flips_probe_gres
+fi
+
 # ---------------------------------------------------------------------------
 # Submit -- same job-pool/barrier pattern as the sibling campaign scripts.
 # ---------------------------------------------------------------------------
@@ -237,15 +308,34 @@ else
         echo "[PHASE] BOOTSTRAP skipped (BOOTSTRAP_SKIP=1)."
     fi
 
-    TIME_PER_TASK="$GEN_TIME"
-    submit_job_pool_slurm GEN_JOBS "paper_gen_${RUN_TAG}" "$gen_dep" || exit 1
-    gen_barrier=$(submit_barrier_slurm "paper_barrier_gen_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-    echo "[PHASE] GEN submitted (${#GEN_JOBS[@]} jobs) -> barrier $gen_barrier"
+    flips_dep="$gen_dep"
+    if [ ${#GEN_JOBS[@]} -gt 0 ]; then
+        TIME_PER_TASK="$GEN_TIME"
+        submit_job_pool_slurm GEN_JOBS "paper_gen_${RUN_TAG}" "$gen_dep" || exit 1
+        gen_barrier=$(submit_barrier_slurm "paper_barrier_gen_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+        echo "[PHASE] GEN submitted (${#GEN_JOBS[@]} jobs, $GEN_SKIPPED already done -- skipped) -> barrier $gen_barrier"
+        flips_dep="afterok:$gen_barrier"
+    else
+        echo "[PHASE] GEN skipped entirely -- all $GEN_SKIPPED cells already have a trigger on disk."
+    fi
 
+    # FLIPS never touches a GPU -- submitted CPU-only (FLIPS_GPUS_PER_TASK=0 by default, see
+    # header Usage section) on FLIPS_PARTITIONS, independently of the GPU resources/partitions
+    # the rest of the campaign uses. Every cell is (re)submitted regardless of GEN_SKIPPED,
+    # since select_flips hasn't run for any cell yet.
     TIME_PER_TASK="$FLIPS_TIME"
-    submit_job_pool_slurm FLIPS_JOBS "paper_flips_${RUN_TAG}" "afterok:$gen_barrier" || exit 1
+    _saved_gpus_per_task="$GPUS_PER_TASK"
+    _saved_mem_per_task="$MEM_PER_TASK"
+    _saved_slurm_partitions="$SLURM_PARTITIONS"
+    GPUS_PER_TASK="$FLIPS_GPUS_PER_TASK"
+    MEM_PER_TASK="$FLIPS_MEM"
+    SLURM_PARTITIONS="$FLIPS_PARTITIONS"
+    submit_job_pool_slurm FLIPS_JOBS "paper_flips_${RUN_TAG}" "$flips_dep" || exit 1
+    GPUS_PER_TASK="$_saved_gpus_per_task"
+    MEM_PER_TASK="$_saved_mem_per_task"
+    SLURM_PARTITIONS="$_saved_slurm_partitions"
     flips_barrier=$(submit_barrier_slurm "paper_barrier_flips_${RUN_TAG}" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-    echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs) -> barrier $flips_barrier"
+    echo "[PHASE] FLIPS submitted (${#FLIPS_JOBS[@]} jobs, gpus_per_task=$FLIPS_GPUS_PER_TASK, partitions=$FLIPS_PARTITIONS) -> barrier $flips_barrier"
 
     if [ "$SKIP_USER" != "1" ]; then
         TIME_PER_TASK="$USER_TIME"

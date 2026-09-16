@@ -328,12 +328,23 @@ submit_job_slurm() {
         [ "$KILL_ON_INVALID_DEP" = "1" ] && dep_args+=(--kill-on-invalid-dep=yes)
     fi
 
+    # GPUS_PER_TASK=0 means this job is CPU-only (e.g. a select_flips cell run
+    # on a CPU-only/CPU-heavy partition). --gres=gpu:0 is rejected outright on
+    # some Slurm builds (see orchestrate_runs_policy_slurm.sh's own comment on
+    # its FLIPS phase), so omit --gres entirely rather than passing gpu:0 --
+    # mirrors what submit_barrier_slurm already does for its own CPU-only
+    # barrier job below.
+    local -a gres_args=()
+    if [ "$GPUS_PER_TASK" != "0" ]; then
+        gres_args=(--gres="gpu:$GPUS_PER_TASK")
+    fi
+
     local jobid
     jobid=$(_run_sbatch "$(partition_host "$partition")" --parsable \
            --job-name="$safe_name" \
            --account="$SLURM_ACCOUNT" \
            --partition="$partition" \
-           --gres="gpu:$GPUS_PER_TASK" \
+           ${gres_args[@]+"${gres_args[@]}"} \
            --ntasks=1 \
            --cpus-per-task="$CPUS_PER_TASK" \
            --mem="$MEM_PER_TASK" \
