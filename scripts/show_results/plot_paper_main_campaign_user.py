@@ -86,13 +86,19 @@ BRANCH_COLORS = {
     "federated_multikrum": "tab:purple",
 }
 
+# Display name for our own attack (previously called BRoADflip in this codebase's own
+# comments/docstrings; the paper's legend now calls it JOLT) -- used for every branch that is
+# OUR method (single_user + each federated_* branch), as opposed to FLIP_LABEL below (the FLIP
+# paper's own baseline).
+JOLT_LABEL = "JOLT"
+
 BRANCH_LABELS = {
-    "single_user": f"Centralized ({GEN_NUM_POISONED}v{GEN_NUM_HONESTS}/{DEPLOY_SINGLE_USER_AGG_METHOD})",
-    "federated_mean": f"{FEDERATED_TAG} (mean)",
-    "federated_median": f"{FEDERATED_TAG} (median)",
-    "federated_krum": f"{FEDERATED_TAG} (krum)",
-    "federated_trmean": f"{FEDERATED_TAG} (trmean)",
-    "federated_multikrum": f"{FEDERATED_TAG} (multikrum)",
+    "single_user": f"{JOLT_LABEL} (Centralized, {DEPLOY_SINGLE_USER_AGG_METHOD})",
+    "federated_mean": f"{JOLT_LABEL} (mean)",
+    "federated_median": f"{JOLT_LABEL} (median)",
+    "federated_krum": f"{JOLT_LABEL} (krum)",
+    "federated_trmean": f"{JOLT_LABEL} (trmean)",
+    "federated_multikrum": f"{JOLT_LABEL} (multikrum)",
 }
 
 # Filename suffix per branch for the per-config trade-off plots (plot_cta_vs_pta_per_branch) --
@@ -107,6 +113,27 @@ BRANCH_FILE_SUFFIX = {
     "federated_trmean": "trmean",
     "federated_multikrum": "multikrum",
 }
+
+# FLIP baseline (the paper's own comparison attack, using its own 1xs sinusoidal trigger)
+# comparison series -- same color as its JOLT counterpart branch, dotted instead of solid (see
+# _branch_linestyle), so each per-branch plot pairs JOLT against FLIP directly:
+#   - one per federated aggregator:
+#     out_neurips/{model}/{tag_suffix}_FLIP/{dataset}/backdoor/{agg}/1xs/{seed}/{budget}/
+#   - one for the centralized/single_user setting (no aggregation, 1v0):
+#     out_neurips/{model}/{1vs0}/{dataset}/backdoor/{DEPLOY_SINGLE_USER_AGG_METHOD}/1xs/{seed}/{budget}/
+# Convention ported from modules/base_utils/show_results.py's own compute_cta_pta_mean_var(...,
+# use_flip=True/False, poisoner_flag="1xs").
+FLIP_LABEL = "FLIP"
+FLIP_ATTACK = "backdoor"
+FLIP_POISONER_FLAG = "1xs"
+for _agg in DEPLOY_AGG_METHODS_FEDERATED:
+    BRANCH_COLORS[f"flip_{_agg}"] = BRANCH_COLORS[f"federated_{_agg}"]
+    BRANCH_LABELS[f"flip_{_agg}"] = f"{FLIP_LABEL} ({_agg})"
+    BRANCH_FILE_SUFFIX[f"flip_{_agg}"] = f"federated_{_agg}"
+
+BRANCH_COLORS["flip_single_user"] = BRANCH_COLORS["single_user"]
+BRANCH_LABELS["flip_single_user"] = f"{FLIP_LABEL} (Centralized, {FLIP_POISONER_FLAG})"
+BRANCH_FILE_SUFFIX["flip_single_user"] = BRANCH_FILE_SUFFIX["single_user"]
 
 # Column order/labels for the LaTeX table -- matches the paper's own header (MEAN, CW-MEDIAN,
 # KRUM, TRMEAN, MULTIKRUM), independent of DEPLOY_AGG_METHODS_FEDERATED's own order. "centralized"
@@ -162,8 +189,8 @@ def get_final_value(npy_path):
 # =========================
 # COMPUTE
 # =========================
-def _branch_run_dir(model_flag, dataset, tag, seed, branch, agg=None):
-    cell_dir = EXP_BASE / cell_name(model_flag, dataset, tag, seed)
+def _branch_run_dir(model_flag, dataset, tag, seed, branch, agg=None, exp_base=EXP_BASE):
+    cell_dir = exp_base / cell_name(model_flag, dataset, tag, seed)
     if branch == "single_user":
         return cell_dir / DEPLOY_SINGLE_USER_AGG_METHOD
     return cell_dir / FEDERATED_TAG / agg
@@ -179,16 +206,23 @@ def compute_cta_pta_mean_var(
     agg=None,
     cta_file="caccs.npy",
     pta_file="paccs.npy",
+    exp_base=EXP_BASE,
 ):
     """Same shape/semantics as show_results.py's own compute_cta_pta_mean_var: for each budget,
     averages caccs.npy/paccs.npy's final value across `seeds`, skipping any (budget, seed) cell
-    whose files don't exist yet (never crashes on a partial/in-progress campaign)."""
+    whose files don't exist yet (never crashes on a partial/in-progress campaign). `exp_base`
+    defaults to the imported EXP_BASE (the local/orchestrator-relative experiments/ tree) but can
+    be overridden -- e.g. to JOLT's own results mirrored onto a cluster mount under a different
+    root, same subtree from {model_flag}/{dataset}/{tag}/seed{seed}/ down (see --jolt-root)."""
     records = []
 
     for budget in budgets:
         cta_vals, pta_vals = [], []
         for seed in seeds:
-            run_dir = _branch_run_dir(model_flag, dataset, tag, seed, branch, agg) / f"train_user_{budget}"
+            run_dir = (
+                _branch_run_dir(model_flag, dataset, tag, seed, branch, agg, exp_base=exp_base)
+                / f"train_user_{budget}"
+            )
             cta_path = run_dir / cta_file
             pta_path = run_dir / pta_file
             if not (cta_path.exists() and pta_path.exists()):
@@ -211,17 +245,122 @@ def compute_cta_pta_mean_var(
     return pd.DataFrame.from_records(records)
 
 
-def collect_dataset(model_flag, dataset, tag, budgets=DEPLOY_BUDGETS, seeds=SEEDS):
-    """{branch_key: DataFrame} for single_user + every federated aggregator, one dataset."""
+def _flip_run_dir(flip_root, model_flag, dataset, agg, seed, budget):
+    tag_suffix = FEDERATED_TAG.split("_", 1)[-1]  # "federated_3vs7" -> "3vs7"
+    return (
+        Path(flip_root) / model_flag / f"{tag_suffix}_FLIP" / dataset / FLIP_ATTACK
+        / agg / FLIP_POISONER_FLAG / str(seed) / str(budget)
+    )
+
+
+def _flip_centralized_run_dir(flip_root, model_flag, dataset, seed, budget):
+    """Centralized (1v0, undefended, no aggregation) counterpart of _flip_run_dir -- e.g.
+    out_neurips/convnext_micro/1vs0/cifar/backdoor/mean/1xs/2/{budget}/. No "_FLIP" suffix on the
+    "1vs0" segment (unlike the federated tree): the undefended single-victim setting doesn't need
+    one to disambiguate from JOLT's own centralized results, since it's already keyed by the 1xs
+    poisoner flag instead of "optimized"."""
+    return (
+        Path(flip_root) / model_flag / f"{GEN_NUM_POISONED}vs{GEN_NUM_HONESTS}" / dataset
+        / FLIP_ATTACK / DEPLOY_SINGLE_USER_AGG_METHOD / FLIP_POISONER_FLAG / str(seed) / str(budget)
+    )
+
+
+def compute_cta_pta_mean_var_flip(
+    flip_root, model_flag, dataset, agg, budgets, seeds,
+    cta_file="caccs.npy", pta_file="paccs.npy",
+):
+    """Same shape/semantics as compute_cta_pta_mean_var above, but reads the FLIP paper
+    baseline's own results tree instead of this campaign's own experiments/ tree -- see
+    modules/base_utils/show_results.py's compute_cta_pta_mean_var(..., use_flip=True,
+    poisoner_flag="1xs") for the path convention this mirrors."""
+    records = []
+
+    for budget in budgets:
+        cta_vals, pta_vals = [], []
+        for seed in seeds:
+            run_dir = _flip_run_dir(flip_root, model_flag, dataset, agg, seed, budget)
+            cta_path = run_dir / cta_file
+            pta_path = run_dir / pta_file
+            if not (cta_path.exists() and pta_path.exists()):
+                continue
+            cta_vals.append(get_final_value(cta_path))
+            pta_vals.append(get_final_value(pta_path))
+
+        records.append({
+            "dataset": dataset,
+            "branch": f"flip_{agg}",
+            "agg": agg,
+            "budget": budget,
+            "model": model_flag,
+            "cta_mean": np.mean(cta_vals) if cta_vals else np.nan,
+            "cta_var": np.var(cta_vals) if cta_vals else np.nan,
+            "pta_mean": np.mean(pta_vals) if pta_vals else np.nan,
+            "pta_var": np.var(pta_vals) if pta_vals else np.nan,
+        })
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_cta_pta_mean_var_flip_centralized(
+    flip_root, model_flag, dataset, budgets, seeds,
+    cta_file="caccs.npy", pta_file="paccs.npy",
+):
+    """Centralized counterpart of compute_cta_pta_mean_var_flip, reading _flip_centralized_run_dir
+    instead (FLIP's own 1xs-trigger results in the undefended single-victim setting)."""
+    records = []
+
+    for budget in budgets:
+        cta_vals, pta_vals = [], []
+        for seed in seeds:
+            run_dir = _flip_centralized_run_dir(flip_root, model_flag, dataset, seed, budget)
+            cta_path = run_dir / cta_file
+            pta_path = run_dir / pta_file
+            if not (cta_path.exists() and pta_path.exists()):
+                continue
+            cta_vals.append(get_final_value(cta_path))
+            pta_vals.append(get_final_value(pta_path))
+
+        records.append({
+            "dataset": dataset,
+            "branch": "flip_single_user",
+            "agg": None,
+            "budget": budget,
+            "model": model_flag,
+            "cta_mean": np.mean(cta_vals) if cta_vals else np.nan,
+            "cta_var": np.var(cta_vals) if cta_vals else np.nan,
+            "pta_mean": np.mean(pta_vals) if pta_vals else np.nan,
+            "pta_var": np.var(pta_vals) if pta_vals else np.nan,
+        })
+
+    return pd.DataFrame.from_records(records)
+
+
+def collect_dataset(
+    model_flag, dataset, tag, budgets=DEPLOY_BUDGETS, seeds=SEEDS, flip_root=None, exp_base=EXP_BASE,
+):
+    """{branch_key: DataFrame} for single_user + every federated aggregator, one dataset. When
+    flip_root is given, also adds a flip_{agg} entry per aggregator read from that FLIP baseline
+    results tree (missing files there just yield all-NaN rows, same fail-soft behavior as the
+    rest of this campaign's own data -- never crashes on a partial/absent cluster mount).
+    `exp_base` overrides where OUR (JOLT) own results are read from -- e.g. a cluster mount
+    mirroring the same {model_flag}/{dataset}/{tag}/seed{seed}/... subtree (see --jolt-root)."""
     all_data = {
         "single_user": compute_cta_pta_mean_var(
-            model_flag, dataset, tag, "single_user", budgets, seeds,
+            model_flag, dataset, tag, "single_user", budgets, seeds, exp_base=exp_base,
         ),
     }
+    if flip_root:
+        all_data["flip_single_user"] = compute_cta_pta_mean_var_flip_centralized(
+            flip_root, model_flag, dataset, budgets, seeds,
+        )
     for agg in DEPLOY_AGG_METHODS_FEDERATED:
         all_data[f"federated_{agg}"] = compute_cta_pta_mean_var(
-            model_flag, dataset, tag, "federated", budgets, seeds, agg=agg,
+            model_flag, dataset, tag, "federated", budgets, seeds, agg=agg, exp_base=exp_base,
         )
+        if flip_root:
+            all_data[f"flip_{agg}"] = compute_cta_pta_mean_var_flip(
+                flip_root, model_flag, dataset, agg, budgets, seeds,
+            )
     return all_data
 
 
@@ -259,6 +398,16 @@ def annotate_key_points(df, x, y, score, color):
     )
 
 
+def _branch_linestyle(branch_key):
+    """single_user is dashed, the FLIP baseline is dotted (so it reads as "the comparison
+    series" next to its same-colored federated_* solid line), everything else solid."""
+    if branch_key == "single_user":
+        return "--"
+    if branch_key.startswith("flip_"):
+        return ":"
+    return "-"
+
+
 def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=None):
     """One figure, one line per branch (single_user + each federated aggregator). Directly
     modeled on show_results.py's plot_cta_vs_pta (error bars = sqrt(var), best-budget point
@@ -285,7 +434,7 @@ def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=
         yerr = np.sqrt(df["cta_var"].values) * 100
 
         color = BRANCH_COLORS.get(branch_key)
-        linestyle = "--" if branch_key == "single_user" else "-"
+        linestyle = _branch_linestyle(branch_key)
 
         plt.plot(
             x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85,
@@ -336,57 +485,93 @@ def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=
     return True
 
 
+def _draw_tradeoff_series(df, color, linestyle, label=None):
+    """Draws one branch's CTA-vs-ASR curve (line + error bars + scatter + best-budget highlight
+    + annotation) onto the current figure. Returns False (nothing drawn) if df has no complete
+    (cta, pta) cell -- shared by plot_cta_vs_pta_per_branch's single_user and per-aggregator
+    (BRoADflip vs FLIP) cases below."""
+    # subset= is required: single_user's DataFrame has "agg"=None for every row (that branch has
+    # no aggregator), and a bare df.dropna() treats None as missing on ANY column -- silently
+    # dropping every row of that branch's df regardless of whether cta/pta actually have data.
+    df = df.dropna(subset=["cta_mean", "cta_var", "pta_mean", "pta_var"])
+    if df.empty:
+        return False
+
+    df = df.sort_values("budget")
+
+    x = df["pta_mean"].values * 100
+    y = df["cta_mean"].values * 100
+    xerr = np.sqrt(df["pta_var"].values) * 100
+    yerr = np.sqrt(df["cta_var"].values) * 100
+
+    plt.plot(x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85, label=label, zorder=3)
+    plt.errorbar(
+        x, y, xerr=xerr, yerr=yerr, fmt="none", ecolor=color,
+        elinewidth=1.2, capsize=3, alpha=0.35, zorder=1,
+    )
+    plt.scatter(x, y, s=45, color=color, edgecolors="none", zorder=4)
+
+    score = x  # ASR
+    max_score = np.nanmax(score)
+    candidates = np.where(np.isclose(score, max_score, atol=1e-12))[0]
+    budgets = df["budget"].values
+    idx_best = candidates[np.argmin(budgets[candidates])]
+
+    plt.scatter(
+        x[idx_best], y[idx_best], s=95, color=color,
+        edgecolor="black", linewidth=1.2, zorder=6,
+    )
+    annotate_key_points(df, x, y, score, color)
+    return True
+
+
 def plot_cta_vs_pta_per_branch(all_data, dataset, model_flag, tag, save_dir=None):
-    """One standalone figure PER branch (single_user + each federated aggregator), instead of
-    plot_cta_vs_pta's single overlaid figure -- meant to be grouped externally into a LaTeX
-    subfigure grid (one \\subfigure per aggregator, caption set by the caller), so no legend/
-    title is drawn here (redundant with that external caption). Same per-point styling as
-    plot_cta_vs_pta otherwise (error bars, best-budget point highlighted and annotated,
-    equal-aspect axes, dashed grid). Saved as f"{dataset}_{BRANCH_FILE_SUFFIX[branch]}.png".
-    Returns the list of paths actually written."""
+    """One standalone figure per aggregator (single_user + each federated aggregator), instead
+    of plot_cta_vs_pta's single overlaid figure -- meant to be grouped externally into a LaTeX
+    subfigure grid (one \\subfigure per aggregator, caption set by the caller). When a flip_{agg}
+    entry is present in all_data (the FLIP paper baseline, see compute_cta_pta_mean_var_flip), it
+    is overlaid on the SAME per-aggregator figure as a dotted same-colored curve, with a small
+    legend distinguishing the two so each plot doubles as a BRoADflip-vs-FLIP comparison; a lone
+    single_user figure keeps no legend/title (redundant with the external caption), same as
+    before. Saved as f"{dataset}_{BRANCH_FILE_SUFFIX[branch]}.png". Returns the list of paths
+    actually written."""
     saved = []
 
-    for branch_key, df in all_data.items():
-        # subset= is required: single_user's DataFrame has "agg"=None for every row (that
-        # branch has no aggregator), and a bare df.dropna() treats None as missing on ANY
-        # column -- silently dropping every row of that branch's df regardless of whether
-        # cta/pta actually have data.
-        df = df.dropna(subset=["cta_mean", "cta_var", "pta_mean", "pta_var"])
-        if df.empty:
+    # (own_key, flip_key, own_linestyle) pairs to overlay on one figure each -- single_user vs.
+    # FLIP's own centralized (1v0) result, then each federated aggregator vs. its FLIP
+    # counterpart. A legend is only drawn when both halves of a pair are actually present (a lone
+    # own_key keeps the original unlabeled, uncluttered single-curve look).
+    pairs = [("single_user", "flip_single_user", "--")]
+    pairs += [(f"federated_{agg}", f"flip_{agg}", "-") for agg in DEPLOY_AGG_METHODS_FEDERATED]
+
+    groups = {}
+    for own_key, flip_key, own_linestyle in pairs:
+        series = []
+        if own_key in all_data:
+            has_flip = flip_key in all_data
+            series.append((
+                all_data[own_key], BRANCH_COLORS[own_key], own_linestyle,
+                BRANCH_LABELS[own_key] if has_flip else None,
+            ))
+        if flip_key in all_data:
+            series.append((all_data[flip_key], BRANCH_COLORS[flip_key], ":", BRANCH_LABELS[flip_key]))
+        if series:
+            groups[own_key] = series
+
+    for branch_key, series in groups.items():
+        plt.figure(figsize=(7.5, 6))
+        any_drawn = False
+        has_legend = False
+        for df, color, linestyle, label in series:
+            drawn = _draw_tradeoff_series(df, color, linestyle, label=label)
+            any_drawn = any_drawn or drawn
+            has_legend = has_legend or (drawn and label is not None)
+
+        if not any_drawn:
+            plt.close()
             print(f"[WARNING] branch={branch_key!r} has no complete (cta,pta) cell yet for "
                   f"{model_flag}/{dataset}/tag={tag} -- skipping its plot.")
             continue
-
-        df = df.sort_values("budget")
-
-        x = df["pta_mean"].values * 100
-        y = df["cta_mean"].values * 100
-        xerr = np.sqrt(df["pta_var"].values) * 100
-        yerr = np.sqrt(df["cta_var"].values) * 100
-
-        color = BRANCH_COLORS.get(branch_key)
-        linestyle = "--" if branch_key == "single_user" else "-"
-
-        plt.figure(figsize=(7.5, 6))
-
-        plt.plot(x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85, zorder=3)
-        plt.errorbar(
-            x, y, xerr=xerr, yerr=yerr, fmt="none", ecolor=color,
-            elinewidth=1.2, capsize=3, alpha=0.35, zorder=1,
-        )
-        plt.scatter(x, y, s=45, color=color, edgecolors="none", zorder=4)
-
-        score = x  # ASR
-        max_score = np.nanmax(score)
-        candidates = np.where(np.isclose(score, max_score, atol=1e-12))[0]
-        budgets = df["budget"].values
-        idx_best = candidates[np.argmin(budgets[candidates])]
-
-        plt.scatter(
-            x[idx_best], y[idx_best], s=95, color=color,
-            edgecolor="black", linewidth=1.2, zorder=6,
-        )
-        annotate_key_points(df, x, y, score, color)
 
         plt.xlabel("ASR (%)")
         plt.ylabel("CTA (%)")
@@ -394,6 +579,8 @@ def plot_cta_vs_pta_per_branch(all_data, dataset, model_flag, tag, save_dir=None
         plt.ylim(0, 100)
         plt.gca().set_aspect("equal", adjustable="box")
         plt.grid(True, linestyle="--", alpha=0.25)
+        if has_legend:
+            plt.legend(frameon=True, fontsize=10, loc="lower left")
         plt.tight_layout()
 
         if save_dir:
@@ -428,7 +615,7 @@ def plot_metric_vs_budget(all_data, dataset, model_flag, tag, metric, ylabel, sa
         means = df[f"{metric}_mean"].values * 100
         stds = np.sqrt(df[f"{metric}_var"].values) * 100
         color = BRANCH_COLORS.get(branch_key)
-        linestyle = "--" if branch_key == "single_user" else "-"
+        linestyle = _branch_linestyle(branch_key)
 
         plt.plot(
             budgets, means, marker="o", linestyle=linestyle, color=color, alpha=0.85, markersize=5,
@@ -546,13 +733,15 @@ def build_table(blocks, budgets, series_labels, caption, label):
 
 def build_dataset_table(
     model_flag, dataset, tags, budgets=DEPLOY_BUDGETS, seeds=SEEDS, include_centralized=True,
+    exp_base=EXP_BASE,
 ):
     """One table for (model_flag, dataset): one \\multicolumn block per `tags` entry that has
     ANY data on disk (missing tags -- not yet trained -- are silently skipped, never crash).
     Columns are the federated_3vs7 robust-aggregation rules (TABLE_AGG_ORDER), plus -- when
     include_centralized -- a leading CENTRALIZED column read off the single_user branch instead
     (the undefended 1-victim/no-aggregation deployment of the SAME attack, directly comparable
-    at fixed budget/seed since it's the same generated trigger)."""
+    at fixed budget/seed since it's the same generated trigger). `exp_base` overrides where OUR
+    (JOLT) own results are read from, same as collect_dataset (see --jolt-root)."""
     columns = TABLE_COLUMNS_WITH_CENTRALIZED if include_centralized else TABLE_AGG_ORDER
 
     blocks = {}
@@ -561,9 +750,13 @@ def build_dataset_table(
         any_cell = False
         for series in columns:
             if series == CENTRALIZED_SERIES:
-                df = compute_cta_pta_mean_var(model_flag, dataset, tag, "single_user", budgets, seeds)
+                df = compute_cta_pta_mean_var(
+                    model_flag, dataset, tag, "single_user", budgets, seeds, exp_base=exp_base,
+                )
             else:
-                df = compute_cta_pta_mean_var(model_flag, dataset, tag, "federated", budgets, seeds, agg=series)
+                df = compute_cta_pta_mean_var(
+                    model_flag, dataset, tag, "federated", budgets, seeds, agg=series, exp_base=exp_base,
+                )
             for _, row in df.iterrows():
                 if not np.isnan(row["cta_mean"]):
                     any_cell = True
@@ -644,16 +837,17 @@ def save_trigger_visual_in(module_dir, model_flag, dataset, label, sample_seed=0
     return out_path
 
 
-def save_all_trigger_visuals(model_flags, datasets, tags, seeds):
+def save_all_trigger_visuals(model_flags, datasets, tags, seeds, exp_base=EXP_BASE):
     """paper_main_campaign wrapper: builds each cell's module_dir via that generator's own
-    cell_name/EXP_BASE, one trigger per (model_flag, dataset, tag, seed)."""
+    cell_name/exp_base (defaults to the imported EXP_BASE, overridable -- see --jolt-root), one
+    trigger per (model_flag, dataset, tag, seed)."""
     saved, missing = [], []
     for model_flag in model_flags:
         for dataset in datasets:
             for tag in tags:
                 for seed in seeds:
                     module_dir = (
-                        EXP_BASE / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint"
+                        exp_base / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint"
                     )
                     out_path = save_trigger_visual_in(
                         module_dir, model_flag, dataset, label=f"{tag}, seed{seed}",
@@ -666,7 +860,7 @@ def save_all_trigger_visuals(model_flags, datasets, tags, seeds):
     if missing:
         print(f"[INFO] {len(missing)} trigger(s) not found yet (skipped):")
         for model_flag, dataset, tag, seed in missing:
-            module_dir = EXP_BASE / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint"
+            module_dir = exp_base / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint"
             print(f"  {trigger_path_in(module_dir, model_flag, dataset)}")
 
     return saved
@@ -689,6 +883,23 @@ def main():
     parser.add_argument("--csv-dir", default="./results_csv_paper_main_campaign_user")
     parser.add_argument("--table-dir", default="./tables_paper_main_campaign_user")
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    parser.add_argument(
+        "--flip-root", default="out_neurips",
+        help="root of the FLIP paper baseline's results tree (out_neurips/{model}/"
+             "{tag_suffix}_FLIP/{dataset}/backdoor/{agg}/1xs/{seed}/{budget}/{caccs,paccs}.npy), "
+             "overlaid per-aggregator as a comparison series on the per-branch trade-off plots; "
+             "pass an empty string to disable",
+    )
+    parser.add_argument(
+        "--jolt-root", default=None,
+        help="override where OUR (JOLT) own results are read from, in place of the imported "
+             "EXP_BASE ('experiments/federated_experiments/"
+             "threat_model_direct_trigger_joint_paper_main_campaign') -- e.g. a cluster mount "
+             "mirroring that same {model_flag}/{dataset}/{tag}/seed{seed}/... subtree under a "
+             "different root, to avoid local<->cluster file transfers "
+             "(e.g. /shared/data1/Projects/DLWP/j1067582/martin/FLIP/out_iclr). "
+             "Default: use EXP_BASE unchanged.",
+    )
     parser.add_argument("--skip-trigger-visuals", action="store_true")
     parser.add_argument(
         "--no-centralized-column", action="store_true",
@@ -698,6 +909,7 @@ def main():
     args = parser.parse_args()
 
     table_tags = args.table_tags or [args.tag]
+    exp_base = Path(args.jolt_root) if args.jolt_root else EXP_BASE
 
     out_root = Path(args.out_dir) / f"{args.model}_{args.tag}"
     csv_root = Path(args.csv_dir) / f"{args.model}_{args.tag}"
@@ -706,11 +918,14 @@ def main():
 
     if not args.skip_trigger_visuals:
         print(f"\n=== [paper_main_campaign] Trigger visuals ({args.model}, tags={table_tags}) ===")
-        save_all_trigger_visuals([args.model], args.datasets, table_tags, args.seeds)
+        save_all_trigger_visuals([args.model], args.datasets, table_tags, args.seeds, exp_base=exp_base)
 
     for dataset in args.datasets:
         print(f"\n=== [paper_main_campaign/user] {args.model} / {dataset} / tag={args.tag} ===")
-        all_data = collect_dataset(args.model, dataset, args.tag, seeds=args.seeds)
+        all_data = collect_dataset(
+            args.model, dataset, args.tag, seeds=args.seeds, flip_root=args.flip_root or None,
+            exp_base=exp_base,
+        )
 
         csv_dir = csv_root / dataset
         csv_dir.mkdir(parents=True, exist_ok=True)
@@ -746,12 +961,12 @@ def main():
         )
 
         if not (ok_tradeoff or ok_cta or ok_asr):
-            print(f"[WARNING] no data found under {EXP_BASE / cell_name(args.model, dataset, args.tag, '*')} -- "
+            print(f"[WARNING] no data found under {exp_base / cell_name(args.model, dataset, args.tag, '*')} -- "
                   f"nothing plotted for {dataset}.")
 
         table = build_dataset_table(
             args.model, dataset, table_tags, seeds=args.seeds,
-            include_centralized=not args.no_centralized_column,
+            include_centralized=not args.no_centralized_column, exp_base=exp_base,
         )
         if table is None:
             print(f"[WARNING] no data found for table blocks {table_tags} -- nothing written for {dataset}.")
