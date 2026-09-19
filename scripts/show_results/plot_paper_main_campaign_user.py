@@ -155,10 +155,15 @@ TABLE_AGG_DISPLAY = {
 # STEALTH_GRID docstring for what each tag means ("baseline" = the plain optimized joint
 # trigger, reference config with no extra stealth regularization).
 TAG_DISPLAY_NAMES = {
-    "baseline": "Optimized Trigger -- \\broad{}",
-    "eps_0p50_lpips_0p1": "Optimized Trigger (eps=0.5, LPIPS=0.1) -- \\broad{}",
-    "eps_16_255": "Optimized Trigger (eps=16/255) -- \\broad{}",
+    "baseline": "Optimized Trigger -- \\jolt{}",
+    "eps_0p50_lpips_0p1": "Optimized Trigger (eps=0.5, LPIPS=0.1) -- \\jolt{}",
+    "eps_16_255": "Optimized Trigger (eps=16/255) -- \\jolt{}",
 }
+
+# Block name for the FLIP comparison rows appended below the \jolt{} tag block(s) in
+# build_dataset_table -- FLIP has no stealth-regularized variants, so it gets exactly one block
+# (its own fixed 1xs sinusoidal trigger), regardless of how many `tags` are requested.
+FLIP_BLOCK_NAME = f"Sinusoidal Trigger -- {FLIP_LABEL}"
 
 DATASET_DISPLAY = {"cifar": "CIFAR-10", "svhn": "SVHN"}
 MODEL_DISPLAY = {"r32p": "ResNet-32", "convnext_micro": "ConvNeXt-Micro"}
@@ -735,7 +740,7 @@ def build_table(blocks, budgets, series_labels, caption, label):
 
 def build_dataset_table(
     model_flag, dataset, tags, budgets=DEPLOY_BUDGETS, seeds=SEEDS, include_centralized=True,
-    exp_base=EXP_BASE,
+    exp_base=EXP_BASE, flip_root=None,
 ):
     """One table for (model_flag, dataset): one \\multicolumn block per `tags` entry that has
     ANY data on disk (missing tags -- not yet trained -- are silently skipped, never crash).
@@ -743,7 +748,10 @@ def build_dataset_table(
     include_centralized -- a leading CENTRALIZED column read off the single_user branch instead
     (the undefended 1-victim/no-aggregation deployment of the SAME attack, directly comparable
     at fixed budget/seed since it's the same generated trigger). `exp_base` overrides where OUR
-    (JOLT) own results are read from, same as collect_dataset (see --jolt-root)."""
+    (JOLT) own results are read from, same as collect_dataset (see --jolt-root). When `flip_root`
+    is given, one extra FLIP_BLOCK_NAME block is appended below the \\jolt{} tag block(s), read
+    from that FLIP baseline results tree (same compute_cta_pta_mean_var_flip/_centralized as the
+    plots use), so the table reads JOLT-then-FLIP for direct comparison."""
     columns = TABLE_COLUMNS_WITH_CENTRALIZED if include_centralized else TABLE_AGG_ORDER
 
     blocks = {}
@@ -769,6 +777,25 @@ def build_dataset_table(
             blocks[TAG_DISPLAY_NAMES.get(tag, tag)] = block
         else:
             print(f"[INFO] tag={tag!r} has no data yet for {model_flag}/{dataset} -- skipped in table.")
+
+    if flip_root:
+        flip_block = {}
+        any_flip_cell = False
+        for series in columns:
+            if series == CENTRALIZED_SERIES:
+                df = compute_cta_pta_mean_var_flip_centralized(flip_root, model_flag, dataset, budgets, seeds)
+            else:
+                df = compute_cta_pta_mean_var_flip(flip_root, model_flag, dataset, series, budgets, seeds)
+            for _, row in df.iterrows():
+                if not np.isnan(row["cta_mean"]):
+                    any_flip_cell = True
+                flip_block[(row["budget"], series)] = (
+                    row["cta_mean"], row["cta_var"], row["pta_mean"], row["pta_var"],
+                )
+        if any_flip_cell:
+            blocks[FLIP_BLOCK_NAME] = flip_block
+        else:
+            print(f"[INFO] FLIP baseline has no data yet for {model_flag}/{dataset} -- skipped in table.")
 
     if not blocks:
         return None
@@ -969,6 +996,7 @@ def main():
         table = build_dataset_table(
             args.model, dataset, table_tags, seeds=args.seeds,
             include_centralized=not args.no_centralized_column, exp_base=exp_base,
+            flip_root=args.flip_root or None,
         )
         if table is None:
             print(f"[WARNING] no data found for table blocks {table_tags} -- nothing written for {dataset}.")
