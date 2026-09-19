@@ -92,13 +92,15 @@ BRANCH_COLORS = {
 # paper's own baseline).
 JOLT_LABEL = "JOLT"
 
+# Legend text is just the algorithm name (JOLT/FLIP) -- no aggregator/setting info, that's left
+# to the caption in LaTeX.
 BRANCH_LABELS = {
-    "single_user": f"{JOLT_LABEL} (Centralized, {DEPLOY_SINGLE_USER_AGG_METHOD})",
-    "federated_mean": f"{JOLT_LABEL} (mean)",
-    "federated_median": f"{JOLT_LABEL} (median)",
-    "federated_krum": f"{JOLT_LABEL} (krum)",
-    "federated_trmean": f"{JOLT_LABEL} (trmean)",
-    "federated_multikrum": f"{JOLT_LABEL} (multikrum)",
+    "single_user": JOLT_LABEL,
+    "federated_mean": JOLT_LABEL,
+    "federated_median": JOLT_LABEL,
+    "federated_krum": JOLT_LABEL,
+    "federated_trmean": JOLT_LABEL,
+    "federated_multikrum": JOLT_LABEL,
 }
 
 # Filename suffix per branch for the per-config trade-off plots (plot_cta_vs_pta_per_branch) --
@@ -128,11 +130,11 @@ FLIP_ATTACK = "backdoor"
 FLIP_POISONER_FLAG = "1xs"
 for _agg in DEPLOY_AGG_METHODS_FEDERATED:
     BRANCH_COLORS[f"flip_{_agg}"] = BRANCH_COLORS[f"federated_{_agg}"]
-    BRANCH_LABELS[f"flip_{_agg}"] = f"{FLIP_LABEL} ({_agg})"
+    BRANCH_LABELS[f"flip_{_agg}"] = FLIP_LABEL
     BRANCH_FILE_SUFFIX[f"flip_{_agg}"] = f"federated_{_agg}"
 
 BRANCH_COLORS["flip_single_user"] = BRANCH_COLORS["single_user"]
-BRANCH_LABELS["flip_single_user"] = f"{FLIP_LABEL} (Centralized, {FLIP_POISONER_FLAG})"
+BRANCH_LABELS["flip_single_user"] = FLIP_LABEL
 BRANCH_FILE_SUFFIX["flip_single_user"] = BRANCH_FILE_SUFFIX["single_user"]
 
 # Column order/labels for the LaTeX table -- matches the paper's own header (MEAN, CW-MEDIAN,
