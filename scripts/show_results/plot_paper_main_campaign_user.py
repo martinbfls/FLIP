@@ -25,8 +25,8 @@ wherever that generator actually wrote its configs.
 
 Usage:
   python scripts/show_results/plot_paper_main_campaign_user.py
-  python scripts/show_results/plot_paper_main_campaign_user.py --model r32p --tag baseline \
-      --datasets cifar svhn
+  python scripts/show_results/plot_paper_main_campaign_user.py --model r32p \
+      --tags baseline eps_16_255 --datasets cifar svhn
 """
 
 import argparse
@@ -167,6 +167,46 @@ FLIP_BLOCK_NAME = f"Sinusoidal Trigger -- {FLIP_LABEL}"
 
 DATASET_DISPLAY = {"cifar": "CIFAR-10", "svhn": "SVHN"}
 MODEL_DISPLAY = {"r32p": "ResNet-32", "convnext_micro": "ConvNeXt-Micro"}
+
+# =========================
+# Multi-tag overlay style -- used by plot_cta_vs_pta_per_branch, which now overlays every
+# requested JOLT `tag` (e.g. baseline, eps_16_255) PLUS the FLIP baseline on the SAME
+# per-aggregator figure. Within one figure, color still encodes the aggregator (BRANCH_COLORS,
+# unchanged), while linestyle+marker encode the *series* (which tag, or FLIP) -- this keeps the
+# per-aggregator file grouping intact while making the tag comparison legible in the legend.
+TAG_SHORT_DISPLAY = {
+    "baseline": f"{JOLT_LABEL} (Optimized)",
+    "eps_16_255": f"{JOLT_LABEL} ($\\epsilon$=16/255)",
+    "eps_0p50_lpips_0p1": f"{JOLT_LABEL} ($\\epsilon$=0.5, LPIPS=0.1)",
+}
+TAG_LINESTYLES = {
+    "baseline": "-",
+    "eps_16_255": "--",
+    "eps_0p50_lpips_0p1": "-.",
+}
+TAG_MARKERS = {
+    "baseline": "o",
+    "eps_16_255": "s",
+    "eps_0p50_lpips_0p1": "^",
+}
+# Fallback cycles for any tag not listed above, so a new/unknown tag still renders distinctly
+# instead of crashing or silently colliding with an existing one.
+_FALLBACK_LINESTYLES = ["-", "--", "-."]
+_FALLBACK_MARKERS = ["o", "s", "^", "D", "v"]
+FLIP_LINESTYLE = ":"
+FLIP_MARKER = "D"  # filled diamond -- 'x' has no fill, so it can't take the best-point black edge
+
+
+def _tag_short_display(tag):
+    return TAG_SHORT_DISPLAY.get(tag, f"{JOLT_LABEL} ({tag})")
+
+
+def _tag_linestyle(tag, idx=0):
+    return TAG_LINESTYLES.get(tag, _FALLBACK_LINESTYLES[idx % len(_FALLBACK_LINESTYLES)])
+
+
+def _tag_marker(tag, idx=0):
+    return TAG_MARKERS.get(tag, _FALLBACK_MARKERS[idx % len(_FALLBACK_MARKERS)])
 
 
 # =========================
@@ -371,6 +411,23 @@ def collect_dataset(
     return all_data
 
 
+def collect_flip_data(flip_root, model_flag, dataset, budgets=DEPLOY_BUDGETS, seeds=SEEDS):
+    """{branch_key: DataFrame} for the FLIP baseline only (flip_single_user + flip_{agg} per
+    federated aggregator) -- the tag-independent counterpart of collect_dataset's own results,
+    split out so it's fetched once per dataset and then overlaid on every requested JOLT tag's
+    figure in plot_cta_vs_pta_per_branch instead of being re-read per tag."""
+    all_data = {
+        "flip_single_user": compute_cta_pta_mean_var_flip_centralized(
+            flip_root, model_flag, dataset, budgets, seeds,
+        ),
+    }
+    for agg in DEPLOY_AGG_METHODS_FEDERATED:
+        all_data[f"flip_{agg}"] = compute_cta_pta_mean_var_flip(
+            flip_root, model_flag, dataset, agg, budgets, seeds,
+        )
+    return all_data
+
+
 # =========================
 # PLOT -- annotate_key_points / plot_cta_vs_pta ported verbatim from show_results.py, just with
 # BRANCH_COLORS/BRANCH_LABELS in place of AGG_COLORS/agg_method.
@@ -492,11 +549,13 @@ def plot_cta_vs_pta(all_data, dataset, model_flag, tag, save_dir=None, filename=
     return True
 
 
-def _draw_tradeoff_series(df, color, linestyle, label=None):
+def _draw_tradeoff_series(df, color, linestyle, label=None, marker="o"):
     """Draws one branch's CTA-vs-ASR curve (line + error bars + scatter + best-budget highlight
     + annotation) onto the current figure. Returns False (nothing drawn) if df has no complete
     (cta, pta) cell -- shared by plot_cta_vs_pta_per_branch's single_user and per-aggregator
-    (BRoADflip vs FLIP) cases below."""
+    (JOLT-per-tag vs FLIP) cases below. `marker` distinguishes overlaid series that share the
+    same `color` (e.g. two JOLT tags on the same aggregator) -- linestyle alone can be hard to
+    tell apart once error bars and best-point highlights are layered on top."""
     # subset= is required: single_user's DataFrame has "agg"=None for every row (that branch has
     # no aggregator), and a bare df.dropna() treats None as missing on ANY column -- silently
     # dropping every row of that branch's df regardless of whether cta/pta actually have data.
@@ -511,12 +570,14 @@ def _draw_tradeoff_series(df, color, linestyle, label=None):
     xerr = np.sqrt(df["pta_var"].values) * 100
     yerr = np.sqrt(df["cta_var"].values) * 100
 
-    plt.plot(x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85, label=label, zorder=3)
+    plt.plot(
+        x, y, linestyle=linestyle, linewidth=2.2, color=color, alpha=0.85, label=label,
+        marker=marker, markersize=5, markerfacecolor=color, markeredgecolor="none", zorder=3,
+    )
     plt.errorbar(
         x, y, xerr=xerr, yerr=yerr, fmt="none", ecolor=color,
         elinewidth=1.2, capsize=3, alpha=0.35, zorder=1,
     )
-    plt.scatter(x, y, s=45, color=color, edgecolors="none", zorder=4)
 
     score = x  # ASR
     max_score = np.nanmax(score)
@@ -525,59 +586,64 @@ def _draw_tradeoff_series(df, color, linestyle, label=None):
     idx_best = candidates[np.argmin(budgets[candidates])]
 
     plt.scatter(
-        x[idx_best], y[idx_best], s=95, color=color,
+        x[idx_best], y[idx_best], s=110, marker=marker, color=color,
         edgecolor="black", linewidth=1.2, zorder=6,
     )
     annotate_key_points(df, x, y, score, color)
     return True
 
 
-def plot_cta_vs_pta_per_branch(all_data, dataset, model_flag, tag, save_dir=None):
-    """One standalone figure per aggregator (single_user + each federated aggregator), instead
-    of plot_cta_vs_pta's single overlaid figure -- meant to be grouped externally into a LaTeX
-    subfigure grid (one \\subfigure per aggregator, caption set by the caller). When a flip_{agg}
-    entry is present in all_data (the FLIP paper baseline, see compute_cta_pta_mean_var_flip), it
-    is overlaid on the SAME per-aggregator figure as a dotted same-colored curve, with a small
-    legend distinguishing the two so each plot doubles as a BRoADflip-vs-FLIP comparison; a lone
-    single_user figure keeps no legend/title (redundant with the external caption), same as
-    before. Saved as f"{dataset}_{BRANCH_FILE_SUFFIX[branch]}.png". Returns the list of paths
-    actually written."""
+def plot_cta_vs_pta_per_branch(tag_data, flip_data, dataset, model_flag, tags, save_dir=None):
+    """One standalone figure per aggregator (single_user + each federated aggregator), meant to
+    be grouped externally into a LaTeX subfigure grid (one \\subfigure per aggregator, caption
+    set by the caller). Unlike the single-tag version this replaces, each figure now overlays
+    EVERY requested JOLT `tags` entry (e.g. baseline, eps_16_255) plus the FLIP baseline (from
+    `flip_data`, see compute_cta_pta_mean_var_flip/_centralized) on the SAME axes, so a reader
+    can compare stealth variants against each other and against FLIP at a glance:
+      - color: which aggregator (BRANCH_COLORS -- unchanged across tags, since it's the same
+        deployment setting).
+      - linestyle + marker: which series (JOLT tag, or FLIP) -- see TAG_LINESTYLES/TAG_MARKERS.
+    `tag_data` is {tag: {branch_key: df}} (one entry per requested tag, own results only) and
+    `flip_data` is {branch_key: df} (FLIP baseline, tag-independent). Saved as
+    f"{dataset}_{BRANCH_FILE_SUFFIX[branch]}.png". Returns the list of paths actually written."""
     saved = []
 
-    # (own_key, flip_key, own_linestyle) pairs to overlay on one figure each -- single_user vs.
-    # FLIP's own centralized (1v0) result, then each federated aggregator vs. its FLIP
-    # counterpart. A legend is only drawn when both halves of a pair are actually present (a lone
-    # own_key keeps the original unlabeled, uncluttered single-curve look).
-    pairs = [("single_user", "flip_single_user", "--")]
-    pairs += [(f"federated_{agg}", f"flip_{agg}", "-") for agg in DEPLOY_AGG_METHODS_FEDERATED]
+    branch_keys = ["single_user"] + [f"federated_{agg}" for agg in DEPLOY_AGG_METHODS_FEDERATED]
+    flip_key_for_branch = {
+        "single_user": "flip_single_user",
+        **{f"federated_{agg}": f"flip_{agg}" for agg in DEPLOY_AGG_METHODS_FEDERATED},
+    }
+    agg_suffix_for_branch = {"single_user": CENTRALIZED_SERIES}
+    agg_suffix_for_branch.update({f"federated_{agg}": agg for agg in DEPLOY_AGG_METHODS_FEDERATED})
 
-    groups = {}
-    for own_key, flip_key, own_linestyle in pairs:
+    for branch_key in branch_keys:
+        color = BRANCH_COLORS[branch_key]
         series = []
-        if own_key in all_data:
-            has_flip = flip_key in all_data
+        for tag_idx, tag in enumerate(tags):
+            df = tag_data.get(tag, {}).get(branch_key)
+            if df is None:
+                continue
             series.append((
-                all_data[own_key], BRANCH_COLORS[own_key], own_linestyle,
-                BRANCH_LABELS[own_key] if has_flip else None,
+                df, color, _tag_linestyle(tag, tag_idx), _tag_short_display(tag), _tag_marker(tag, tag_idx),
             ))
-        if flip_key in all_data:
-            series.append((all_data[flip_key], BRANCH_COLORS[flip_key], ":", BRANCH_LABELS[flip_key]))
-        if series:
-            groups[own_key] = series
 
-    for branch_key, series in groups.items():
+        flip_key = flip_key_for_branch[branch_key]
+        flip_df = flip_data.get(flip_key)
+        if flip_df is not None:
+            series.append((flip_df, color, FLIP_LINESTYLE, FLIP_LABEL, FLIP_MARKER))
+
         plt.figure(figsize=(7.5, 6))
         any_drawn = False
-        has_legend = False
-        for df, color, linestyle, label in series:
-            drawn = _draw_tradeoff_series(df, color, linestyle, label=label)
+        n_labeled = 0
+        for df, series_color, linestyle, label, marker in series:
+            drawn = _draw_tradeoff_series(df, series_color, linestyle, label=label, marker=marker)
             any_drawn = any_drawn or drawn
-            has_legend = has_legend or (drawn and label is not None)
+            n_labeled += int(drawn)
 
         if not any_drawn:
             plt.close()
             print(f"[WARNING] branch={branch_key!r} has no complete (cta,pta) cell yet for "
-                  f"{model_flag}/{dataset}/tag={tag} -- skipping its plot.")
+                  f"{model_flag}/{dataset}/tags={tags} -- skipping its plot.")
             continue
 
         plt.xlabel("ASR (%)")
@@ -586,8 +652,13 @@ def plot_cta_vs_pta_per_branch(all_data, dataset, model_flag, tag, save_dir=None
         plt.ylim(0, 100)
         plt.gca().set_aspect("equal", adjustable="box")
         plt.grid(True, linestyle="--", alpha=0.25)
-        if has_legend:
+        # A legend is only useful once >1 series is actually drawn on this figure -- always true
+        # now that every plot overlays multiple tags/FLIP, but kept conditional so a
+        # partially-trained campaign (only one tag with data yet) still renders cleanly.
+        if n_labeled > 1:
             plt.legend(frameon=True, fontsize=10, loc="lower left")
+        agg_display = TABLE_AGG_DISPLAY.get(agg_suffix_for_branch[branch_key], branch_key)
+        plt.title(f"{MODEL_DISPLAY.get(model_flag, model_flag)} / {DATASET_DISPLAY.get(dataset, dataset)} -- {agg_display}")
         plt.tight_layout()
 
         if save_dir:
@@ -901,11 +972,17 @@ def save_all_trigger_visuals(model_flags, datasets, tags, seeds, exp_base=EXP_BA
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="r32p")
-    parser.add_argument("--tag", default="baseline", help="single tag to plot per-dataset curves for")
+    parser.add_argument(
+        "--tags", nargs="+", default=["baseline", "eps_16_255"],
+        help="JOLT tags to compare, in order. Each is overlaid on every per-aggregator "
+             "trade-off plot (see plot_cta_vs_pta_per_branch) AND gets its own block in the "
+             "LaTeX table, alongside the FLIP baseline (default: baseline eps_16_255; e.g. pass "
+             "--tags baseline eps_16_255 eps_0p50_lpips_0p1 to add the stealth-regularized tag "
+             "too, once it has finished training).",
+    )
     parser.add_argument(
         "--table-tags", nargs="+", default=None,
-        help="tags to include as table blocks, in order (default: just --tag; add more once "
-             "trained, e.g. --table-tags baseline eps_16_255 eps_0p50_lpips_0p1)",
+        help="tags to include as table blocks, in order (default: same as --tags)",
     )
     parser.add_argument("--datasets", nargs="+", default=DATASETS)
     parser.add_argument("--out-dir", default="./plots_paper_main_campaign_user")
@@ -937,11 +1014,12 @@ def main():
     )
     args = parser.parse_args()
 
-    table_tags = args.table_tags or [args.tag]
+    table_tags = args.table_tags or args.tags
     exp_base = Path(args.jolt_root) if args.jolt_root else EXP_BASE
 
-    out_root = Path(args.out_dir) / f"{args.model}_{args.tag}"
-    csv_root = Path(args.csv_dir) / f"{args.model}_{args.tag}"
+    tags_suffix = "-".join(args.tags)
+    out_root = Path(args.out_dir) / f"{args.model}_{tags_suffix}"
+    csv_root = Path(args.csv_dir) / f"{args.model}_{tags_suffix}"
     table_root = Path(args.table_dir)
     table_root.mkdir(parents=True, exist_ok=True)
 
@@ -950,47 +1028,69 @@ def main():
         save_all_trigger_visuals([args.model], args.datasets, table_tags, args.seeds, exp_base=exp_base)
 
     for dataset in args.datasets:
-        print(f"\n=== [paper_main_campaign/user] {args.model} / {dataset} / tag={args.tag} ===")
-        all_data = collect_dataset(
-            args.model, dataset, args.tag, seeds=args.seeds, flip_root=args.flip_root or None,
-            exp_base=exp_base,
+        print(f"\n=== [paper_main_campaign/user] {args.model} / {dataset} / tags={args.tags} ===")
+
+        # One JOLT results collection per requested tag (baseline, eps_16_255, ...) -- own
+        # results only, no FLIP branches mixed in (see collect_flip_data below for that, fetched
+        # once and shared across every tag's plot/table/CSV).
+        tag_data = {}
+        for tag in args.tags:
+            tag_data[tag] = collect_dataset(
+                args.model, dataset, tag, seeds=args.seeds, flip_root=None, exp_base=exp_base,
+            )
+        flip_data = (
+            collect_flip_data(args.flip_root, args.model, dataset, seeds=args.seeds)
+            if args.flip_root else {}
         )
 
         csv_dir = csv_root / dataset
         csv_dir.mkdir(parents=True, exist_ok=True)
-        for branch_key, df in all_data.items():
+        for tag, all_data in tag_data.items():
+            for branch_key, df in all_data.items():
+                n_cta = df["cta_mean"].notna().sum()
+                n_asr = df["pta_mean"].notna().sum()
+                print(f"   -> tag={tag:16s} {branch_key:24s} budgets with data: "
+                      f"cta={n_cta}/{len(DEPLOY_BUDGETS)} asr={n_asr}/{len(DEPLOY_BUDGETS)}")
+                df.to_csv(csv_dir / f"{tag}__{branch_key}.csv", index=False)
+        for branch_key, df in flip_data.items():
             n_cta = df["cta_mean"].notna().sum()
             n_asr = df["pta_mean"].notna().sum()
-            print(f"   -> {branch_key:24s} budgets with data: cta={n_cta}/{len(DEPLOY_BUDGETS)} asr={n_asr}/{len(DEPLOY_BUDGETS)}")
-            df.to_csv(csv_dir / f"{branch_key}.csv", index=False)
-
-        save_dir = str(out_root / dataset)
+            print(f"   -> tag={'flip':16s} {branch_key:24s} budgets with data: "
+                  f"cta={n_cta}/{len(DEPLOY_BUDGETS)} asr={n_asr}/{len(DEPLOY_BUDGETS)}")
+            df.to_csv(csv_dir / f"flip__{branch_key}.csv", index=False)
 
         # Per-branch trade-off plots -- one file per config (cifar_mean.png, cifar_krum.png,
-        # ..., cifar_centralized.png), saved under out_root (which already keys on
-        # {model}_{tag} -- see above) / {dataset}_{federated_tag_suffix}, so results from a
-        # DIFFERENT tag never collide/overwrite these files (each tag gets its own
-        # {model}_{tag}/ subtree). Matches the img_neurips/ subfigure-grid convention (e.g.
-        # img_neurips/r32p_cifar_3vs7/cifar_mean.png) one level deeper -- group them into a
-        # LaTeX subfigure grid by hand from there.
+        # ..., cifar_centralized.png), each overlaying every tag in args.tags plus FLIP (see
+        # plot_cta_vs_pta_per_branch). Saved under out_root (which already keys on
+        # {model}_{tags_suffix} -- see above) / {dataset}_{federated_tag_suffix}, so a DIFFERENT
+        # set of --tags never collides/overwrites these files. Matches the img_neurips/
+        # subfigure-grid convention (e.g. img_neurips/r32p_cifar_3vs7/cifar_mean.png) one level
+        # deeper -- group them into a LaTeX subfigure grid by hand from there.
         tag_suffix = FEDERATED_TAG.split("_", 1)[-1]  # "federated_3vs7" -> "3vs7"
         per_branch_dir = str(out_root / f"{dataset}_{tag_suffix}")
         saved_per_branch = plot_cta_vs_pta_per_branch(
-            all_data, dataset, args.model, args.tag, save_dir=per_branch_dir,
+            tag_data, flip_data, dataset, args.model, args.tags, save_dir=per_branch_dir,
         )
         ok_tradeoff = bool(saved_per_branch)
 
+        # CTA/ASR-vs-budget overlay plots (all aggregators on one figure) only support a single
+        # tag at a time -- kept on the FIRST requested tag (args.tags[0]) merged with FLIP, same
+        # visual style as before. The per-aggregator trade-off plots above are where every tag is
+        # compared side by side.
+        primary_tag = args.tags[0]
+        primary_data = {**tag_data[primary_tag], **flip_data}
+        save_dir = str(out_root / dataset)
         ok_cta = plot_metric_vs_budget(
-            all_data, dataset, args.model, args.tag,
+            primary_data, dataset, args.model, primary_tag,
             metric="cta", ylabel="CTA (%)", save_dir=save_dir,
         )
         ok_asr = plot_metric_vs_budget(
-            all_data, dataset, args.model, args.tag,
+            primary_data, dataset, args.model, primary_tag,
             metric="pta", ylabel="ASR (%)", save_dir=save_dir,
         )
 
         if not (ok_tradeoff or ok_cta or ok_asr):
-            print(f"[WARNING] no data found under {exp_base / cell_name(args.model, dataset, args.tag, '*')} -- "
+            print(f"[WARNING] no data found under {exp_base / cell_name(args.model, dataset, primary_tag, '*')} -- "
                   f"nothing plotted for {dataset}.")
 
         table = build_dataset_table(
