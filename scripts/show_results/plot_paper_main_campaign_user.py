@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from torchvision import transforms
 
 # This file lives at FLIP/scripts/show_results/ -- same sys.path fix as show_results.py, needed
@@ -171,9 +172,12 @@ MODEL_DISPLAY = {"r32p": "ResNet-32", "convnext_micro": "ConvNeXt-Micro"}
 # =========================
 # Multi-tag overlay style -- used by plot_cta_vs_pta_per_branch, which now overlays every
 # requested JOLT `tag` (e.g. baseline, eps_16_255) PLUS the FLIP baseline on the SAME
-# per-aggregator figure. Within one figure, color still encodes the aggregator (BRANCH_COLORS,
-# unchanged), while linestyle+marker encode the *series* (which tag, or FLIP) -- this keeps the
-# per-aggregator file grouping intact while making the tag comparison legible in the legend.
+# per-aggregator figure. Each figure's BASE hue still comes from BRANCH_COLORS (aggregator
+# identity stays consistent across figures -- MEAN is always blue-ish, KRUM always green-ish,
+# etc.), but every series drawn on it gets its own SHADE of that hue via _tag_color/_flip_color
+# below, on top of linestyle+marker. Plain same-color overlapping curves were unreadable once
+# two JOLT tags' trade-off curves sat close together -- shading fixes that while the hue itself
+# still says "this is the MEAN plot" at a glance.
 TAG_SHORT_DISPLAY = {
     "baseline": f"{JOLT_LABEL} (Optimized)",
     "eps_16_255": f"{JOLT_LABEL} ($\\epsilon$=16/255)",
@@ -207,6 +211,41 @@ def _tag_linestyle(tag, idx=0):
 
 def _tag_marker(tag, idx=0):
     return TAG_MARKERS.get(tag, _FALLBACK_MARKERS[idx % len(_FALLBACK_MARKERS)])
+
+
+def _lighten(color, amount):
+    """Blend `color` toward white by `amount` in [0, 1] (0 = unchanged, 1 = white)."""
+    r, g, b = mcolors.to_rgb(color)
+    return (r + (1 - r) * amount, g + (1 - g) * amount, b + (1 - b) * amount)
+
+
+def _darken(color, amount):
+    """Blend `color` toward black by `amount` in [0, 1] (0 = unchanged, 1 = black)."""
+    r, g, b = mcolors.to_rgb(color)
+    return (r * (1 - amount), g * (1 - amount), b * (1 - amount))
+
+
+def _tag_color(base_color, tag_idx):
+    """Per-tag shade of an aggregator's base color: the first tag (tag_idx=0, e.g. baseline)
+    keeps the base color, later tags are progressively shaded away from it. Combined with
+    linestyle+marker, this keeps close/overlapping curves on the same per-aggregator figure
+    legible without giving up the aggregator's own hue (so the figure still reads as "this is
+    MEAN" etc. across the whole set of per-aggregator plots). Darkens by default; for an already
+    near-black base (single_user's color), darkening would be a no-op, so those shade by
+    lightening instead."""
+    if tag_idx == 0:
+        return base_color
+    amount = min(0.5, 0.3 * tag_idx)
+    r, g, b = mcolors.to_rgb(base_color)
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return _lighten(base_color, amount) if luminance < 0.25 else _darken(base_color, amount)
+
+
+def _flip_color(base_color):
+    """FLIP gets a clearly lighter/washed-out tint of the SAME aggregator hue -- distinct from
+    every JOLT tag shade (which only darken), so FLIP reads as "the other paper's baseline" at a
+    glance rather than blending into the JOLT tag curves."""
+    return _lighten(base_color, 0.55)
 
 
 # =========================
@@ -617,20 +656,21 @@ def plot_cta_vs_pta_per_branch(tag_data, flip_data, dataset, model_flag, tags, s
     agg_suffix_for_branch.update({f"federated_{agg}": agg for agg in DEPLOY_AGG_METHODS_FEDERATED})
 
     for branch_key in branch_keys:
-        color = BRANCH_COLORS[branch_key]
+        base_color = BRANCH_COLORS[branch_key]
         series = []
         for tag_idx, tag in enumerate(tags):
             df = tag_data.get(tag, {}).get(branch_key)
             if df is None:
                 continue
             series.append((
-                df, color, _tag_linestyle(tag, tag_idx), _tag_short_display(tag), _tag_marker(tag, tag_idx),
+                df, _tag_color(base_color, tag_idx), _tag_linestyle(tag, tag_idx),
+                _tag_short_display(tag), _tag_marker(tag, tag_idx),
             ))
 
         flip_key = flip_key_for_branch[branch_key]
         flip_df = flip_data.get(flip_key)
         if flip_df is not None:
-            series.append((flip_df, color, FLIP_LINESTYLE, FLIP_LABEL, FLIP_MARKER))
+            series.append((flip_df, _flip_color(base_color), FLIP_LINESTYLE, FLIP_LABEL, FLIP_MARKER))
 
         plt.figure(figsize=(7.5, 6))
         any_drawn = False
