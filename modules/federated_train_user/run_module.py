@@ -79,14 +79,13 @@ def run(experiment_name, module_name, **kwargs):
     print("Reconstructing worker datasets...")
     user_datasets = []
 
-    if track_grad_proximity and not track_poison_selection:
-        # track_grad_proximity defaults to true, but it needs the per-example flip mask
-        # that only track_poison_selection loads -- silently no-op rather than forcing
-        # every run to also set track_poison_selection (and thus require an
-        # {budget}_idx_flipped.npy file to exist) just to keep its old default behavior.
+    if track_grad_proximity and num_honests == 0:
+        # Needs at least one honest worker to compare a poisoned-worker gradient against
+        # (see mini_train_multi's own assertion) -- silently no-op on the single_user
+        # deployment (num_honests=0) rather than forcing every run to opt out by hand.
         print(
-            "track_grad_proximity=true but track_poison_selection=false -- "
-            "skipping gradient-proximity tracking (needs the per-example flip mask)."
+            "track_grad_proximity=true but num_honests=0 -- skipping gradient-proximity "
+            "tracking (needs at least one honest worker to compare against)."
         )
         track_grad_proximity = False
 
@@ -148,7 +147,8 @@ def run(experiment_name, module_name, **kwargs):
         track_poison_selection=track_poison_selection,
         track_grad_proximity=track_grad_proximity,
     )
-    if track_poison_selection:
+    track_extra = track_poison_selection or track_grad_proximity
+    if track_extra:
         model_retrain, poison_stats, clean_metrics, poison_metrics = train_result
     else:
         model_retrain, clean_metrics, poison_metrics = train_result
@@ -156,7 +156,7 @@ def run(experiment_name, module_name, **kwargs):
     print("Saving results...")
     np.save(output_dir / "paccs.npy", poison_metrics)
     np.save(output_dir / "caccs.npy", clean_metrics)
-    if track_poison_selection:
+    if track_extra:
         with open(output_dir / "multikrum_poison_stats.json", "w") as f:
             json.dump(poison_stats, f, indent=2)
         grad_prox = poison_stats.get("grad_proximity")
@@ -166,8 +166,8 @@ def run(experiment_name, module_name, **kwargs):
             ):
                 tracker.log(
                     epoch,
-                    grad_cosine_sim_flip_clean=cos_sim,
-                    grad_l2_dist_flip_clean=l2_dist,
+                    grad_cosine_sim_poisoned_honest=cos_sim,
+                    grad_l2_dist_poisoned_honest=l2_dist,
                 )
     #torch.save(model_retrain.state_dict(), output_dir / "model.pth")
 

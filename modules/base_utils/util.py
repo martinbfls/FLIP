@@ -202,41 +202,10 @@ def get_mean_lr(opt: optim.Optimizer):
     return np.mean([group["lr"] for group in opt.param_groups])
 
 
-def _subset_grad_vector(model: torch.nn.Module, x_sub: torch.Tensor, y_sub: torch.Tensor):
-    """Computes the flattened, concatenated gradient of clf_loss on a subset of a batch,
-    without disturbing any gradient accumulated by the caller before/after this call (the
-    caller is expected to model.zero_grad() again before relying on p.grad)."""
-    model.zero_grad()
-    y_pred = model(x_sub)
-    loss = clf_loss(y_pred, y_sub)
-    loss.backward()
-    return torch.cat([
-        (p.grad.detach() if p.grad is not None else torch.zeros_like(p)).reshape(-1)
-        for p in model.parameters()
-    ])
-
-
-def _flip_clean_grad_proximity(model, x, y, is_flipped, min_subset_size=2):
-    """Compares, within one poisoned worker's batch, the gradient produced by the
-    flipped-label examples against the gradient produced by the clean examples. Returns
-    (cosine_similarity, l2_distance) or None if the batch doesn't contain at least
-    `min_subset_size` examples of each kind.
-
-    This is a diagnostic-only measurement (mirrors the pattern used for Multi-Krum
-    selection tracking): it runs two extra forward/backward passes and does not affect the
-    actual training step -- the caller must model.zero_grad() before continuing."""
-    flip_mask = is_flipped
-    clean_mask = ~is_flipped
-    if flip_mask.sum().item() < min_subset_size or clean_mask.sum().item() < min_subset_size:
-        return None
-
-    flip_vec = _subset_grad_vector(model, x[flip_mask], y[flip_mask])
-    clean_vec = _subset_grad_vector(model, x[clean_mask], y[clean_mask])
-
-    cos = torch.nn.functional.cosine_similarity(
-        flip_vec, clean_vec, dim=0, eps=1e-12
-    ).item()
-    l2 = torch.linalg.vector_norm(flip_vec - clean_vec).item()
+def _cosine_and_l2(vec_a: torch.Tensor, vec_b: torch.Tensor):
+    """Cosine similarity and L2 distance between two flattened vectors."""
+    cos = torch.nn.functional.cosine_similarity(vec_a, vec_b, dim=0, eps=1e-12).item()
+    l2 = torch.linalg.vector_norm(vec_a - vec_b).item()
     return cos, l2
 
 
@@ -363,13 +332,17 @@ def mini_train_multi(
             test_data = [test_data]
         acc_loss = [[] for _ in range(len(test_data))]
 
-    if track_poison_selection:
+    if track_poison_selection or track_grad_proximity:
         # Worker ordering convention shared with partition_across_workers /
         # build_federated_datasets: honest workers first, poisoned workers last (the last
         # `f` entries of `dataloaders`).
         num_workers_total = len(dataloaders)
         poisoned_worker_ids = list(range(num_workers_total - f, num_workers_total))
-        poison_stats = {
+        honest_worker_ids = list(range(0, num_workers_total - f))
+        poison_stats = {}
+
+    if track_poison_selection:
+        poison_stats.update({
             "total_aggregations": 0,
             "any_poisoned_selected_given_flip": 0,
             "workers": {
@@ -380,12 +353,19 @@ def mini_train_multi(
                 }
                 for w in poisoned_worker_ids
             },
-        }
+        })
 
     if track_grad_proximity:
-        assert track_poison_selection, "track_grad_proximity requires track_poison_selection"
+        assert honest_worker_ids and poisoned_worker_ids, (
+            "track_grad_proximity needs at least one honest and one poisoned worker "
+            f"(got {len(honest_worker_ids)} honest, {len(poisoned_worker_ids)} poisoned)"
+        )
         poison_stats["grad_proximity"] = {
             "epoch": [],
+            # Cosine similarity / L2 distance, per aggregation step, between the mean
+            # poisoned-worker gradient and the mean honest-worker gradient (each worker's
+            # full-model gradient, every parameter tensor flattened and concatenated) --
+            # a worker-level comparison, not a per-example one.
             "cosine_sim_mean": [],
             "l2_dist_mean": [],
             "num_batches": [],
@@ -435,26 +415,15 @@ def mini_train_multi(
                     batch_loss += loss.item() * len(x)
                     batch_correct += correct.item()
 
-                    if (
-                        track_grad_proximity
-                        and w in poison_stats["workers"]
-                        and batch_has_flip.get(w, False)
-                    ):
-                        proximity = _flip_clean_grad_proximity(
-                            model, x, y, is_flipped.to(device)
-                        )
-                        if proximity is not None:
-                            cos, l2 = proximity
-                            epoch_cos_values.append(cos)
-                            epoch_l2_values.append(l2)
-
                 if track_poison_selection:
                     # Default for agg_method not in ("multikrum", "krum") -- "selection"
                     # isn't a concept for mean/median/trmean/soft*, so every worker reads as
                     # not-selected for those (same as before this fix).
                     step_selected_workers = set()
 
-                if track_poison_selection and agg_method in ("multikrum", "krum"):
+                if track_grad_proximity or (
+                    track_poison_selection and agg_method in ("multikrum", "krum")
+                ):
                     # True (Blanchard et al.) Multi-Krum selection, computed ONCE on each
                     # worker's FULL gradient (every parameter tensor flattened and
                     # concatenated) -- diagnostics ONLY, does not affect the actual per-
@@ -481,11 +450,26 @@ def mini_train_multi(
                         ])
                         for w in range(len(batches))
                     ]
-                    krum_m = 1 if agg_method == "krum" else None
-                    _, step_selected_workers = aggr_multikrum(
-                        full_vectors, f=f, m=krum_m, return_selected=True
-                    )
-                    step_selected_workers = set(step_selected_workers)
+
+                    if track_poison_selection and agg_method in ("multikrum", "krum"):
+                        krum_m = 1 if agg_method == "krum" else None
+                        _, step_selected_workers = aggr_multikrum(
+                            full_vectors, f=f, m=krum_m, return_selected=True
+                        )
+                        step_selected_workers = set(step_selected_workers)
+
+                    if track_grad_proximity:
+                        # Mean poisoned-worker gradient vs. mean honest-worker gradient --
+                        # a worker-level comparison (not per-example).
+                        mean_honest = torch.stack(
+                            [full_vectors[w] for w in honest_worker_ids], dim=0
+                        ).mean(dim=0)
+                        mean_poisoned = torch.stack(
+                            [full_vectors[w] for w in poisoned_worker_ids], dim=0
+                        ).mean(dim=0)
+                        cos, l2 = _cosine_and_l2(mean_poisoned, mean_honest)
+                        epoch_cos_values.append(cos)
+                        epoch_l2_values.append(l2)
 
                 model.zero_grad()
                 for i, p in enumerate(model.parameters()):
@@ -573,7 +557,7 @@ def mini_train_multi(
                     lr,
                 )
 
-    if track_poison_selection:
+    if track_poison_selection or track_grad_proximity:
         if record:
             return model, poison_stats, *acc_loss
         return model, poison_stats
