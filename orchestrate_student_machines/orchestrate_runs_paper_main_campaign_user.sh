@@ -25,6 +25,16 @@
 # Usage:
 #   TAG=baseline ./orchestrate_runs_paper_main_campaign_user.sh
 #   TAG=eps_16_255 ./orchestrate_runs_paper_main_campaign_user.sh   # once that tag's GEN/FLIPS land
+#
+# FORCE_RETRAIN=1: bypass the already_done (caccs.npy/paccs.npy present) skip check, so every
+# matching cell is resubmitted even if it already finished -- e.g. to redo cells that ran
+# before a code change (a new tracked metric, a fixed bug in federated_train_user, ...) and
+# whose existing outputs don't reflect it. federated_train_user overwrites caccs.npy/paccs.npy
+# in place, so no cleanup is needed beforehand:
+#   TAG=baseline FORCE_RETRAIN=1 ./orchestrate_runs_paper_main_campaign_user.sh
+# To narrow which cells get redone (e.g. only the multikrum ones), edit MODEL_FLAGS/DATASETS/
+# SEEDS/DEPLOY_BUDGETS/DEPLOY_AGG_METHODS_FEDERATED below (or DEPLOY_SINGLE_USER_AGG) before
+# running with FORCE_RETRAIN=1 -- there's no separate per-agg-method env override.
 
 set -x
 
@@ -273,11 +283,17 @@ echo "=============================="
 echo "TRAIN_USER (paper_main_campaign, tag=$TAG)"
 echo "=============================="
 
+FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
+
 # already_done: true if federated_train_user's own output (caccs.npy + paccs.npy, same
 # convention show_results.py's get_final_value reads) already exists for this config -- the
 # ground truth for "did this cell finish", regardless of which orchestrator (Slurm or this
-# script, on a prior/interrupted run) produced it.
+# script, on a prior/interrupted run) produced it. Always false when FORCE_RETRAIN=1, so every
+# matching cell gets resubmitted regardless of prior output (see usage note above).
 already_done() {
+    if [ "$FORCE_RETRAIN" = "1" ]; then
+        return 1
+    fi
     local config="$1"
     [ -f "$BASE_DIR/experiments/$config/caccs.npy" ] && [ -f "$BASE_DIR/experiments/$config/paccs.npy" ]
 }
@@ -319,6 +335,9 @@ TOTAL=${#USER_JOBS[@]}
 INDEX=0
 FAILED=()
 
+if [ "$FORCE_RETRAIN" = "1" ]; then
+    echo "[FORCE_RETRAIN=1] already_done ignoré -- tout est relancé, même ce qui a déjà caccs/paccs."
+fi
 echo "À lancer : $TOTAL   déjà faits (caccs/paccs présents) : $SKIPPED"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then

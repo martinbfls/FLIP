@@ -202,6 +202,44 @@ def get_mean_lr(opt: optim.Optimizer):
     return np.mean([group["lr"] for group in opt.param_groups])
 
 
+def _subset_grad_vector(model: torch.nn.Module, x_sub: torch.Tensor, y_sub: torch.Tensor):
+    """Computes the flattened, concatenated gradient of clf_loss on a subset of a batch,
+    without disturbing any gradient accumulated by the caller before/after this call (the
+    caller is expected to model.zero_grad() again before relying on p.grad)."""
+    model.zero_grad()
+    y_pred = model(x_sub)
+    loss = clf_loss(y_pred, y_sub)
+    loss.backward()
+    return torch.cat([
+        (p.grad.detach() if p.grad is not None else torch.zeros_like(p)).reshape(-1)
+        for p in model.parameters()
+    ])
+
+
+def _flip_clean_grad_proximity(model, x, y, is_flipped, min_subset_size=2):
+    """Compares, within one poisoned worker's batch, the gradient produced by the
+    flipped-label examples against the gradient produced by the clean examples. Returns
+    (cosine_similarity, l2_distance) or None if the batch doesn't contain at least
+    `min_subset_size` examples of each kind.
+
+    This is a diagnostic-only measurement (mirrors the pattern used for Multi-Krum
+    selection tracking): it runs two extra forward/backward passes and does not affect the
+    actual training step -- the caller must model.zero_grad() before continuing."""
+    flip_mask = is_flipped
+    clean_mask = ~is_flipped
+    if flip_mask.sum().item() < min_subset_size or clean_mask.sum().item() < min_subset_size:
+        return None
+
+    flip_vec = _subset_grad_vector(model, x[flip_mask], y[flip_mask])
+    clean_vec = _subset_grad_vector(model, x[clean_mask], y[clean_mask])
+
+    cos = torch.nn.functional.cosine_similarity(
+        flip_vec, clean_vec, dim=0, eps=1e-12
+    ).item()
+    l2 = torch.linalg.vector_norm(flip_vec - clean_vec).item()
+    return cos, l2
+
+
 def mini_train(
     *,
     model: torch.nn.Module,
@@ -305,6 +343,7 @@ def mini_train_multi(
     f=1,
     epoch_callback=None,
     track_poison_selection=False,
+    track_grad_proximity=False,
 ):
     device = get_module_device(model)
 
@@ -343,11 +382,24 @@ def mini_train_multi(
             },
         }
 
+    if track_grad_proximity:
+        assert track_poison_selection, "track_grad_proximity requires track_poison_selection"
+        poison_stats["grad_proximity"] = {
+            "epoch": [],
+            "cosine_sim_mean": [],
+            "l2_dist_mean": [],
+            "num_batches": [],
+        }
+
     with make_pbar(total=total_examples) as pbar:
         for epoch in range(1, epochs + 1):
             model.train()
             train_epoch_loss = 0.0
             train_epoch_correct = 0
+
+            if track_grad_proximity:
+                epoch_cos_values = []
+                epoch_l2_values = []
 
             for batches in zip(*dataloaders):
                 grad_buffer = [[] for _ in model.parameters()]
@@ -382,6 +434,19 @@ def mini_train_multi(
 
                     batch_loss += loss.item() * len(x)
                     batch_correct += correct.item()
+
+                    if (
+                        track_grad_proximity
+                        and w in poison_stats["workers"]
+                        and batch_has_flip.get(w, False)
+                    ):
+                        proximity = _flip_clean_grad_proximity(
+                            model, x, y, is_flipped.to(device)
+                        )
+                        if proximity is not None:
+                            cos, l2 = proximity
+                            epoch_cos_values.append(cos)
+                            epoch_l2_values.append(l2)
 
                 if track_poison_selection:
                     # Default for agg_method not in ("multikrum", "krum") -- "selection"
@@ -489,6 +554,14 @@ def mini_train_multi(
                     postfix[f"acc{i}"] = "%.2f" % (acc * 100)
                     if record:
                         acc_loss[i].append((acc, loss))
+
+            if track_grad_proximity and epoch_cos_values:
+                gp = poison_stats["grad_proximity"]
+                gp["epoch"].append(epoch)
+                gp["cosine_sim_mean"].append(float(np.mean(epoch_cos_values)))
+                gp["l2_dist_mean"].append(float(np.mean(epoch_l2_values)))
+                gp["num_batches"].append(len(epoch_cos_values))
+                postfix["grad_cos"] = "%.3f" % gp["cosine_sim_mean"][-1]
 
             pbar.set_postfix(**postfix)
 

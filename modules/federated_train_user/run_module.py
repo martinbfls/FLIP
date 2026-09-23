@@ -59,6 +59,7 @@ def run(experiment_name, module_name, **kwargs):
     output_dir.mkdir(parents=True, exist_ok=True)
     agg_method = args.get("agg_method", "mean")
     track_poison_selection = args.get("track_poison_selection", False)
+    track_grad_proximity = args.get("track_grad_proximity", True)
 
     print("Loading base datasets...")
     poisoner = pick_poisoner(poisoner_flag, dataset_flag, target_label, delta)
@@ -77,6 +78,17 @@ def run(experiment_name, module_name, **kwargs):
 
     print("Reconstructing worker datasets...")
     user_datasets = []
+
+    if track_grad_proximity and not track_poison_selection:
+        # track_grad_proximity defaults to true, but it needs the per-example flip mask
+        # that only track_poison_selection loads -- silently no-op rather than forcing
+        # every run to also set track_poison_selection (and thus require an
+        # {budget}_idx_flipped.npy file to exist) just to keep its old default behavior.
+        print(
+            "track_grad_proximity=true but track_poison_selection=false -- "
+            "skipping gradient-proximity tracking (needs the per-example flip mask)."
+        )
+        track_grad_proximity = False
 
     idx_flipped = None
     if track_poison_selection:
@@ -134,6 +146,7 @@ def run(experiment_name, module_name, **kwargs):
         f=num_poisoned,
         epoch_callback=tracker.epoch_callback(),
         track_poison_selection=track_poison_selection,
+        track_grad_proximity=track_grad_proximity,
     )
     if track_poison_selection:
         model_retrain, poison_stats, clean_metrics, poison_metrics = train_result
@@ -146,6 +159,16 @@ def run(experiment_name, module_name, **kwargs):
     if track_poison_selection:
         with open(output_dir / "multikrum_poison_stats.json", "w") as f:
             json.dump(poison_stats, f, indent=2)
+        grad_prox = poison_stats.get("grad_proximity")
+        if grad_prox:
+            for epoch, cos_sim, l2_dist in zip(
+                grad_prox["epoch"], grad_prox["cosine_sim_mean"], grad_prox["l2_dist_mean"]
+            ):
+                tracker.log(
+                    epoch,
+                    grad_cosine_sim_flip_clean=cos_sim,
+                    grad_l2_dist_flip_clean=l2_dist,
+                )
     #torch.save(model_retrain.state_dict(), output_dir / "model.pth")
 
     tracker.finalize()
