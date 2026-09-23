@@ -35,6 +35,9 @@
 # To narrow which cells get redone (e.g. only the multikrum ones), edit MODEL_FLAGS/DATASETS/
 # SEEDS/DEPLOY_BUDGETS/DEPLOY_AGG_METHODS_FEDERATED below (or DEPLOY_SINGLE_USER_AGG) before
 # running with FORCE_RETRAIN=1 -- there's no separate per-agg-method env override.
+#
+# SKIP_SINGLE_USER=0: also submit the single_user branch (skipped by default -- see its own
+# comment below, it never gets the multikrum/krum selection stats or grad-proximity tracking).
 
 set -x
 
@@ -298,6 +301,13 @@ already_done() {
     [ -f "$BASE_DIR/experiments/$config/caccs.npy" ] && [ -f "$BASE_DIR/experiments/$config/paccs.npy" ]
 }
 
+# SKIP_SINGLE_USER=1 (default): don't submit the single_user branch (DEPLOY_SINGLE_USER_AGG,
+# agg_method="mean") at all -- those cells have track_poison_selection=false baked into their
+# config.toml (see gen_configs_paper_main_campaign.py), so they never get the multikrum/krum
+# selection stats or the grad-proximity tracking; not worth training (or re-training under
+# FORCE_RETRAIN=1). Set SKIP_SINGLE_USER=0 to include them again.
+SKIP_SINGLE_USER="${SKIP_SINGLE_USER:-1}"
+
 USER_JOBS=()
 SKIPPED=0
 
@@ -306,15 +316,17 @@ for model in "${MODEL_FLAGS[@]}"; do
         for seed in "${SEEDS[@]}"; do
             cell="$EXP_BASE_REL/$model/$dataset/$TAG/seed${seed}"
 
-            for budget in "${DEPLOY_BUDGETS[@]}"; do
-                config="$cell/$DEPLOY_SINGLE_USER_AGG/train_user_${budget}"
-                name="paper_user_${model}_${dataset}_${TAG}_seed${seed}_su_${budget}"
-                if already_done "$config"; then
-                    SKIPPED=$((SKIPPED + 1))
-                    continue
-                fi
-                USER_JOBS+=("$config|$name")
-            done
+            if [ "$SKIP_SINGLE_USER" != "1" ]; then
+                for budget in "${DEPLOY_BUDGETS[@]}"; do
+                    config="$cell/$DEPLOY_SINGLE_USER_AGG/train_user_${budget}"
+                    name="paper_user_${model}_${dataset}_${TAG}_seed${seed}_su_${budget}"
+                    if already_done "$config"; then
+                        SKIPPED=$((SKIPPED + 1))
+                        continue
+                    fi
+                    USER_JOBS+=("$config|$name")
+                done
+            fi
 
             for agg in "${DEPLOY_AGG_METHODS_FEDERATED[@]}"; do
                 for budget in "${DEPLOY_BUDGETS[@]}"; do
@@ -337,6 +349,9 @@ FAILED=()
 
 if [ "$FORCE_RETRAIN" = "1" ]; then
     echo "[FORCE_RETRAIN=1] already_done ignoré -- tout est relancé, même ce qui a déjà caccs/paccs."
+fi
+if [ "$SKIP_SINGLE_USER" = "1" ]; then
+    echo "[SKIP_SINGLE_USER=1] branche single_user ($DEPLOY_SINGLE_USER_AGG) ignorée."
 fi
 echo "À lancer : $TOTAL   déjà faits (caccs/paccs présents) : $SKIPPED"
 
